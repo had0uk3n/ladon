@@ -18,6 +18,14 @@ pub enum LadonError {
     VaultPayloadTooLarge,
     #[error("invalid vault payload")]
     InvalidVaultPayload,
+    #[error("invalid vault file")]
+    InvalidVaultFile,
+    #[error("unsupported vault version")]
+    UnsupportedVaultVersion,
+    #[error("vault authentication failed")]
+    VaultAuthenticationFailed,
+    #[error("cryptographic randomness is unavailable")]
+    CryptoUnavailable,
 }
 
 impl LadonError {
@@ -32,6 +40,10 @@ impl LadonError {
             Self::TooManyFields => "too_many_fields",
             Self::VaultPayloadTooLarge => "vault_payload_too_large",
             Self::InvalidVaultPayload => "invalid_vault_payload",
+            Self::InvalidVaultFile => "invalid_vault_file",
+            Self::UnsupportedVaultVersion => "unsupported_vault_version",
+            Self::VaultAuthenticationFailed => "vault_authentication_failed",
+            Self::CryptoUnavailable => "crypto_unavailable",
         }
     }
 }

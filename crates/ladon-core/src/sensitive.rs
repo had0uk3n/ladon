@@ -14,6 +14,10 @@ impl SensitiveBytes {
         operation(self.0.as_slice())
     }
 
+    pub(crate) fn expose_mut<R>(&mut self, operation: impl FnOnce(&mut [u8]) -> R) -> R {
+        operation(self.0.as_mut_slice())
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()

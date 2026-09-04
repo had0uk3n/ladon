@@ -1,6 +1,7 @@
 # Ladon: Local Secret Broker for Coding Agents
 
-**Status:** Approved specification; four self-review iterations complete
+**Status:** Approved specification; five review iterations complete, including
+an implementation-consistency pass
 
 **Date:** 2026-09-04
 
@@ -333,9 +334,10 @@ The vault is one versioned binary file. Multibyte integer fields are unsigned
 big-endian. Version 1 has this exact framing:
 
 ```text
-magic=`LADONV1\0`[8] | version[u16] | header_len[u32] | payload_len[u64] |
+magic=`LADONV1\0`[8] | version[u16] | header_len[u32] |
 canonical-CBOR header[header_len] |
 DEK nonce[24] | encrypted DEK[32] | DEK tag[16] |
+payload_len[u64] |
 payload nonce[24] | encrypted canonical-CBOR payload[payload_len] |
 payload tag[16]
 ```
@@ -345,10 +347,12 @@ The version 1 header is a canonical CBOR map containing exactly `kdf`,
 `header_len` and `payload_len` are bounded before allocation; version 1 limits
 the header to 4 KiB and encrypted payload to 64 MiB plus AEAD overhead. The DEK
 associated data is the bytes before `DEK nonce` prefixed with
-`ladon/dek/v1`. The payload associated data is every preceding byte through the
-DEK tag prefixed with `ladon/payload/v1`. Canonical CBOR is required so these
-byte sequences have one representation. The fixed test vectors include the
-complete file bytes, not only primitive-level outputs.
+`ladon/dek/v1`. The payload associated data is every preceding byte through
+`payload_len` prefixed with `ladon/payload/v1`. Keeping `payload_len` after the
+wrapped DEK lets an ordinary mutation reuse that wrapper after the KEK has been
+discarded, while still authenticating the new ciphertext length. Canonical CBOR
+is required so these byte sequences have one representation. The fixed test
+vectors include the complete file bytes, not only primitive-level outputs.
 
 An ordinary mutation reuses the authenticated header and wrapped DEK and creates
 only a fresh payload nonce and ciphertext. Passphrase rotation creates a fresh

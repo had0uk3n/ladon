@@ -79,14 +79,14 @@ impl FieldName {
 - Create: `crates/ladon-core/tests/fixtures/v1-empty-vault.hex`
 - Modify: `crates/ladon-core/src/lib.rs`
 
-- [ ] Write tests for XChaCha20-Poly1305 round trip, wrong passphrase, modified header/ciphertext/tag, truncated input, unsupported version/KDF/cipher IDs, and fixed v1 fixture compatibility.
-- [ ] Write a test confirming passphrase rotation replaces the data-encryption key, wrapping salt, both nonces, and both ciphertexts so an old vault copy cannot be unlocked with the new session key.
-- [ ] Run `cargo test -p ladon-core --test vault_crypto`; expect failure.
-- [ ] Implement the exact v1 envelope from the spec: authenticated fixed header, Argon2id parameters (64 MiB, 3 iterations, parallelism 4), random salt/nonces/DEK, and XChaCha20-Poly1305 for both wrapped DEK and payload.
-- [ ] Keep passphrases/keys in `SensitiveBytes`, cap attacker-controlled lengths before allocation or KDF work, and map all authentication failures to one non-oracular error.
-- [ ] Generate the fixture from deterministic test-only inputs and document that production randomness cannot be overridden.
-- [ ] Re-run focused and workspace tests; expect pass.
-- [ ] Commit: `feat: implement authenticated portable vault envelope`.
+- [x] Write tests for XChaCha20-Poly1305 round trip, wrong passphrase, modified header/ciphertext/tag, truncated input, unsupported version/KDF/cipher IDs, and fixed v1 fixture compatibility.
+- [x] Write a test confirming passphrase rotation replaces the data-encryption key, wrapping salt, both nonces, and both ciphertexts so an old vault copy cannot be unlocked with the new session key.
+- [x] Run `cargo test -p ladon-core --test vault_crypto`; expect failure.
+- [x] Implement the exact v1 envelope from the spec: authenticated fixed header, Argon2id parameters (64 MiB, 3 iterations, parallelism 4), random salt/nonces/DEK, and XChaCha20-Poly1305 for both wrapped DEK and payload.
+- [x] Keep passphrases/keys in `SensitiveBytes`, cap attacker-controlled lengths before allocation or KDF work, and map all authentication failures to one non-oracular error.
+- [x] Generate the fixture from deterministic test-only inputs and document that production randomness cannot be overridden.
+- [x] Re-run focused and workspace tests; expect pass.
+- [x] Commit: `feat: implement authenticated portable vault envelope`.
 
 ### Task 4: Add crash-safe vault persistence and GUI-owned CRUD service
 

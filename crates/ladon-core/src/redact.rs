@@ -8,7 +8,7 @@ use crate::{FieldName, LadonError, SecretId, SensitiveBytes};
 
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 pub const MAX_OUTPUT_LIMIT_BYTES: usize = 2 * 1024 * 1024;
-const MIN_OUTPUT_LIMIT_BYTES: usize = 128;
+pub const MIN_OUTPUT_LIMIT_BYTES: usize = 128;
 
 pub struct RedactionSecret {
     id: SecretId,
@@ -91,14 +91,14 @@ impl StreamingRedactor {
                     &marker,
                 );
                 if let Ok(text) = std::str::from_utf8(value) {
-                    let json = Zeroizing::new(
-                        serde_json::to_string(text).expect("JSON string serialization"),
-                    );
-                    add_pattern(
-                        &mut patterns,
-                        json.as_bytes()[1..json.len() - 1].to_vec(),
-                        &marker,
-                    );
+                    if let Ok(json) = serde_json::to_string(text) {
+                        let json = Zeroizing::new(json);
+                        add_pattern(
+                            &mut patterns,
+                            json.as_bytes()[1..json.len() - 1].to_vec(),
+                            &marker,
+                        );
+                    }
                     add_pattern(&mut patterns, percent_encode(value, false), &marker);
                     add_pattern(&mut patterns, percent_encode(value, true), &marker);
                 }
@@ -284,9 +284,9 @@ impl Utf8Escaper {
                 }
                 Err(error) => {
                     let valid_end = position + error.valid_up_to();
-                    let valid = std::str::from_utf8(&buffer[position..valid_end])
-                        .expect("validated UTF-8 prefix");
-                    capture.push_str(valid);
+                    if let Ok(valid) = std::str::from_utf8(&buffer[position..valid_end]) {
+                        capture.push_str(valid);
+                    }
                     let Some(invalid_bytes) = error.error_len() else {
                         self.pending.extend_from_slice(&buffer[valid_end..]);
                         position = buffer.len();
@@ -355,11 +355,7 @@ impl BoundedCapture {
         if self.total_bytes <= self.limit as u64 && captured == self.total_bytes as usize {
             let mut bytes = self.head;
             bytes.extend(self.tail);
-            return (
-                String::from_utf8(bytes).expect("capture contains rendered UTF-8"),
-                false,
-                0,
-            );
+            return (String::from_utf8_lossy(&bytes).into_owned(), false, 0);
         }
 
         loop {
@@ -371,11 +367,7 @@ impl BoundedCapture {
                 let mut bytes = self.head;
                 bytes.extend_from_slice(marker.as_bytes());
                 bytes.extend(self.tail);
-                return (
-                    String::from_utf8(bytes).expect("capture contains rendered UTF-8"),
-                    true,
-                    omitted,
-                );
+                return (String::from_utf8_lossy(&bytes).into_owned(), true, omitted);
             }
             pop_front_character(&mut self.tail);
         }

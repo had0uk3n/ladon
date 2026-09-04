@@ -287,6 +287,11 @@ name = "ladon-app"
 version = "0.1.0"
 dependencies = [
  "ladon-core",
+ "libc",
+ "tempfile",
+ "uuid",
+ "windows-sys",
+ "zeroize",
 ]
 
 [[package]]

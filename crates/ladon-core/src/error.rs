@@ -48,6 +48,24 @@ pub enum LadonError {
     UnsupportedProtocolVersion,
     #[error("output limit is outside the supported range")]
     InvalidOutputLimit,
+    #[error("executable path is invalid")]
+    InvalidExecutablePath,
+    #[error("working directory is invalid")]
+    InvalidWorkingDirectory,
+    #[error("secret binding is invalid")]
+    InvalidBinding,
+    #[error("run contains too many secret bindings")]
+    TooManyBindings,
+    #[error("run timeout is outside the supported range")]
+    InvalidTimeout,
+    #[error("injected secret data exceeds the size limit")]
+    InjectedDataTooLarge,
+    #[error("managed secret data appears in command metadata")]
+    SecretInCommand,
+    #[error("another secret-bearing process is already running")]
+    Busy,
+    #[error("process execution failed")]
+    ProcessFailure,
 }
 
 impl LadonError {
@@ -77,6 +95,15 @@ impl LadonError {
             Self::InvalidRequest => "invalid_request",
             Self::UnsupportedProtocolVersion => "unsupported_protocol_version",
             Self::InvalidOutputLimit => "invalid_output_limit",
+            Self::InvalidExecutablePath => "invalid_executable_path",
+            Self::InvalidWorkingDirectory => "invalid_working_directory",
+            Self::InvalidBinding => "invalid_binding",
+            Self::TooManyBindings => "too_many_bindings",
+            Self::InvalidTimeout => "invalid_timeout",
+            Self::InjectedDataTooLarge => "injected_data_too_large",
+            Self::SecretInCommand => "secret_in_command",
+            Self::Busy => "busy",
+            Self::ProcessFailure => "process_failure",
         }
     }
 
@@ -106,6 +133,15 @@ impl LadonError {
             Self::InvalidRequest => "IPC request is invalid",
             Self::UnsupportedProtocolVersion => "unsupported protocol version",
             Self::InvalidOutputLimit => "output limit is outside the supported range",
+            Self::InvalidExecutablePath => "executable path must be absolute",
+            Self::InvalidWorkingDirectory => "working directory must be absolute",
+            Self::InvalidBinding => "secret binding is invalid",
+            Self::TooManyBindings => "run contains too many secret bindings",
+            Self::InvalidTimeout => "run timeout is outside the supported range",
+            Self::InjectedDataTooLarge => "injected secret data exceeds the size limit",
+            Self::SecretInCommand => "managed secret data appears in command metadata",
+            Self::Busy => "another secret-bearing process is already running",
+            Self::ProcessFailure => "process execution failed",
         }
     }
 }

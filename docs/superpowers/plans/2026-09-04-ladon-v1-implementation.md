@@ -146,14 +146,18 @@ impl FieldName {
 - Create: `crates/ladon-app/tests/helpers/echo_fixture.rs`
 - Modify: `crates/ladon-app/src/main.rs`
 
-- [ ] Write tests rejecting relative executable paths at the app boundary, duplicate env names, multiple stdin bindings, invalid temp filenames, >16 bindings, >1 MiB aggregate injected bytes, and timeout/output limits above policy.
-- [ ] Write integration tests for env/stdin/temp-file injection, minimal inherited environment, direct execution without a shell, temp cleanup, output redaction, timeout, user cancellation, and one-run concurrency.
-- [ ] Run `cargo test -p ladon-app --test runner_integration`; expect failure.
-- [ ] Implement `RunRequest` validation in core and a supervisor that resolves secret fields only after all non-secret validation passes.
-- [ ] On Unix, create a new process group, disable core dumps, cancel the group TERM→bounded grace→KILL, and keep the unlocked session until the process tree is gone. On Windows, use a Job Object with kill-on-close behind `cfg(windows)`.
-- [ ] Open temp files with user-only permissions and delete them on every normal/error/cancel path; clearly surface best-effort deletion semantics.
-- [ ] Re-run focused and workspace tests; expect pass.
-- [ ] Commit: `feat: add generic supervised secret runner`.
+- [x] Write tests rejecting relative executable paths at the app boundary, duplicate env names, multiple stdin bindings, invalid temp filenames, >16 bindings, >1 MiB aggregate injected bytes, and timeout/output limits above policy.
+- [x] Write integration tests for env/stdin/temp-file injection, minimal inherited environment, direct execution without a shell, temp cleanup, output redaction, timeout, user cancellation, large duplex I/O, and one-run concurrency.
+- [x] Run `cargo test -p ladon-app --test runner_integration`; expect failure.
+- [x] Implement `RunRequest` validation in core and a supervisor that resolves secret fields only after all non-secret validation passes.
+- [x] On Unix, create a new process group, disable core dumps, cancel the group TERM→bounded grace→KILL, and keep the unlocked session until the process tree is gone. On Windows, use a Job Object with kill-on-close behind `cfg(windows)`.
+- [x] Open temp files with user-only permissions and delete them on every normal/error/cancel path; clearly surface best-effort deletion semantics.
+- [x] Re-run focused and workspace tests, plus strict Windows cross-compilation; expect pass.
+- [x] Commit: `feat: add generic supervised secret runner`.
+
+Before the security-preview release, add the Unix app-death liveness pipe and
+native Windows ACL integration test described in the specification; these are
+release gates, not required for exercising the end-to-end local MVP.
 
 ### Task 8: Add same-user local transports and the thin CLI/MCP client
 

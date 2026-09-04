@@ -50,9 +50,15 @@ pub struct SecretBindingRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BindingTarget {
-    Environment { name: String },
+    Environment {
+        name: String,
+    },
     StandardInput,
-    TemporaryFileEnvironment { name: String },
+    TemporaryFileEnvironment {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggested_filename: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

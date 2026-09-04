@@ -279,7 +279,11 @@ dependencies = [
 name = "ladon"
 version = "0.1.0"
 dependencies = [
+ "ladon-app",
  "ladon-core",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

@@ -61,7 +61,7 @@ pub enum BindingTarget {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RpcResponse {
     pub version: u16,
     pub request_id: Uuid,
@@ -69,20 +69,20 @@ pub struct RpcResponse {
     outcome: RpcOutcome,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 enum RpcOutcome {
     Success { result: RpcResult },
     Failure { error: RpcErrorBody },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct RpcErrorBody {
-    code: &'static str,
-    message: &'static str,
+    code: String,
+    message: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResult {
     Status {
@@ -104,14 +104,14 @@ pub enum RpcResult {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SecretSummary {
     pub id: Uuid,
     pub name: String,
     pub fields: Vec<SecretFieldSummary>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SecretFieldSummary {
     pub name: String,
     pub text: bool,
@@ -134,10 +134,26 @@ impl RpcResponse {
             request_id,
             outcome: RpcOutcome::Failure {
                 error: RpcErrorBody {
-                    code: error.code(),
-                    message: error.safe_message(),
+                    code: error.code().to_owned(),
+                    message: error.safe_message().to_owned(),
                 },
             },
+        }
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> Option<&RpcResult> {
+        match &self.outcome {
+            RpcOutcome::Success { result } => Some(result),
+            RpcOutcome::Failure { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn error_details(&self) -> Option<(&str, &str)> {
+        match &self.outcome {
+            RpcOutcome::Success { .. } => None,
+            RpcOutcome::Failure { error } => Some((&error.code, &error.message)),
         }
     }
 }
@@ -148,6 +164,17 @@ pub fn encode_request_frame(request: &RpcRequest) -> Result<Vec<u8>, LadonError>
 
 pub fn encode_response_frame(response: &RpcResponse) -> Result<Vec<u8>, LadonError> {
     encode_frame(response)
+}
+
+pub fn decode_response_frame(frame: &[u8]) -> Result<RpcResponse, LadonError> {
+    let json = checked_frame_payload(frame)?;
+    validate_json_document(json)?;
+    let response: RpcResponse =
+        serde_json::from_slice(json).map_err(|_| LadonError::InvalidRequest)?;
+    if response.version != 1 {
+        return Err(LadonError::UnsupportedProtocolVersion);
+    }
+    Ok(response)
 }
 
 fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, LadonError> {
@@ -166,6 +193,15 @@ fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, LadonError> {
 }
 
 pub fn decode_request_frame(frame: &[u8]) -> Result<RpcRequest, LadonError> {
+    let json = checked_frame_payload(frame)?;
+    validate_json_document(json)?;
+    let request: RpcRequest =
+        serde_json::from_slice(json).map_err(|_| LadonError::InvalidRequest)?;
+    validate_request(&request)?;
+    Ok(request)
+}
+
+fn checked_frame_payload(frame: &[u8]) -> Result<&[u8], LadonError> {
     let declared = frame
         .get(..4)
         .and_then(|bytes| bytes.try_into().ok())
@@ -181,12 +217,7 @@ pub fn decode_request_frame(frame: &[u8]) -> Result<RpcRequest, LadonError> {
         return Err(LadonError::InvalidFrame);
     }
 
-    let json = &frame[4..];
-    validate_json(json)?;
-    let request: RpcRequest =
-        serde_json::from_slice(json).map_err(|_| LadonError::InvalidRequest)?;
-    validate_request(&request)?;
-    Ok(request)
+    Ok(&frame[4..])
 }
 
 fn validate_request(request: &RpcRequest) -> Result<(), LadonError> {
@@ -225,7 +256,7 @@ fn validate_request(request: &RpcRequest) -> Result<(), LadonError> {
     Ok(())
 }
 
-fn validate_json(input: &[u8]) -> Result<(), LadonError> {
+pub fn validate_json_document(input: &[u8]) -> Result<(), LadonError> {
     let mut deserializer = serde_json::Deserializer::from_slice(input);
     CheckedSeed { depth: 0 }
         .deserialize(&mut deserializer)

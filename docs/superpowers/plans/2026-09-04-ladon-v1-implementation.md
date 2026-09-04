@@ -173,14 +173,15 @@ release gates, not required for exercising the end-to-end local MVP.
 - Modify: `crates/ladon-cli/src/main.rs`
 - Modify: `crates/ladon-app/src/main.rs`
 
-- [ ] Write transport tests for owner-only endpoint permissions, peer-user validation, stale endpoint recovery, single-instance refusal, partial/oversized frames, and connection teardown.
-- [ ] Write CLI/MCP contract tests proving stdout/JSON-RPC never contains injected values, list returns metadata only, run resolves executable names client-side then sends an absolute path, and MCP caps timeouts at 15 minutes while CLI caps at 2 hours.
-- [ ] Run focused tests; expect failure.
-- [ ] Implement Unix sockets in a `0700` runtime directory with peer credentials where available; implement Windows named pipes with an owner-only security descriptor and client impersonation/SID validation.
-- [ ] Implement `ladon status|list|lock|run`, structured exit codes, and stdio MCP tools `ladon_status`, `ladon_list`, `ladon_lock`, `ladon_run`; ensure diagnostics go to stderr and never include plaintext.
+- [x] Write Unix transport tests for owner-only endpoint permissions, peer-user validation, stale endpoint recovery, single-instance refusal, partial/oversized frames, and connection teardown.
+- [x] Write CLI/MCP contract tests proving stdout/JSON-RPC never contains injected values, list returns metadata only, run resolves executable names client-side then sends an absolute path, and MCP caps timeouts at 15 minutes while CLI caps at 2 hours.
+- [x] Run focused tests; expect failure.
+- [x] Implement Unix sockets in a `0700` runtime directory with peer credentials (`getpeereid`/`SO_PEERCRED`) and fail-closed stale endpoint checks.
+- [ ] Implement Windows named pipes with an owner-only security descriptor and client impersonation/SID validation.
+- [x] Implement `ladon status|list|lock|run`, structured exit codes, and stdio MCP tools `ladon_status`, `ladon_list_secrets`, `ladon_lock`, `ladon_run`; ensure diagnostics go to stderr and never include plaintext. Support both the current stateless MCP discovery call and the preceding initialization handshake used by existing local clients.
 - [ ] Implement `ladon setup codex|claude` as an idempotent, preview-before-write configuration edit with a timestamped backup.
-- [ ] Re-run focused and workspace tests; expect pass.
-- [ ] Commit: `feat: add local IPC CLI and MCP bridge`.
+- [x] Re-run focused and workspace tests; expect pass on the implemented Unix transport, plus strict Windows compilation of the platform-independent client and MCP layers.
+- [ ] Commit the complete cross-platform transport and setup flow as `feat: add local IPC CLI and MCP bridge`.
 
 ### Task 9: Build the minimal tray GUI and quick-unlock abstraction
 

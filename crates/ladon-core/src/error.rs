@@ -66,6 +66,14 @@ pub enum LadonError {
     Busy,
     #[error("process execution failed")]
     ProcessFailure,
+    #[error("another Ladon instance already owns the local endpoint")]
+    AlreadyRunning,
+    #[error("local endpoint failed its ownership or type checks")]
+    UnsafeEndpoint,
+    #[error("local Ladon endpoint is unavailable")]
+    EndpointUnavailable,
+    #[error("local IPC peer is not the current operating-system user")]
+    InvalidPeer,
 }
 
 impl LadonError {
@@ -104,6 +112,10 @@ impl LadonError {
             Self::SecretInCommand => "secret_in_command",
             Self::Busy => "busy",
             Self::ProcessFailure => "process_failure",
+            Self::AlreadyRunning => "already_running",
+            Self::UnsafeEndpoint => "unsafe_endpoint",
+            Self::EndpointUnavailable => "endpoint_unavailable",
+            Self::InvalidPeer => "invalid_peer",
         }
     }
 
@@ -142,6 +154,10 @@ impl LadonError {
             Self::SecretInCommand => "managed secret data appears in command metadata",
             Self::Busy => "another secret-bearing process is already running",
             Self::ProcessFailure => "process execution failed",
+            Self::AlreadyRunning => "another Ladon instance is already running",
+            Self::UnsafeEndpoint => "local endpoint failed security checks",
+            Self::EndpointUnavailable => "local Ladon endpoint is unavailable",
+            Self::InvalidPeer => "local IPC peer is not the current user",
         }
     }
 }

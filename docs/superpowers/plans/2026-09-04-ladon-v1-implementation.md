@@ -36,10 +36,10 @@
 - Create: `crates/ladon-cli/Cargo.toml`
 - Create: `crates/ladon-cli/src/main.rs`
 
-- [ ] Write validation tests for NFC-normalized secret names, reserved `id:` and `::`, bidi/control rejection, field grammar, per-field size, and immutable UUID references.
-- [ ] Run `cargo test -p ladon-core --test model_validation`; expect compilation or missing-symbol failure.
-- [ ] Add `SecretId`, `SecretRef`, `FieldName`, `SecretRecord`, `SecretField`, `TextHint`, and a non-secret `LadonError` with stable machine-readable codes.
-- [ ] Implement constructors as the only public route to validated names and fields. Example public surface:
+- [x] Write validation tests for NFC-normalized secret names, reserved `id:` and `::`, bidi/control rejection, field grammar, per-field size, and immutable UUID references.
+- [x] Run `cargo test -p ladon-core --test model_validation`; expect compilation or missing-symbol failure.
+- [x] Add `SecretId`, `SecretRef`, `FieldName`, `SecretRecord`, `SecretField`, `TextHint`, and a non-secret `LadonError` with stable machine-readable codes.
+- [x] Implement constructors as the only public route to validated names and fields. Example public surface:
 
 ```rust
 impl SecretRef {
@@ -51,8 +51,8 @@ impl FieldName {
 }
 ```
 
-- [ ] Re-run the focused test, then `cargo test --workspace`; expect pass.
-- [ ] Commit: `feat: bootstrap Ladon workspace and domain model`.
+- [x] Re-run the focused test, then `cargo test --workspace`; expect pass.
+- [x] Commit: `feat: bootstrap Ladon workspace and domain model`.
 
 ### Task 2: Implement secret-memory wrappers and deterministic vault encoding
 

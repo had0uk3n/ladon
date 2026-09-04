@@ -1,0 +1,10 @@
+[package]
+name = "ladon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ladon-core = { path = "../ladon-core" }
+

@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/ladon-app",
+    "crates/ladon-cli",
+    "crates/ladon-core",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+version = "0.1.0"
+
+[workspace.dependencies]
+thiserror = "2"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
+

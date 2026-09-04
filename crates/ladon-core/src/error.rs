@@ -46,6 +46,8 @@ pub enum LadonError {
     InvalidRequest,
     #[error("unsupported protocol version")]
     UnsupportedProtocolVersion,
+    #[error("output limit is outside the supported range")]
+    InvalidOutputLimit,
 }
 
 impl LadonError {
@@ -74,6 +76,7 @@ impl LadonError {
             Self::FrameTooLarge => "frame_too_large",
             Self::InvalidRequest => "invalid_request",
             Self::UnsupportedProtocolVersion => "unsupported_protocol_version",
+            Self::InvalidOutputLimit => "invalid_output_limit",
         }
     }
 
@@ -102,6 +105,7 @@ impl LadonError {
             Self::FrameTooLarge => "IPC frame exceeds the size limit",
             Self::InvalidRequest => "IPC request is invalid",
             Self::UnsupportedProtocolVersion => "unsupported protocol version",
+            Self::InvalidOutputLimit => "output limit is outside the supported range",
         }
     }
 }

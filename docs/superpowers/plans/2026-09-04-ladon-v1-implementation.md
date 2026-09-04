@@ -130,12 +130,12 @@ impl FieldName {
 - Create: `crates/ladon-core/tests/redaction.rs`
 - Modify: `crates/ladon-core/src/lib.rs`
 
-- [ ] Write tests for raw, URL-encoded, percent-case variants, Base64/Base64URL padded and unpadded values, shell-quoted common forms, overlapping secrets, binary output, and secrets split across read boundaries.
-- [ ] Add property tests asserting that no configured transform of a managed value survives in returned output and output never exceeds the configured 512 KiB default / 2 MiB hard maximum.
-- [ ] Run `cargo test -p ladon-core --test redaction`; expect failure.
-- [ ] Implement a streaming multi-pattern redactor that holds enough suffix bytes to detect boundary-spanning matches, replaces matches with `[REDACTED]`, and records truncation/redaction flags without logging needles.
-- [ ] Re-run focused and workspace tests; expect pass.
-- [ ] Commit: `feat: add bounded streaming secret redaction`.
+- [x] Write tests for raw, JSON-escaped, URL-encoded percent-case variants, hexadecimal, Base64/Base64URL padded and unpadded values, overlapping secrets, binary output, and secrets split across read boundaries.
+- [x] Add property tests asserting that no configured transform of a managed value survives in returned output and output never exceeds the configured 512 KiB default / 2 MiB hard maximum.
+- [x] Run `cargo test -p ladon-core --test redaction`; expect failure.
+- [x] Implement a streaming multi-pattern redactor that holds enough suffix bytes to detect boundary-spanning matches, replaces matches with labeled `[REDACTED:secret-id.field]` markers, and records truncation/redaction flags without logging needles.
+- [x] Re-run focused and workspace tests; expect pass.
+- [x] Commit: `feat: add bounded streaming secret redaction`.
 
 ### Task 7: Implement generic run validation and process supervision
 

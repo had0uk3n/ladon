@@ -1,7 +1,6 @@
 # Ladon: Local Secret Broker for Coding Agents
 
-**Status:** Draft specification; four self-review iterations complete; awaiting
-user approval
+**Status:** Approved specification; four self-review iterations complete
 
 **Date:** 2026-09-04
 

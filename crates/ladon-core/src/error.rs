@@ -26,6 +26,18 @@ pub enum LadonError {
     VaultAuthenticationFailed,
     #[error("cryptographic randomness is unavailable")]
     CryptoUnavailable,
+    #[error("a secret with that name already exists")]
+    DuplicateSecretName,
+    #[error("secret not found")]
+    SecretNotFound,
+    #[error("secret field not found")]
+    FieldNotFound,
+    #[error("vault revision cannot be incremented")]
+    RevisionOverflow,
+    #[error("vault storage operation failed")]
+    StorageFailure,
+    #[error("neither managed vault copy can be opened")]
+    VaultUnavailable,
 }
 
 impl LadonError {
@@ -44,6 +56,12 @@ impl LadonError {
             Self::UnsupportedVaultVersion => "unsupported_vault_version",
             Self::VaultAuthenticationFailed => "vault_authentication_failed",
             Self::CryptoUnavailable => "crypto_unavailable",
+            Self::DuplicateSecretName => "duplicate_secret_name",
+            Self::SecretNotFound => "secret_not_found",
+            Self::FieldNotFound => "field_not_found",
+            Self::RevisionOverflow => "revision_overflow",
+            Self::StorageFailure => "storage_failure",
+            Self::VaultUnavailable => "vault_unavailable",
         }
     }
 }

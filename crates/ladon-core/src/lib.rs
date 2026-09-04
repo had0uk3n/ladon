@@ -3,6 +3,8 @@ mod crypto;
 mod error;
 mod model;
 mod sensitive;
+mod store;
+mod vault;
 
 pub use codec::{MAX_VAULT_PAYLOAD_BYTES, VaultPayload, decode_payload, encode_payload};
 pub use crypto::{UnlockedVault, create_vault, unlock_vault};
@@ -12,3 +14,5 @@ pub use model::{
     SecretRecord, SecretRef, TextHint,
 };
 pub use sensitive::SensitiveBytes;
+pub use store::{VaultOpen, VaultStore};
+pub use vault::{ActivitySink, SecretMetadata, VaultSession};

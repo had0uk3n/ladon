@@ -74,6 +74,10 @@ impl UnlockedVault {
         &self.payload
     }
 
+    pub(crate) fn payload_mut(&mut self) -> &mut VaultPayload {
+        &mut self.payload
+    }
+
     pub fn seal(&self) -> Result<Vec<u8>, LadonError> {
         seal_payload(&self.payload, &self.key_material, &mut OsRandom)
     }

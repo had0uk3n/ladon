@@ -97,13 +97,13 @@ impl FieldName {
 - Create: `crates/ladon-core/tests/vault_crud.rs`
 - Modify: `crates/ladon-core/src/lib.rs`
 
-- [ ] Write CRUD tests for duplicate normalized names, UUID lookup, ordered multi-field records, rename/update/delete, generation increments, and the 64 MiB aggregate bound.
-- [ ] Write filesystem fault tests for first save, replacement, primary corruption with valid `.bak`, both copies invalid, stale temporary files, and restrictive permissions.
-- [ ] Run the two focused tests; expect failure.
-- [ ] Implement an unlocked `VaultSession` that owns the DEK and records, exposes no plaintext serialization, and resets an injected idle-clock hook only on use/mutation.
-- [ ] Implement the two-current-copy write protocol: write/sync temp, rotate primary to `.bak`, atomically install primary, sync directory where supported, and never promote an unauthenticated copy.
-- [ ] Re-run focused and workspace tests; expect pass.
-- [ ] Commit: `feat: add crash-safe vault store and CRUD service`.
+- [x] Write CRUD tests for duplicate normalized names, UUID lookup, ordered multi-field records, rename/update/delete, generation increments, and the 64 MiB aggregate bound.
+- [x] Write filesystem fault tests for first save, replacement, primary corruption with valid `.bak`, both copies invalid, stale temporary files, and restrictive permissions.
+- [x] Run the two focused tests; expect failure.
+- [x] Implement an unlocked `VaultSession` that owns the DEK and records, exposes no plaintext serialization, and resets an injected idle-clock hook only on use/mutation.
+- [x] Implement the two-current-copy write protocol: write/sync two candidates, atomically install the first as `.bak`, atomically install the second as primary, sync each directory change where supported, and never promote an unauthenticated copy.
+- [x] Re-run focused and workspace tests; expect pass.
+- [x] Commit: `feat: add crash-safe vault store and CRUD service`.
 
 ### Task 5: Define bounded IPC and broker state transitions
 

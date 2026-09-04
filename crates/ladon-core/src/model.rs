@@ -230,6 +230,10 @@ impl SecretRecord {
         self.name = SecretName::parse(name)?;
         Ok(())
     }
+
+    pub(crate) fn set_name(&mut self, name: SecretName) {
+        self.name = name;
+    }
 }
 
 impl fmt::Debug for SecretRecord {

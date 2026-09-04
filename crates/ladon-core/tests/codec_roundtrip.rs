@@ -119,3 +119,37 @@ fn rejects_unsorted_maps_inside_preserved_unknown_values() {
         LadonError::InvalidVaultPayload
     );
 }
+
+#[test]
+fn rejects_payloads_with_duplicate_normalized_secret_names() {
+    let first = SecretRecord::new(
+        "Cafe\u{301}",
+        vec![
+            SecretField::new(
+                FieldName::parse("value").unwrap(),
+                vec![1],
+                TextHint::Binary,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let second = SecretRecord::new(
+        "Café",
+        vec![
+            SecretField::new(
+                FieldName::parse("value").unwrap(),
+                vec![2],
+                TextHint::Binary,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let vault_id = SecretId::parse("66666666-6666-4666-8666-666666666666").unwrap();
+
+    assert_eq!(
+        VaultPayload::new(vault_id, 0, vec![first, second]).unwrap_err(),
+        LadonError::InvalidVaultPayload
+    );
+}

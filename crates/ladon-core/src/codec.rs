@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::BTreeMap, fmt};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 use minicbor::{Decoder, Encoder, data::Type, encode::Write};
 
@@ -27,6 +31,14 @@ impl VaultPayload {
         if records.len() > MAX_RECORDS {
             return Err(LadonError::InvalidVaultPayload);
         }
+        let mut ids = HashSet::with_capacity(records.len());
+        let mut names = HashSet::with_capacity(records.len());
+        if records
+            .iter()
+            .any(|record| !ids.insert(record.id()) || !names.insert(record.name()))
+        {
+            return Err(LadonError::InvalidVaultPayload);
+        }
 
         Ok(Self {
             vault_id,
@@ -50,6 +62,18 @@ impl VaultPayload {
     #[must_use]
     pub fn records(&self) -> &[SecretRecord] {
         &self.records
+    }
+
+    pub(crate) fn records_mut(&mut self) -> &mut Vec<SecretRecord> {
+        &mut self.records
+    }
+
+    pub(crate) fn increment_revision(&mut self) -> Result<(), LadonError> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(LadonError::RevisionOverflow)?;
+        Ok(())
     }
 }
 
@@ -158,13 +182,13 @@ pub fn decode_payload(input: &[u8]) -> Result<VaultPayload, LadonError> {
         return Err(LadonError::InvalidVaultPayload);
     }
 
-    let payload = VaultPayload {
-        vault_id: vault_id.ok_or(LadonError::InvalidVaultPayload)?,
-        revision: revision.ok_or(LadonError::InvalidVaultPayload)?,
-        records: records.ok_or(LadonError::InvalidVaultPayload)?,
-        idle_timeout_seconds: idle_timeout_seconds.ok_or(LadonError::InvalidVaultPayload)?,
-        unknown,
-    };
+    let mut payload = VaultPayload::new(
+        vault_id.ok_or(LadonError::InvalidVaultPayload)?,
+        revision.ok_or(LadonError::InvalidVaultPayload)?,
+        records.ok_or(LadonError::InvalidVaultPayload)?,
+    )?;
+    payload.idle_timeout_seconds = idle_timeout_seconds.ok_or(LadonError::InvalidVaultPayload)?;
+    payload.unknown = unknown;
 
     if encode_payload(&payload)? != input {
         return Err(LadonError::InvalidVaultPayload);

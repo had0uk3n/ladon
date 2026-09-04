@@ -18,3 +18,4 @@ getrandom.workspace = true
 [dev-dependencies]
 serde = "1"
 static_assertions = "1"
+tempfile = "3"

@@ -132,3 +132,24 @@ fn records_require_at_least_one_field() {
         "empty_record"
     );
 }
+
+#[test]
+fn records_reject_more_than_sixty_four_fields() {
+    let fields = (0..65)
+        .map(|index| {
+            SecretField::new(
+                FieldName::parse(&format!("f{index}")).unwrap(),
+                vec![],
+                TextHint::Binary,
+            )
+            .unwrap()
+        })
+        .collect();
+
+    assert_eq!(
+        SecretRecord::new("too-many-fields", fields)
+            .unwrap_err()
+            .code(),
+        "too_many_fields"
+    );
+}

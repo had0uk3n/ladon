@@ -63,13 +63,13 @@ impl FieldName {
 - Modify: `crates/ladon-core/src/lib.rs`
 - Modify: `crates/ladon-core/src/model.rs`
 
-- [ ] Write tests proving `SensitiveBytes` redacts `Debug`, cannot serialize directly, zeroizes on drop through a test hook, and rejects a decoded payload above 64 MiB.
-- [ ] Add golden-byte tests for deterministic canonical CBOR ordering and round-tripping binary and text-hinted fields.
-- [ ] Run `cargo test -p ladon-core --test codec_roundtrip`; expect failure.
-- [ ] Implement `SensitiveBytes` with `zeroize`, explicit exposure methods scoped to closures, and constant non-secret formatting.
-- [ ] Encode the payload manually with `minicbor::Encoder` using integer map keys in ascending order; reject unknown required fields, duplicate keys, invalid UUIDs, invalid names, and trailing bytes on decode.
-- [ ] Re-run focused and workspace tests; expect pass.
-- [ ] Commit: `feat: add bounded canonical vault payload codec`.
+- [x] Write tests proving `SensitiveBytes` has redacted `Debug`, is non-cloneable and non-serializable, permits only explicit closure access, and rejects a decoded payload above 64 MiB. Delegate drop zeroization to `zeroize::Zeroizing` rather than testing upstream internals.
+- [x] Add golden-byte tests for deterministic canonical CBOR ordering and round-tripping binary and text-hinted fields.
+- [x] Run `cargo test -p ladon-core --test codec_roundtrip`; expect failure.
+- [x] Implement `SensitiveBytes` with `zeroize`, explicit exposure methods scoped to closures, and constant non-secret formatting.
+- [x] Encode the payload manually with `minicbor::Encoder` using integer map keys in ascending order; reject unknown required fields, duplicate keys, invalid UUIDs, invalid names, and trailing bytes on decode.
+- [x] Re-run focused and workspace tests; expect pass.
+- [x] Commit: `feat: add bounded canonical vault payload codec`.
 
 ### Task 3: Implement the versioned encrypted vault envelope
 
@@ -80,7 +80,7 @@ impl FieldName {
 - Modify: `crates/ladon-core/src/lib.rs`
 
 - [ ] Write tests for XChaCha20-Poly1305 round trip, wrong passphrase, modified header/ciphertext/tag, truncated input, unsupported version/KDF/cipher IDs, and fixed v1 fixture compatibility.
-- [ ] Write a test confirming passphrase rotation preserves the data-encryption key while changing the wrapping salt, nonce, and wrapped key.
+- [ ] Write a test confirming passphrase rotation replaces the data-encryption key, wrapping salt, both nonces, and both ciphertexts so an old vault copy cannot be unlocked with the new session key.
 - [ ] Run `cargo test -p ladon-core --test vault_crypto`; expect failure.
 - [ ] Implement the exact v1 envelope from the spec: authenticated fixed header, Argon2id parameters (64 MiB, 3 iterations, parallelism 4), random salt/nonces/DEK, and XChaCha20-Poly1305 for both wrapped DEK and payload.
 - [ ] Keep passphrases/keys in `SensitiveBytes`, cap attacker-controlled lengths before allocation or KDF work, and map all authentication failures to one non-oracular error.

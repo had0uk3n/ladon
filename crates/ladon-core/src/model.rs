@@ -3,9 +3,10 @@ use std::{collections::HashSet, fmt};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-use crate::LadonError;
+use crate::{LadonError, SensitiveBytes};
 
 pub const MAX_FIELD_BYTES: usize = 1024 * 1024;
+pub const MAX_FIELDS_PER_RECORD: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SecretId(Uuid);
@@ -20,6 +21,14 @@ impl SecretId {
         Uuid::parse_str(input)
             .map(Self)
             .map_err(|_| LadonError::InvalidSecretRef)
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+
+    pub(crate) fn as_bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
     }
 }
 
@@ -119,10 +128,10 @@ pub enum TextHint {
     Text,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct SecretField {
     name: FieldName,
-    value: Vec<u8>,
+    value: SensitiveBytes,
     text_hint: TextHint,
 }
 
@@ -134,7 +143,7 @@ impl SecretField {
 
         Ok(Self {
             name,
-            value,
+            value: SensitiveBytes::new(value),
             text_hint,
         })
     }
@@ -142,6 +151,16 @@ impl SecretField {
     #[must_use]
     pub fn name(&self) -> &FieldName {
         &self.name
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &SensitiveBytes {
+        &self.value
+    }
+
+    #[must_use]
+    pub const fn text_hint(&self) -> TextHint {
+        self.text_hint
     }
 }
 
@@ -156,7 +175,7 @@ impl fmt::Debug for SecretField {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct SecretRecord {
     id: SecretId,
     name: SecretName,
@@ -165,8 +184,19 @@ pub struct SecretRecord {
 
 impl SecretRecord {
     pub fn new(name: &str, fields: Vec<SecretField>) -> Result<Self, LadonError> {
+        Self::from_parts(SecretId::new(), name, fields)
+    }
+
+    pub(crate) fn from_parts(
+        id: SecretId,
+        name: &str,
+        fields: Vec<SecretField>,
+    ) -> Result<Self, LadonError> {
         if fields.is_empty() {
             return Err(LadonError::EmptyRecord);
+        }
+        if fields.len() > MAX_FIELDS_PER_RECORD {
+            return Err(LadonError::TooManyFields);
         }
 
         let mut names = HashSet::with_capacity(fields.len());
@@ -175,7 +205,7 @@ impl SecretRecord {
         }
 
         Ok(Self {
-            id: SecretId::new(),
+            id,
             name: SecretName::parse(name)?,
             fields,
         })
@@ -189,6 +219,11 @@ impl SecretRecord {
     #[must_use]
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    #[must_use]
+    pub fn fields(&self) -> &[SecretField] {
+        &self.fields
     }
 
     pub fn rename(&mut self, name: &str) -> Result<(), LadonError> {

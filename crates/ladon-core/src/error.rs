@@ -12,6 +12,12 @@ pub enum LadonError {
     DuplicateField,
     #[error("record must contain at least one field")]
     EmptyRecord,
+    #[error("record contains too many fields")]
+    TooManyFields,
+    #[error("vault payload exceeds the size limit")]
+    VaultPayloadTooLarge,
+    #[error("invalid vault payload")]
+    InvalidVaultPayload,
 }
 
 impl LadonError {
@@ -23,6 +29,9 @@ impl LadonError {
             Self::FieldTooLarge => "field_too_large",
             Self::DuplicateField => "duplicate_field",
             Self::EmptyRecord => "empty_record",
+            Self::TooManyFields => "too_many_fields",
+            Self::VaultPayloadTooLarge => "vault_payload_too_large",
+            Self::InvalidVaultPayload => "invalid_vault_payload",
         }
     }
 }

@@ -9,4 +9,9 @@ rust-version.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true
+minicbor.workspace = true
+zeroize.workspace = true
 
+[dev-dependencies]
+serde = "1"
+static_assertions = "1"

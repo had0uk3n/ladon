@@ -59,14 +59,18 @@ impl VaultStore {
 
     pub fn commit(&self, vault: &UnlockedVault) -> Result<(), LadonError> {
         let encrypted = vault.seal()?;
+        self.commit_encrypted(&encrypted)
+    }
+
+    pub(crate) fn commit_encrypted(&self, encrypted: &[u8]) -> Result<(), LadonError> {
         let first = self.candidate_path();
         let second = self.candidate_path();
 
         let result = (|| {
-            write_candidate(&first, &encrypted)?;
-            write_candidate(&second, &encrypted)?;
-            verify_candidate(&first, &encrypted)?;
-            verify_candidate(&second, &encrypted)?;
+            write_candidate(&first, encrypted)?;
+            write_candidate(&second, encrypted)?;
+            verify_candidate(&first, encrypted)?;
+            verify_candidate(&second, encrypted)?;
 
             atomic_replace(&first, &self.backup)?;
             sync_parent(&self.primary)?;

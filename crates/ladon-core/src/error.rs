@@ -74,6 +74,8 @@ pub enum LadonError {
     EndpointUnavailable,
     #[error("local IPC peer is not the current operating-system user")]
     InvalidPeer,
+    #[error("passphrase does not meet the local vault requirements")]
+    InvalidPassphrase,
 }
 
 impl LadonError {
@@ -116,6 +118,7 @@ impl LadonError {
             Self::UnsafeEndpoint => "unsafe_endpoint",
             Self::EndpointUnavailable => "endpoint_unavailable",
             Self::InvalidPeer => "invalid_peer",
+            Self::InvalidPassphrase => "invalid_passphrase",
         }
     }
 
@@ -158,6 +161,7 @@ impl LadonError {
             Self::UnsafeEndpoint => "local endpoint failed security checks",
             Self::EndpointUnavailable => "local Ladon endpoint is unavailable",
             Self::InvalidPeer => "local IPC peer is not the current user",
+            Self::InvalidPassphrase => "passphrase must match and contain 12 to 1024 characters",
         }
     }
 }

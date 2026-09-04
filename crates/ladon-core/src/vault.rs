@@ -1,4 +1,7 @@
-use crate::{FieldName, LadonError, SecretField, SecretId, SecretRecord, SecretRef, UnlockedVault};
+use crate::{
+    FieldName, LadonError, SecretField, SecretId, SecretRecord, SecretRef, UnlockedVault,
+    VaultStore,
+};
 
 pub trait ActivitySink {
     fn secret_activity(&mut self);
@@ -136,6 +139,11 @@ impl<A: ActivitySink> VaultSession<A> {
 
     pub fn seal(&self) -> Result<Vec<u8>, LadonError> {
         self.vault.seal()
+    }
+
+    pub fn commit_to(&self, store: &VaultStore) -> Result<(), LadonError> {
+        let encrypted = self.seal()?;
+        store.commit_encrypted(&encrypted)
     }
 }
 

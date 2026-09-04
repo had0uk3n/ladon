@@ -1,6 +1,7 @@
 # Ladon: Local Secret Broker for Coding Agents
 
-**Status:** Draft specification for user review; product direction approved
+**Status:** Draft specification; four self-review iterations complete; awaiting
+user approval
 
 **Date:** 2026-09-04
 
@@ -9,10 +10,10 @@
 ## 1. Summary
 
 Ladon is a lightweight, local, cross-platform secret broker for people who use
-coding agents such as Codex and Claude Code. It lets an agent run an arbitrary
-local program with user-selected secrets without placing the secret values in
-the conversation, tool arguments, shell history, process arguments, ordinary
-logs, or MCP results.
+coding agents such as Codex and Claude Code. It lets an agent run a local
+program with user-selected secrets without placing the secret values in the
+conversation, agent-facing tool arguments, shell history, process arguments,
+ordinary Ladon logs, or MCP results created by Ladon itself.
 
 Ladon is not a service-specific credential adapter. It does not contain GitLab,
 GitHub, AWS, or other provider logic. Its central operation is a generic process
@@ -34,7 +35,7 @@ MCP bridge. Both connect to the tray process through operating-system-local IPC.
 6. Keep the storage format portable across supported operating systems.
 7. Use public, standard cryptographic primitives and permit independent review.
 
-## 3. Non-goals for the first release
+## 3. Non-goals for version 1
 
 - Protecting secrets after the user's operating-system account is fully
   compromised.
@@ -45,9 +46,12 @@ MCP bridge. Both connect to the tray process through operating-system-local IPC.
 - Remote MCP transport.
 - Interactive PTY/ConPTY process proxying.
 - Transparent injection into an already-running process.
+- Detecting replacement of a valid vault by an older, valid encrypted copy.
+- Persisting a history of commands run by agents. The tray shows only bounded
+  activity from the current application lifetime.
 
 These exclusions are security boundaries, not claims that the features are
-impossible. They keep the first release small enough to audit.
+impossible. They keep version 1 small enough to audit.
 
 ## 4. Threat model
 
@@ -71,15 +75,19 @@ Ladon provides limited defense against:
 
 - prompt injection causing an unintended use of a secret;
 - another process running as the same operating-system user;
+- replacement of the vault with an older authenticated generation;
 - offline guessing of a short device PIN after both the vault and the native
   device credential store are compromised;
 - memory inspection, swap, hibernation images, crash dumps, or privileged
-  debugging.
+  debugging;
+- filesystem snapshots, backups, or forensic remnants of an explicitly
+  requested plaintext temporary-file binding.
 
 These risks are reduced by explicit unlock context, OS-level IPC permissions,
-short unlocked sessions, device-bound PIN material, output redaction, best-effort
-memory locking and zeroization, and disabled core dumps. Ladon does not claim to
-eliminate them.
+short unlocked sessions, device-bound PIN material, output redaction,
+best-effort memory locking and zeroization, and disabled core dumps. Ladon does
+not claim to eliminate them. In particular, unlocking authorizes requests from
+other processes running as the same OS user until the idle session expires.
 
 ### 4.3 Security invariant
 
@@ -94,7 +102,9 @@ operating-system access controls, never on hidden implementation details.
 1. The user launches `ladon-app`.
 2. Ladon creates a vault at the platform's standard per-user application-data
    location unless the user chooses another path.
-3. The user enters and confirms a strong passphrase.
+3. The user enters and confirms a passphrase of at least 12 Unicode scalar
+   values and at most 1,024 UTF-8 bytes. Spaces are allowed; Ladon imposes no
+   composition rules.
 4. Ladon explains that a lost passphrase cannot be reset and offers an immediate
    encrypted vault backup.
 5. When a supported native credential store is available, Ladon offers a
@@ -113,17 +123,26 @@ The value is stored internally under the field name `value`. An expandable
 **Additional fields** control supports credentials that naturally contain
 multiple values. Dragging a file into the form stores its bytes as one field and
 preserves a sanitized suggested filename for temporary-file injection.
+Binary fields are shown as a byte count and may be replaced from a file; the GUI
+never performs a lossy text conversion.
 
 Secret names are UTF-8 strings between 1 and 128 bytes after NFC normalization.
-Names are unique by exact normalized value. Every record also receives an
-immutable random UUID. Agent and CLI references accept either the exact name or
-UUID; a syntactically valid UUID is resolved as an ID before name lookup.
+They cannot contain ASCII control characters, Unicode bidi-control characters,
+the delimiter `::`, or begin with the reserved prefix `id:`. Names are unique
+by exact normalized value. Every record also receives an immutable random UUID.
+An unprefixed reference is always an exact name; `id:<uuid>` is always an ID.
+There is no heuristic UUID detection.
 
 Field names use `[A-Za-z][A-Za-z0-9_-]{0,63}`. A record contains one or more
 ordered fields. Field values are opaque bytes with an optional `text` hint for
 display; Ladon does not infer provider or credential types. One field is limited
 to 1 MiB and the decrypted vault payload to 64 MiB. These limits keep IPC,
 redaction, backup, and authenticated decoding bounded.
+
+In structured RPC and MCP messages, the secret reference and field name are
+always separate properties. Human CLI syntax uses `secret-ref` for the default
+`value` field and `secret-ref::field` for an explicit field. The reserved name
+rules make this syntax unambiguous.
 
 ### 5.3 Tray-first desktop model
 
@@ -137,26 +156,32 @@ The tray menu shows:
 - **Quit**.
 
 The full manager window opens only for initialization, unlocking, settings,
-history, and create/read/update/delete operations. Closing the window keeps the
-tray process running. Autostart at login is disabled by default and can be
-enabled in settings.
+current-session activity, and create/read/update/delete operations. Closing the
+window keeps the tray process running. Autostart at login is disabled by default
+and can be enabled in settings.
 
 ### 5.4 Unlock-on-request
 
 When an agent request arrives while the vault is locked, Ladon opens a native
 window containing:
 
-- the claimed client name, such as Codex or Claude Code;
-- the secret references and fields exactly as supplied by the client;
-- the executable, arguments, and working directory;
+- an explicit **unverified local client label**, such as Codex or Claude Code;
+- any secret references and fields exactly as supplied by the client;
+- the requested operation and, for a run, the executable, arguments, and working
+  directory;
 - a PIN field when quick unlock is available, plus an option to use the
   passphrase;
 - **Deny** and **Unlock and continue** actions.
 
-The request waits for up to two minutes. A successful unlock resumes the exact
+All client-controlled strings are rendered with control and bidi characters
+escaped and cannot supply markup. The request waits for up to two minutes. A
+successful unlock resumes the exact
 pending request without asking the agent to retry. Denial, timeout, window
 closure, or authentication failure returns a structured error and never starts
 the child process.
+
+Only one unlock request is pending at a time. Additional run or list requests
+receive `busy`; Ladon does not merge dialogs or silently queue commands.
 
 ### 5.5 Unlocked session
 
@@ -175,8 +200,11 @@ when the run ends. Manual lock, MCP lock, screen lock, logout, suspend, or tray
 shutdown cancels active runs before wiping the unlocked session. Ladon never
 claims to be locked while a managed child still retains an injected value.
 
-While unlocked, requests from the same user do not require confirmation per
-operation in the first release.
+While unlocked, requests from the same OS user do not require confirmation per
+operation in version 1. This is a deliberate usability trade-off, not a
+client identity guarantee. The tray keeps the unlocked state and remaining time
+visible. Per-client or per-secret grants are deferred until real usage shows
+that their additional prompts justify the complexity.
 
 ### 5.6 Human reveal and copy
 
@@ -202,13 +230,20 @@ The workspace has three primary packages:
 - `ladon`: human CLI and the `ladon mcp` stdio bridge.
 
 `ladon-core` must not depend on `egui`, MCP, or platform GUI code. Secret values
-are represented by dedicated zeroizing types rather than ordinary application
-strings wherever library APIs permit.
+are represented by dedicated non-cloneable zeroizing byte containers rather
+than ordinary application strings. Passphrase, PIN, and value-entry widgets use
+a Ladon-owned `egui::TextBuffer` implementation backed by the same kind of
+container; password masking alone is not treated as memory protection. Undo,
+copy, drag, and accessibility value export are disabled for these widgets.
 
 ### 6.2 Process lifecycle
 
 `ladon-app` is the single owner of the vault key and decrypted payload. The CLI
-and MCP bridge never decrypt the vault.
+and MCP bridge never decrypt the vault. On Unix, a small runner subprocess may
+receive only the values required for one run through an anonymous private pipe;
+it never receives the vault key or payload and zeroizes its request buffer after
+starting the child. This supervisor is an internal mode of the installed
+`ladon-app` executable, not another service or user-facing binary.
 
 When `ladon run` or `ladon mcp` cannot reach the local endpoint, it starts the
 installed tray application with platform-native process APIs and waits up to
@@ -225,20 +260,24 @@ Codex / Claude Code
         v
 ladon mcp
         |
-        | authenticated local IPC; no managed secret values
+        | OS-authenticated agent-facing local IPC; no managed secret values
         v
 ladon-app
         |-- unlocks vault when required
         |-- resolves secret references
-        |-- starts the child itself
-        |-- injects values in memory
-        |-- redacts output before IPC
+        |-- starts the managed child or Unix supervisor
+        |-- injects values without exposing them to the agent
+        |-- redacts output before agent-facing IPC
         v
 MCP receives exit status and sanitized output
 ```
 
-The only routine that converts a vault field into plaintext process input lives
-inside `ladon-app` and is not exposed as an RPC method.
+Only `ladon-app` can resolve a vault field into plaintext. On Unix it may pass
+the resolved bytes to the single-run supervisor over an anonymous pipe that is
+not addressable by other processes. No public or agent-facing RPC returns a
+plaintext value. Secret creation, editing, import, reveal, and deletion exist
+only in the GUI in version 1, so plaintext values never cross the public local
+IPC endpoint.
 
 ## 7. Vault and cryptography
 
@@ -258,29 +297,68 @@ The default Argon2id profile is the RFC 9106 memory-constrained recommendation:
 - output: 256 bits.
 
 Parameters are stored in the authenticated header so future releases can
-upgrade them. A successful passphrase change generates a fresh salt and KEK and
-rewraps the existing DEK. It does not re-encrypt every logical record.
+upgrade them. Before running Argon2id, the locked decoder rejects parameters
+outside format-version bounds. Version 1 accepts 32--256 MiB of memory, 1--10
+passes, parallelism 1--16, and a 16--64 byte salt. This prevents a malformed
+header from requesting unbounded work.
+
+Passphrases are encoded as the exact UTF-8 bytes entered and are not normalized
+or case-folded. The same rule is used on every platform and is explained beside
+the first passphrase field so visually similar Unicode strings are not implied
+to be equivalent.
+
+A passphrase change requires the current passphrase even while the vault is
+unlocked. A successful change generates a fresh salt, KEK, and DEK and
+re-encrypts the payload. If quick PIN is enabled, its replacement wrapper is
+prepared before the vault commit. Failure to prepare it aborts the change; a
+failure while committing it after the new vault is durable disables quick PIN
+and leaves the new passphrase usable. This is intentionally a less frequent
+operation than ordinary vault writes and gives a
+passphrase change clear revocation semantics for files managed by Ladon.
+Previously copied vaults, sidecars, backups outside Ladon's managed paths, and
+storage-forensic remnants cannot be revoked and are explicitly outside this
+guarantee.
 
 XChaCha20-Poly1305 encrypts both the wrapped DEK and the serialized payload. Each
-encryption uses a fresh random 192-bit nonce. The cleartext format version and
-cryptographic header are supplied as associated data so tampering is detected.
-There is no separate password verifier: successful authenticated decryption is
-the verifier.
+encryption uses a fresh random 192-bit nonce and produces its own 128-bit tag.
+The two operations use distinct domain labels in their associated data. There
+is no separate password verifier: successful authenticated decryption is the
+verifier.
 
 Ladon uses established Rust cryptography libraries and never implements an
 algorithm itself.
 
 ### 7.2 Portable file format
 
-The vault is one versioned binary file:
+The vault is one versioned binary file. Multibyte integer fields are unsigned
+big-endian. Version 1 has this exact framing:
 
 ```text
-magic | format version | authenticated CBOR header | encrypted DEK |
-payload nonce | encrypted canonical-CBOR payload | authentication tag
+magic=`LADONV1\0`[8] | version[u16] | header_len[u32] | payload_len[u64] |
+canonical-CBOR header[header_len] |
+DEK nonce[24] | encrypted DEK[32] | DEK tag[16] |
+payload nonce[24] | encrypted canonical-CBOR payload[payload_len] |
+payload tag[16]
 ```
 
+The version 1 header is a canonical CBOR map containing exactly `kdf`,
+`memory_kib`, `passes`, `parallelism`, and `salt`; `kdf` must be `argon2id`.
+`header_len` and `payload_len` are bounded before allocation; version 1 limits
+the header to 4 KiB and encrypted payload to 64 MiB plus AEAD overhead. The DEK
+associated data is the bytes before `DEK nonce` prefixed with
+`ladon/dek/v1`. The payload associated data is every preceding byte through the
+DEK tag prefixed with `ladon/payload/v1`. Canonical CBOR is required so these
+byte sequences have one representation. The fixed test vectors include the
+complete file bytes, not only primitive-level outputs.
+
+An ordinary mutation reuses the authenticated header and wrapped DEK and creates
+only a fresh payload nonce and ciphertext. Passphrase rotation creates a fresh
+header, both nonces, and both ciphertexts. The KEK is discarded immediately
+after DEK unwrap or wrap; an unlocked session retains the DEK, not the
+passphrase-derived key.
+
 Only format and KDF information is visible while locked. Secret names, field
-names, audit entries, timestamps, and settings are inside the encrypted payload.
+names, timestamps, and portable settings are inside the encrypted payload.
 The decoder enforces size, nesting, record-count, and string-length limits before
 allocation.
 
@@ -288,33 +366,54 @@ The payload contains:
 
 - vault UUID and monotonic revision;
 - secret records and fields;
-- encrypted audit history;
 - user settings that should travel with the vault.
+
+Version 1 accepts at most 10,000 records, 64 fields per record, 16 levels of
+CBOR nesting, and the string limits defined by their model fields. Aggregate
+plaintext remains capped at 64 MiB. These values are format limits, not tunable
+settings.
 
 Device-specific settings such as autostart, native credential-store handles,
 window placement, and quick-PIN configuration remain outside the portable
 payload and never contain managed secret values.
 
-Unknown critical format features cause a hard failure. Unknown non-critical
-payload fields are preserved during read/write so an older compatible client
-does not silently destroy newer data.
+An unsupported file version or extra version 1 header key causes a hard failure.
+Unknown top-level payload keys are preserved during read/write; a future feature
+that changes required interpretation must use a new file version rather than an
+unknown payload key.
 
 ### 7.3 Atomic persistence and recovery
 
-Every mutation follows this sequence:
+After a successful mutation, primary and backup are two copies of the newest
+committed generation, not a version history. Every mutation follows this
+sequence:
 
 1. Serialize and encrypt a complete new generation in memory.
-2. Write it to a randomly named file in the same directory with owner-only
-   permissions.
-3. Flush and close the candidate.
-4. Reopen and authenticate it before replacement.
-5. Preserve the previous valid generation as one encrypted `.bak` file.
-6. Atomically replace the primary file and sync directory metadata where the OS
-   provides that operation.
+2. Write identical bytes to two randomly named candidates in the same directory
+   with owner-only permissions.
+3. Flush, close, reopen, and authenticate both candidates.
+4. Atomically replace `.bak` with the first candidate and sync directory
+   metadata using the platform's durable-replace primitive.
+5. Atomically replace the primary with the second candidate and sync again.
+6. Report success only after both replacements complete.
+
+If interrupted before step 5 completes, the old primary remains authoritative
+and the mutation is not acknowledged. If interrupted during or after step 5,
+at least one candidate contains the fully authenticated new generation. The
+implementation has an explicit per-platform state machine for replace and
+directory synchronization. The durability guarantee applies to the standard
+local filesystems in the supported-platform test matrix. A custom path on a
+filesystem without equivalent primitives requires an explicit warning and is
+not described as crash-safe.
 
 On startup, Ladon never silently selects a backup. If the primary fails
 authentication or structural validation and the backup succeeds, the GUI offers
-an explicit restore showing only generation metadata after passphrase entry.
+an explicit restore showing only generation metadata after passphrase entry. If
+both are valid but have different revisions after an interrupted mutation, the
+primary remains authoritative and the GUI offers the newer backup only when its
+revision is greater. A passphrase change and secret deletion use the same
+two-candidate procedure, so a successfully completed operation does not leave an
+old-password or deleted-secret generation in Ladon's managed `.bak` path.
 
 ### 7.4 Device-local quick PIN
 
@@ -324,30 +423,43 @@ Secret Service implementation.
 
 Enabling a PIN creates a device-local sidecar containing:
 
+- a cleartext sidecar format version and vault UUID;
 - a random PIN salt;
 - Argon2id parameters;
 - a nonce;
-- the DEK encrypted by a quick-unlock KEK;
-- the vault UUID and format version as associated data.
+- the DEK encrypted by a quick-unlock KEK and its AEAD tag;
+- the cleartext fields above as associated data.
 
 The quick-unlock KEK is produced by Argon2id using the PIN as its password input,
 the sidecar salt as its salt input, and the device secret as Argon2's optional
 secret input. The vault UUID and wrapper format version are included in the
 authenticated context. Neither the sidecar nor the native credential item is
-sufficient alone.
+sufficient alone. After quick unwrap, Ladon accepts the session only if payload
+authentication succeeds and its encrypted vault UUID matches the sidecar UUID.
 
-PINs contain at least six digits. Five consecutive failures introduce an
+The sidecar uses owner-only permissions and versioned canonical CBOR and is
+replaced atomically. It is not copied by the GUI backup action. Native credential
+items are requested as device-local and non-synchronizing where the platform
+offers that distinction; otherwise the setup screen states the platform's actual
+behavior.
+
+PINs contain 6--12 digits. The sidecar decoder applies the same KDF bounds as
+the vault header before running Argon2id. Five consecutive failures introduce an
 exponential in-process delay. This delay is not claimed to resist an attacker
 who has extracted both device artifacts and can perform an offline attack.
 
 If the device store is missing, locked, or unavailable, Ladon falls back to the
-passphrase. Removing quick unlock deletes the native item and sidecar. Copying a
-vault never copies a usable PIN unlock mechanism.
+passphrase. **Disable quick PIN** requires the passphrase, rotates the DEK using
+the same durable procedure, then removes the native item and sidecar. Changing
+the passphrase rotates the DEK and updates the sidecar instead. Copying a vault
+never copies a usable PIN unlock mechanism.
 
 ### 7.5 Memory handling
 
 - DEKs, KEKs, PIN material, passphrases, and plaintext fields use zeroizing
   containers.
+- Secret containers are non-cloneable, have redacted `Debug`, no `Display`, and
+  no general-purpose serialization implementation.
 - Temporary copies are minimized and never formatted through general logging.
 - The tray process attempts to lock sensitive pages in RAM and disables core
   dumps where supported. Failure is recorded as a non-secret diagnostic and does
@@ -366,8 +478,11 @@ Ladon never listens on TCP, HTTP, or a network interface.
 The app uses a Unix stream socket inside an owner-only runtime directory. The
 directory mode is `0700` and socket mode is `0600`. The server checks kernel-
 reported peer credentials and rejects peers whose effective UID differs from
-the app owner. The client likewise verifies endpoint ownership before sending a
-request.
+the app owner. After connecting, the client likewise verifies kernel-reported
+server credentials before sending a request; path ownership alone is not used as
+server identity. Startup rejects symlinks and an existing directory or socket
+owned by another user; it fails closed if it cannot create or validate a private
+runtime path.
 
 ### 8.2 Windows
 
@@ -386,10 +501,17 @@ Messages are length-prefixed UTF-8 JSON with:
 - method;
 - typed parameters.
 
-The maximum frame is 1 MiB. Invalid UTF-8, excessive lengths, duplicate object
-keys, unknown methods, and incompatible versions are rejected. Responses echo
-the request UUID and contain either a typed result or a stable error code plus a
-redacted human message.
+Protocol version 1 permits at most 16 levels of JSON nesting, a 64-byte client
+label, 256 arguments, 256 KiB of arguments in total, and 32 KiB each for an
+executable or working directory. Runner-specific binding and output limits apply
+in addition.
+
+The maximum frame is 4 MiB, accommodating the maximum sanitized process response
+without streaming. Environment, output, and aggregate request limits are
+checked independently rather than inferred from frame size. Invalid UTF-8,
+excessive lengths, duplicate object keys, unknown methods, and incompatible
+versions are rejected. Responses echo the request UUID and contain either a
+typed result or a stable error code plus a redacted human message.
 
 No shared IPC token is used. A token readable by every process under the same
 user would not improve the selected security boundary. The client label shown
@@ -404,38 +526,60 @@ Agent-facing MCP can call only:
 - read lock/session status;
 - lock the vault.
 
-It cannot create, update, delete, reveal, copy, export, or decrypt a secret. The
-human CLI may perform create/update/delete through a separate RPC role, but
-requires an interactive terminal and cannot accept a plaintext value in an
-argument. The GUI has the complete management surface.
+It cannot create, update, delete, reveal, copy, export, or decrypt a secret. No
+public IPC method performs those operations. The GUI is the only management
+surface in version 1.
+
+Listing names while locked opens the same unlock window as a run request. Secret
+names and field names are metadata, not managed values, but the setup screen
+warns that listing exposes them to the local agent and its transcript.
 
 ## 9. Generic process runner
 
 ### 9.1 Request shape
 
-A run request contains:
+A public run RPC request contains:
 
-- executable as one string;
+- an absolute executable path;
 - arguments as an array of strings;
 - absolute working directory;
-- environment inheritance mode;
 - zero or more secret bindings;
 - timeout and output limit within configured bounds.
+
+Executable, arguments, and working directory are Unicode strings without NUL.
+Version 1 returns `unsupported_path_encoding` for non-UTF-8 Unix paths rather
+than adding a second byte-string representation to the public protocol.
+
+A run has at most 16 secret bindings and at most 1 MiB of injected secret bytes
+in total. The default timeout is five minutes. MCP callers may request up to 15
+minutes; a human CLI caller may request up to two hours. Version 1 does not
+support an unlimited run or more than one concurrent secret-bearing run. A
+second run receives `busy` rather than entering a hidden queue; status and lock
+remain available.
 
 Ladon uses direct process creation. It never implicitly wraps the request in
 `sh -c`, `cmd.exe`, or PowerShell. A caller that genuinely needs a shell must
 name it explicitly. Managed secret values are rejected if they appear in the
-executable, arguments, working directory, or non-secret environment values.
+executable, arguments, or working directory.
 
-The requesting CLI sends its environment snapshot through protected IPC because
-the tray process may have been launched outside the user's shell. Environment
-values are never logged. `clean` mode instead starts from a documented minimal
-platform environment. The resolved executable path is included in the unlock
-dialog and encrypted audit entry.
+The human CLI and MCP tool accept an absolute path, a path relative to the
+requested working directory, or a bare executable name. The local `ladon`
+frontend canonicalizes a path or resolves a bare name once using its own PATH,
+then sends the absolute result to the app. The app rejects relative RPC paths,
+verifies the target is an executable file and the working directory is an
+existing directory, shows that same path in the unlock dialog, and passes it
+unchanged to process creation.
+
+All runs start from a documented minimal platform environment containing the
+target executable's directory, standard system command directories, temporary
+directory, user home, and locale. Version 1 never inherits the requesting
+process's complete environment and accepts no caller-supplied non-secret
+environment map. A caller may pass non-secret configuration through the target
+program's ordinary arguments.
 
 ### 9.2 Secret bindings
 
-The first release supports three targets:
+Version 1 supports three targets:
 
 1. **Environment**: set a named child environment variable. The field must be
    valid text for the target OS and contain no NUL.
@@ -446,7 +590,13 @@ The first release supports three targets:
    write the field to an owner-only file, and set a named environment variable
    to the file path.
 
-Secret values are never supported in command-line arguments.
+Ladon never places secret values in the direct child's command-line arguments.
+It cannot prevent an authorized child from copying a value into a descendant's
+arguments, files, or network traffic.
+Environment target names must be valid for the target OS and cannot contain NUL
+or `=`. Targets must be unique after platform comparison (case-insensitive on
+Windows) and secret bindings override the corresponding minimal-environment
+value. Duplicate or conflicting bindings are rejected before unlock.
 
 Temporary file names are random. A sanitized suggested basename may provide a
 file extension when required, but cannot add directories or escape the temporary
@@ -454,6 +604,11 @@ root. The directory is removed after normal completion, cancellation, timeout,
 or spawn failure. Startup removes stale Ladon temporary directories after
 validating ownership and an unguessable marker; it never recursively deletes an
 unvalidated path.
+
+Temporary-file binding necessarily writes plaintext to local storage. The GUI
+and tool description prefer environment or stdin and warn that filesystem
+snapshots, backups, and forensic recovery are outside Ladon's control. The file
+mode exists only for programs that require a credential path.
 
 ### 9.3 Output redaction
 
@@ -464,27 +619,46 @@ boundaries and covers each injected field in these representations:
 - raw bytes;
 - UTF-8 JSON string escaping when the value is valid UTF-8;
 - percent encoding when the value is valid UTF-8;
+- lowercase and uppercase hexadecimal;
 - standard and URL-safe Base64, padded and unpadded.
 
-Matches become `[REDACTED:secret-id.field]`. Empty values have no pattern. Short
-values may heavily redact output; safety takes precedence over readability.
-Output is capped at 10 MiB combined by default and 50 MiB maximum. Truncation is
-explicitly reported.
+JSON escaping follows the serializer used by the protocol. Percent patterns
+cover byte-wise RFC 3986 encoding with upper- and lowercase hex. Duplicate
+derived patterns are removed before matching. These are deliberately common
+accidental representations, not an open-ended transformation engine.
+
+Matches become `[REDACTED:secret-id.field]`. Empty values have no pattern. If any
+non-empty injected value or generated representation is shorter than four
+bytes, Ladon suppresses stdout and stderr entirely for that run rather than risk
+unbounded marker expansion. Redaction operates on bytes. After redaction,
+remaining invalid UTF-8 bytes are rendered as `\xNN`; this conversion never runs
+on unredacted bytes. The combined response is capped after replacement and
+escaping at 512 KiB by default and 2 MiB maximum. Ladon retains a bounded head
+and tail and reports omitted byte counts.
 
 Redaction is defense against accidental disclosure, not a data-loss-prevention
 sandbox. A malicious child can split, encrypt, hash, or transmit its input.
 
 ### 9.4 Cancellation and process trees
 
-Each run owns a process group on Unix and a Job Object on Windows. Timeout,
-client cancellation, or tray shutdown terminates the group, waits for cleanup,
-removes temporary files, and returns a structured outcome. Ladon reports exit
-code or terminating signal where the platform provides one.
+Each run owns a Job Object with kill-on-last-handle-close on Windows. On macOS
+and Linux, a minimal single-run supervisor owns a new process group and watches
+an anonymous liveness pipe from `ladon-app`; EOF terminates the group. The app
+also watches the supervisor and terminates the group if the supervisor fails.
+Timeout, client cancellation, deliberate lock, tray shutdown, or either side of
+the supervision channel disappearing terminates the group, waits for cleanup,
+and removes temporary files. The supervisor accepts no public connections,
+persists nothing, and exits with the child. Ladon reports exit code or
+terminating signal where the platform provides one.
 
-The first release does not allocate a PTY/ConPTY. Programs must be usable
+These lifecycle guarantees cover the direct child and descendants that remain
+in the assigned Job Object or process group. Deliberately escaping containment
+is malicious-child behavior and remains a non-goal.
+
+Version 1 does not allocate a PTY/ConPTY. Programs must be usable
 non-interactively when called through MCP.
 
-### 9.5 Result and audit
+### 9.5 Result and current-session activity
 
 The response contains:
 
@@ -494,11 +668,14 @@ The response contains:
 - redaction count;
 - output-truncated flag.
 
-The encrypted bounded audit log stores client label, resolved executable,
-arguments, working directory, referenced secret IDs and fields, timestamps,
-outcome, and redaction count. It never stores environment values, secret values,
-stdin, temporary-file contents, stdout, or stderr. The first release retains the
-most recent 1,000 entries.
+For usability, the running tray keeps at most 100 metadata-only activity entries
+in memory: unverified client label, resolved executable, referenced secret IDs
+and fields, timestamps, outcome, and redaction count. It never stores arguments,
+environment values, secret values, stdin, temporary-file contents, stdout, or
+stderr. The list is cleared on tray exit and is not part of the vault. Persistent
+audit history is deferred because it is not required for safe secret handoff and
+would add a second encrypted persistence protocol or force a full-vault write on
+every command.
 
 ## 10. CLI and MCP integration
 
@@ -509,9 +686,6 @@ Initial commands are:
 ```text
 ladon status
 ladon list
-ladon add
-ladon edit <ref>
-ladon remove <ref>
 ladon run [bindings] -- <program> [args...]
 ladon lock
 ladon integrate codex
@@ -519,8 +693,9 @@ ladon integrate claude
 ladon mcp
 ```
 
-`add` and `edit` read values from a no-echo terminal prompt, stdin, or a file.
-They reject value-bearing command-line options. Structured output modes never
+The initial CLI deliberately has no add, edit, reveal, export, or remove command.
+Those operations stay in the GUI so the local protocol never needs a general
+"return secret" or plaintext-management path. Structured output modes never
 include plaintext values.
 
 Example bindings:
@@ -529,12 +704,12 @@ Example bindings:
 ladon run --env GITLAB_TOKEN=gitlab-work -- glab mr list
 
 ladon run \
-  --env AWS_ACCESS_KEY_ID=aws-prod.access_key_id \
-  --env AWS_SECRET_ACCESS_KEY=aws-prod.secret_access_key \
+  --env AWS_ACCESS_KEY_ID=aws-prod::access_key_id \
+  --env AWS_SECRET_ACCESS_KEY=aws-prod::secret_access_key \
   -- terraform plan
 
 ladon run \
-  --file-env GOOGLE_APPLICATION_CREDENTIALS=gcp.credentials_json \
+  --file-env GOOGLE_APPLICATION_CREDENTIALS=gcp::credentials_json \
   -- gcloud projects list
 ```
 
@@ -547,11 +722,19 @@ ladon run \
 - `ladon_status`
 - `ladon_lock`
 
-Tool descriptions tell the model to refer to secrets by exact name or ID and
-never ask the user to paste a value. `ladon_run` is marked as potentially
-destructive because the arbitrary child command can modify external state.
-Secret values never appear in MCP resources, prompts, tool schemas, tool
-arguments, progress notifications, errors, or results.
+Tool descriptions tell the model to refer to secrets by exact name or
+`id:<uuid>` and never ask the user to paste a value. `ladon_run` is marked as
+potentially destructive because the arbitrary child command can modify external
+state. Ladon never intentionally places secret values in MCP resources, prompts,
+tool schemas, tool arguments, progress notifications, errors, or results. Known
+output representations are redacted as specified in section 9.3; a malicious
+child's transformed output remains outside that guarantee.
+
+The MCP bridge and `ladon-app` must run on the same machine and under the same OS
+user. The integration command states this requirement before writing anything.
+If the configured MCP process cannot reach the app, it returns an actionable
+local-only error; Ladon does not try to infer every client's remote-execution
+mode.
 
 ### 10.3 One-command setup
 
@@ -561,10 +744,12 @@ arguments, progress notifications, errors, or results.
 2. show the exact local stdio MCP configuration to be created;
 3. ask for confirmation;
 4. invoke the client's documented MCP configuration command when available;
-5. verify that the resulting client configuration starts `ladon mcp` by absolute
-   path;
-6. print a manual configuration snippet if the client command is unavailable or
-   incompatible.
+5. configure a tool timeout of at least 16 minutes where the client supports it,
+   so Ladon's maximum MCP run can return its cleanup result;
+6. verify that the resulting client configuration starts `ladon mcp` by absolute
+   local path and does not select a remote execution environment;
+7. print a manual configuration snippet if the client command or timeout setting
+   is unavailable or incompatible.
 
 The integration command never writes credentials into Codex or Claude
 configuration.
@@ -580,6 +765,8 @@ configuration.
 - **Unknown secret/field:** return a stable not-found error without opening a
   process.
 - **Locked request timeout:** deny and return `unlock_timeout`.
+- **No interactive desktop:** a locked request returns `ui_unavailable`; MCP
+  never falls back to asking for a passphrase or PIN in the agent transcript.
 - **Vault corruption:** never overwrite the primary; validate the encrypted
   backup and offer explicit recovery.
 - **IPC version mismatch:** show installed client/app versions and request an
@@ -588,8 +775,9 @@ configuration.
   temporary material.
 - **Redactor failure:** suppress output and report a redaction error rather than
   forwarding unsanitized bytes.
-- **Audit failure:** fail closed before starting a process when the audit entry
-  cannot be committed, unless audit was explicitly disabled in GUI settings.
+- **Supervisor failure:** do not start the target if supervision is not ready;
+  if supervision disappears later, terminate the target and suppress any output
+  that has not completed redaction.
 
 All user-visible errors use stable codes and actionable text. Internal logs use
 structured fields with an allowlist; arbitrary request objects and environments
@@ -597,7 +785,7 @@ are never formatted into logs.
 
 ## 12. Packaging and platform support
 
-The first public release targets:
+The first stable release targets:
 
 - macOS 13 or later, Apple Silicon and x86_64;
 - Windows 10 or later, x86_64;
@@ -607,6 +795,12 @@ The first public release targets:
 Release CI builds each target on a native GitHub Actions runner. The project does
 not claim that one host can cross-compile and sign every platform. Packages
 contain both `ladon-app` and `ladon` and require no Rust toolchain.
+
+Security-preview builds may reach the three platforms sequentially. A platform
+is not called supported until its native credential store, IPC, lock events,
+process supervision, installer, and leakage tests pass. This preserves the
+three-platform product goal without making simultaneous parity a release gate
+for early feedback.
 
 macOS applications are code-signed and notarized. Windows installers and
 executables are Authenticode-signed. Linux artifacts include checksums and a
@@ -635,10 +829,14 @@ Advisories until a fixed release is available.
 ### 14.1 Cryptography and vault
 
 - fixed test vectors for KDF, DEK wrapping, payload encryption, and quick unlock;
+- whole-file byte-for-byte vectors for every format version;
 - round-trip tests for every supported format version;
 - mutation tests proving that header, nonce, ciphertext, and tag changes fail;
 - wrong passphrase, wrong PIN, wrong device secret, and wrong vault UUID tests;
-- property tests for atomic generations and unknown non-critical fields;
+- KDF-boundary tests proving oversized parameters fail before Argon2 allocation;
+- passphrase-rotation tests proving the old passphrase and old PIN wrapper cannot
+  open the new primary or managed backup;
+- property tests for atomic generations and preserved unknown payload keys;
 - fuzzing for the locked header and decrypted CBOR decoder;
 - fault injection at every atomic-write step, including recovery from `.bak`.
 
@@ -649,6 +847,9 @@ Advisories until a fixed release is available.
 - peer-credential validation tests;
 - frame length, invalid JSON, duplicate key, cancellation, and version mismatch
   tests;
+- maximum-size request and sanitized-response tests within the frame limit;
+- assertions that the public method table contains no plaintext management or
+  reveal operation;
 - fuzzing of request decoding and dispatch;
 - startup races proving only one tray owner becomes ready.
 
@@ -656,12 +857,17 @@ Advisories until a fixed release is available.
 
 - assert managed values never appear in process arguments;
 - verify environment, stdin, and file bindings independently;
+- verify the minimal environment, absence of inherited variables, and executable
+  resolution;
 - verify raw and encoded redaction across every possible chunk boundary;
+- verify short-secret output suppression, invalid UTF-8 escaping, marker
+  expansion, and post-redaction output limits;
 - verify no unredacted output is emitted when the redactor fails;
 - verify cleanup after success, non-zero exit, spawn failure, timeout,
   cancellation, and forced process death;
 - scan test logs, MCP fixtures, snapshots, and crash output for canary secrets;
-- verify process-tree termination on macOS, Linux, and Windows.
+- kill the app and supervisor independently and verify process-tree termination
+  and temporary-file cleanup on macOS, Linux, and Windows.
 
 ### 14.4 GUI and integration
 
@@ -670,7 +876,8 @@ Advisories until a fixed release is available.
 - accessibility checks for keyboard navigation, focus, and screen-reader labels;
 - packaged smoke tests on all supported OS targets;
 - protocol-level MCP conformance tests;
-- smoke tests against supported Codex and Claude Code versions before release.
+- smoke tests against supported Codex and Claude Code versions before release,
+  including client cancellation and configured tool timeout.
 
 ### 14.5 Independent review gate
 
@@ -685,9 +892,9 @@ assessed at minimum:
 - output redaction limitations;
 - release pipeline integrity.
 
-## 15. Acceptance criteria for the first release
+## 15. Acceptance criteria for stable version 1
 
-The first release is feature-complete when all of the following are true:
+Stable version 1 is feature-complete when all of the following are true:
 
 1. A new user can create, lock, unlock, back up, and reopen a portable vault.
 2. A user can add a single value with only a name and value, add multiple fields,
@@ -697,13 +904,15 @@ The first release is feature-complete when all of the following are true:
 4. The 30-minute idle timer and immediate lock events behave as specified.
 5. `ladon run` supports environment, stdin, and temporary-file bindings without
    managed values in process arguments.
-6. Canary values do not appear in Ladon logs, IPC captures, MCP transcripts, or
-   sanitized child output in the leakage test suite.
+6. Canary values do not appear in Ladon logs, agent-facing IPC captures, MCP
+   transcripts, or sanitized child output in the leakage test suite. The public
+   local IPC endpoint is separately verified to be owner-only and value-free.
 7. Codex and Claude Code can be configured through the integration commands and
    can list names and run commands without receiving plaintext values.
 8. Owner-only IPC access is verified on macOS, Linux, and Windows.
 9. Interrupted vault writes recover without losing both the primary and backup
-   generations.
+   generations, and successful passphrase rotation leaves neither managed file
+   decryptable with the old passphrase.
 10. Signed installable artifacts and SBOMs are produced from a tagged public
     commit for every supported platform.
 
@@ -714,7 +923,7 @@ The first release is feature-complete when all of the following are true:
 - [OWASP Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
 - [NIST Secure Software Development Framework](https://csrc.nist.gov/projects/ssdf)
 - [Model Context Protocol specification](https://modelcontextprotocol.io/specification/)
-- [Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+- [Codex MCP documentation](https://developers.openai.com/codex/mcp/)
 - [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp)
 - [Linux Unix-domain sockets](https://man7.org/linux/man-pages/man7/unix.7.html)
 - [macOS `getpeereid`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getpeereid.3.html)

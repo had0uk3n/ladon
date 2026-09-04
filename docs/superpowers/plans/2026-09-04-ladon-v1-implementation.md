@@ -114,14 +114,14 @@ impl FieldName {
 - Create: `crates/ladon-core/tests/broker_state.rs`
 - Modify: `crates/ladon-core/src/lib.rs`
 
-- [ ] Write JSON fixture tests for versioned `status`, `list`, `lock`, and `run` requests/results plus every stable error code.
-- [ ] Write length-prefix tests rejecting zero/oversized (>4 MiB), malformed, partial, duplicate-field, and extra trailing frames before state mutation.
-- [ ] Write a deterministic state-machine test for locked, one pending unlock, busy rejection, two-minute timeout, unlocked idle expiry, active-run timer pause, and lock-triggered cancellation-before-wipe.
-- [ ] Run focused tests; expect failure.
-- [ ] Implement explicit DTOs that contain only secret references/field names and sanitized metadata; add a recursive test that successful agent-facing responses contain no secret-byte field.
-- [ ] Implement `BrokerState` with injected monotonic clock and event enum; keep only bounded in-memory current-lifetime activity.
-- [ ] Re-run focused and workspace tests; expect pass.
-- [ ] Commit: `feat: define bounded IPC protocol and broker state`.
+- [x] Write JSON fixture tests for versioned `status`, `list`, `lock`, and `run` requests/results plus stable error codes.
+- [x] Write length-prefix tests rejecting zero/oversized (>4 MiB), malformed, partial, duplicate-field, and extra trailing frames before state mutation.
+- [x] Write a deterministic state-machine test for locked, one pending unlock, busy rejection, two-minute timeout, unlocked idle expiry, active-run timer pause, and lock-triggered cancellation-before-wipe.
+- [x] Run focused tests; expect failure.
+- [x] Implement explicit DTOs that contain only secret references/field names and sanitized metadata; add a recursive test that successful agent-facing responses contain no secret-byte field.
+- [x] Implement `BrokerState` with injected monotonic clock and event enum; keep only bounded in-memory current-lifetime activity.
+- [x] Re-run focused and workspace tests; expect pass.
+- [x] Commit: `feat: define bounded IPC protocol and broker state`.
 
 ### Task 6: Implement streaming output redaction
 

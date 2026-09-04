@@ -15,9 +15,11 @@ version = "0.1.0"
 [workspace.dependencies]
 thiserror = "2"
 unicode-normalization = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 minicbor = { version = "2", features = ["alloc"] }
 zeroize = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -38,6 +38,14 @@ pub enum LadonError {
     StorageFailure,
     #[error("neither managed vault copy can be opened")]
     VaultUnavailable,
+    #[error("IPC frame is invalid")]
+    InvalidFrame,
+    #[error("IPC frame exceeds the size limit")]
+    FrameTooLarge,
+    #[error("IPC request is invalid")]
+    InvalidRequest,
+    #[error("unsupported protocol version")]
+    UnsupportedProtocolVersion,
 }
 
 impl LadonError {
@@ -62,6 +70,38 @@ impl LadonError {
             Self::RevisionOverflow => "revision_overflow",
             Self::StorageFailure => "storage_failure",
             Self::VaultUnavailable => "vault_unavailable",
+            Self::InvalidFrame => "invalid_frame",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::InvalidRequest => "invalid_request",
+            Self::UnsupportedProtocolVersion => "unsupported_protocol_version",
+        }
+    }
+
+    #[must_use]
+    pub const fn safe_message(self) -> &'static str {
+        match self {
+            Self::InvalidSecretRef => "invalid secret reference",
+            Self::InvalidFieldName => "invalid field name",
+            Self::FieldTooLarge => "field value exceeds the size limit",
+            Self::DuplicateField => "record contains duplicate field names",
+            Self::EmptyRecord => "record must contain at least one field",
+            Self::TooManyFields => "record contains too many fields",
+            Self::VaultPayloadTooLarge => "vault payload exceeds the size limit",
+            Self::InvalidVaultPayload => "invalid vault payload",
+            Self::InvalidVaultFile => "invalid vault file",
+            Self::UnsupportedVaultVersion => "unsupported vault version",
+            Self::VaultAuthenticationFailed => "vault authentication failed",
+            Self::CryptoUnavailable => "cryptographic randomness is unavailable",
+            Self::DuplicateSecretName => "a secret with that name already exists",
+            Self::SecretNotFound => "secret not found",
+            Self::FieldNotFound => "secret field not found",
+            Self::RevisionOverflow => "vault revision cannot be incremented",
+            Self::StorageFailure => "vault storage operation failed",
+            Self::VaultUnavailable => "neither managed vault copy can be opened",
+            Self::InvalidFrame => "IPC frame is invalid",
+            Self::FrameTooLarge => "IPC frame exceeds the size limit",
+            Self::InvalidRequest => "IPC request is invalid",
+            Self::UnsupportedProtocolVersion => "unsupported protocol version",
         }
     }
 }

@@ -2,8 +2,8 @@ use std::{fs, time::Duration};
 
 use ladon_app::{
     AddSecretDraft, ApprovalSecret, ClipboardLease, EditSecretDraft, EditableField, EditableValue,
-    PendingApproval, PendingRequestView, RevealLease, SensitiveText, VaultController, VaultUiPhase,
-    validate_new_passphrase,
+    NavigationResult, NavigationTarget, PendingApproval, PendingRequestView, SecretDetailState,
+    SensitiveText, VaultController, VaultUiPhase, validate_new_passphrase,
 };
 use ladon_core::{
     ActivitySink, FieldName, LadonError, MAX_FIELD_BYTES, SecretField, SecretId, SensitiveBytes,
@@ -31,11 +31,74 @@ fn add_form_starts_simple_and_expands_to_ordered_additional_fields() {
     assert_eq!(draft.fields()[1].name(), "access_key");
 }
 
+fn text_draft(id: SecretId) -> EditSecretDraft {
+    EditSecretDraft::from_parts(
+        id,
+        "example",
+        vec![EditableField::text(
+            "value",
+            SensitiveText::from("fake-state-secret"),
+        )],
+    )
+}
+
+fn authorized_state() -> (SecretDetailState, uuid::Uuid, SecretId) {
+    let session = uuid::Uuid::new_v4();
+    let secret = SecretId::new();
+    let mut state = SecretDetailState::default();
+    state.navigate_now(NavigationTarget::Secret(secret));
+    let attempt = state.authentication_attempt(session).unwrap();
+    assert!(state.accept_authentication(attempt, session));
+    (state, session, secret)
+}
+
 #[test]
-fn reveal_lease_expires_after_ten_seconds() {
-    let lease = RevealLease::new(1_000);
-    assert!(lease.is_active(10_999));
-    assert!(!lease.is_active(11_000));
+fn authorization_is_bound_to_session_secret_and_selection_epoch() {
+    let session = uuid::Uuid::new_v4();
+    let first = SecretId::new();
+    let second = SecretId::new();
+    let mut state = SecretDetailState::default();
+    state.navigate_now(NavigationTarget::Secret(first));
+    let stale = state.authentication_attempt(session).unwrap();
+    state.navigate_now(NavigationTarget::Secret(second));
+    state.navigate_now(NavigationTarget::Secret(first));
+    assert!(!state.accept_authentication(stale, session));
+    assert!(!state.is_authorized(session));
+}
+
+#[test]
+fn dirty_edit_requires_discard_before_navigation_but_lock_never_waits() {
+    let (mut state, _, secret) = authorized_state();
+    state.begin_edit(text_draft(secret)).unwrap();
+    state.mark_dirty();
+    assert_eq!(
+        state.request_navigation(NavigationTarget::Add),
+        NavigationResult::ConfirmDiscard
+    );
+    assert!(state.is_editing());
+    state.clear_for_vault_lock();
+    assert_eq!(state.selected(), None);
+    assert!(!state.has_sensitive_buffer());
+}
+
+#[test]
+fn hiding_drops_values_but_keeps_current_secret_authorized() {
+    let (mut state, session, secret) = authorized_state();
+    state.begin_reveal(text_draft(secret)).unwrap();
+    state.hide_values();
+    assert!(!state.has_sensitive_buffer());
+    assert!(state.is_authorized(session));
+}
+
+#[test]
+fn finishing_save_drops_the_editor_but_keeps_current_secret_authorized() {
+    let (mut state, session, secret) = authorized_state();
+    state.begin_edit(text_draft(secret)).unwrap();
+    state.mark_dirty();
+    state.finish_save();
+    assert!(!state.has_sensitive_buffer());
+    assert!(!state.is_editing());
+    assert!(state.is_authorized(session));
 }
 
 #[test]

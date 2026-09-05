@@ -9,6 +9,7 @@ use ladon_core::{
     SecretField, SecretId, SecretMetadata, SecretRef, SensitiveBytes, TextHint,
     ValidatedSecretBinding, VaultOpen, VaultPayload, VaultSession, VaultStore, create_vault,
 };
+use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ApprovalSecret;
@@ -16,7 +17,6 @@ use crate::EditSecretDraft;
 
 const MIN_PASSPHRASE_SCALARS: usize = 12;
 const MAX_PASSPHRASE_BYTES: usize = 1024;
-const REVEAL_MILLIS: u64 = 10_000;
 const CLIPBOARD_MILLIS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -679,22 +679,223 @@ fn ensure_private_parent(path: &Path) -> Result<(), LadonError> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RevealLease {
-    deadline_millis: u64,
+pub enum DetailMode {
+    Hidden,
+    Revealed(EditSecretDraft),
+    Editing { draft: EditSecretDraft, dirty: bool },
 }
 
-impl RevealLease {
-    #[must_use]
-    pub const fn new(now_millis: u64) -> Self {
+impl Default for DetailMode {
+    fn default() -> Self {
+        Self::Hidden
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NavigationTarget {
+    Add,
+    Secret(SecretId),
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NavigationResult {
+    Applied,
+    ConfirmDiscard,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalAuthAttempt {
+    vault_session_id: Uuid,
+    secret_id: SecretId,
+    selection_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetailStateError {
+    NotAuthorized,
+    DraftDoesNotMatchSelection,
+}
+
+pub struct SecretDetailState {
+    selected: Option<SecretId>,
+    authorized: Option<LocalAuthAttempt>,
+    selection_epoch: u64,
+    mode: DetailMode,
+    pending_navigation: Option<NavigationTarget>,
+}
+
+impl Default for SecretDetailState {
+    fn default() -> Self {
         Self {
-            deadline_millis: now_millis.saturating_add(REVEAL_MILLIS),
+            selected: None,
+            authorized: None,
+            selection_epoch: 0,
+            mode: DetailMode::Hidden,
+            pending_navigation: None,
+        }
+    }
+}
+
+impl SecretDetailState {
+    #[must_use]
+    pub const fn selected(&self) -> Option<SecretId> {
+        self.selected
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> &DetailMode {
+        &self.mode
+    }
+
+    #[must_use]
+    pub const fn is_editing(&self) -> bool {
+        matches!(self.mode, DetailMode::Editing { .. })
+    }
+
+    #[must_use]
+    pub const fn has_sensitive_buffer(&self) -> bool {
+        !matches!(self.mode, DetailMode::Hidden)
+    }
+
+    #[must_use]
+    pub fn is_authorized(&self, vault_session_id: Uuid) -> bool {
+        self.authorization_for_current_selection(vault_session_id)
+            .is_some()
+    }
+
+    #[must_use]
+    pub fn authentication_attempt(&self, vault_session_id: Uuid) -> Option<LocalAuthAttempt> {
+        self.selected.map(|secret_id| LocalAuthAttempt {
+            vault_session_id,
+            secret_id,
+            selection_epoch: self.selection_epoch,
+        })
+    }
+
+    pub fn accept_authentication(
+        &mut self,
+        attempt: LocalAuthAttempt,
+        vault_session_id: Uuid,
+    ) -> bool {
+        if self.authentication_attempt(vault_session_id) != Some(attempt) {
+            return false;
+        }
+        self.authorized = Some(attempt);
+        true
+    }
+
+    pub fn begin_reveal(&mut self, draft: EditSecretDraft) -> Result<(), DetailStateError> {
+        self.begin_with_draft(draft, false)
+    }
+
+    pub fn begin_edit(&mut self, draft: EditSecretDraft) -> Result<(), DetailStateError> {
+        self.begin_with_draft(draft, true)
+    }
+
+    pub fn mark_dirty(&mut self) {
+        if let DetailMode::Editing { dirty, .. } = &mut self.mode {
+            *dirty = true;
+        }
+    }
+
+    pub fn hide_values(&mut self) {
+        self.drop_sensitive_mode();
+    }
+
+    pub fn finish_save(&mut self) {
+        self.drop_sensitive_mode();
+    }
+
+    pub fn request_navigation(&mut self, target: NavigationTarget) -> NavigationResult {
+        if matches!(self.mode, DetailMode::Editing { dirty: true, .. }) {
+            self.pending_navigation = Some(target);
+            NavigationResult::ConfirmDiscard
+        } else {
+            self.navigate_now(target);
+            NavigationResult::Applied
         }
     }
 
     #[must_use]
-    pub const fn is_active(self, now_millis: u64) -> bool {
-        now_millis < self.deadline_millis
+    pub const fn pending_navigation(&self) -> Option<NavigationTarget> {
+        self.pending_navigation
+    }
+
+    pub fn cancel_pending_navigation(&mut self) {
+        self.pending_navigation = None;
+    }
+
+    pub fn discard_pending_navigation(&mut self) -> NavigationResult {
+        if let Some(target) = self.pending_navigation.take() {
+            self.navigate_now(target);
+        }
+        NavigationResult::Applied
+    }
+
+    pub fn navigate_now(&mut self, target: NavigationTarget) {
+        self.drop_sensitive_mode();
+        self.authorized = None;
+        self.selected = match target {
+            NavigationTarget::Secret(secret_id) => Some(secret_id),
+            NavigationTarget::Add | NavigationTarget::Close => None,
+        };
+        self.pending_navigation = None;
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+    }
+
+    pub fn clear_for_vault_lock(&mut self) {
+        self.drop_sensitive_mode();
+        self.selected = None;
+        self.authorized = None;
+        self.pending_navigation = None;
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+    }
+
+    pub fn clear_for_close(&mut self) {
+        self.clear_for_vault_lock();
+    }
+
+    fn begin_with_draft(
+        &mut self,
+        draft: EditSecretDraft,
+        editing: bool,
+    ) -> Result<(), DetailStateError> {
+        let Some(selected) = self.selected else {
+            return Err(DetailStateError::DraftDoesNotMatchSelection);
+        };
+        if draft.id() != selected {
+            return Err(DetailStateError::DraftDoesNotMatchSelection);
+        }
+        if self.authorized.is_none() {
+            return Err(DetailStateError::NotAuthorized);
+        }
+        self.drop_sensitive_mode();
+        self.mode = if editing {
+            DetailMode::Editing {
+                draft,
+                dirty: false,
+            }
+        } else {
+            DetailMode::Revealed(draft)
+        };
+        Ok(())
+    }
+
+    fn authorization_for_current_selection(
+        &self,
+        vault_session_id: Uuid,
+    ) -> Option<LocalAuthAttempt> {
+        let authorization = self.authorized?;
+        (authorization.vault_session_id == vault_session_id
+            && self.selected == Some(authorization.secret_id)
+            && self.selection_epoch == authorization.selection_epoch)
+            .then_some(authorization)
+    }
+
+    fn drop_sensitive_mode(&mut self) {
+        let discarded = std::mem::replace(&mut self.mode, DetailMode::Hidden);
+        drop(discarded);
     }
 }
 

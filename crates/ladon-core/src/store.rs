@@ -92,8 +92,9 @@ impl VaultStore {
 
         match (primary, backup) {
             (Some(vault), Some(backup)) => {
-                let newer_backup =
-                    (backup.payload().revision() > vault.payload().revision()).then_some(backup);
+                let newer_backup = (backup.payload().vault_id() == vault.payload().vault_id()
+                    && backup.payload().revision() > vault.payload().revision())
+                .then_some(backup);
                 Ok(VaultOpen::Primary {
                     vault,
                     newer_backup,

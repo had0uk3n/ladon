@@ -47,6 +47,33 @@ fn valid_primary_remains_authoritative_while_newer_backup_is_offered() {
 }
 
 #[test]
+fn backup_from_a_different_vault_is_never_offered_over_a_valid_primary() {
+    let directory = tempfile::tempdir().unwrap();
+    let primary_path = directory.path().join("vault.ladon");
+    let store = VaultStore::new(primary_path.clone());
+    let password = SensitiveBytes::new(b"correct horse".to_vec());
+    let primary = create_vault(
+        VaultPayload::new(SecretId::new(), 1, vec![]).unwrap(),
+        &password,
+    )
+    .unwrap()
+    .1;
+    let unrelated_backup = create_vault(
+        VaultPayload::new(SecretId::new(), 99, vec![]).unwrap(),
+        &password,
+    )
+    .unwrap()
+    .1;
+    fs::write(&primary_path, primary).unwrap();
+    fs::write(store.backup_path(), unrelated_backup).unwrap();
+
+    match store.open(&password).unwrap() {
+        VaultOpen::Primary { newer_backup, .. } => assert!(newer_backup.is_none()),
+        VaultOpen::RestoreRequired { .. } => panic!("valid primary must remain authoritative"),
+    }
+}
+
+#[test]
 fn commit_installs_two_identical_authenticated_copies() {
     let directory = tempdir().unwrap();
     let primary = directory.path().join("vault.ladon");

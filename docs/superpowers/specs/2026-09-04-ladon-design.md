@@ -199,6 +199,9 @@ An active secret-bearing run pauses the idle countdown; the countdown restarts
 when the run ends. Manual lock, MCP lock, screen lock, logout, suspend, or tray
 shutdown cancels active runs before wiping the unlocked session. Ladon never
 claims to be locked while a managed child still retains an injected value.
+Run admission and locking share one synchronized state: entering a locking
+transition atomically blocks new runs, cancels the active token if present, and
+waits for process-tree cleanup before dropping the unlocked session.
 
 While unlocked, requests from the same OS user do not require confirmation per
 operation in version 1. This is a deliberate usability trade-off, not a
@@ -417,9 +420,12 @@ authentication or structural validation and the backup succeeds, the GUI offers
 an explicit restore showing only generation metadata after passphrase entry. If
 both are valid but have different revisions after an interrupted mutation, the
 primary remains authoritative and the GUI offers the newer backup only when its
-revision is greater. A passphrase change and secret deletion use the same
-two-candidate procedure, so a successfully completed operation does not leave an
-old-password or deleted-secret generation in Ladon's managed `.bak` path.
+vault ID matches and its revision is greater. The user explicitly chooses to
+continue with the primary or restore the backup. Decrypted recovery choices obey
+the same 30-minute idle deadline as an ordinary unlocked session. A passphrase
+change and secret deletion use the same two-candidate procedure, so a
+successfully completed operation does not leave an old-password or
+deleted-secret generation in Ladon's managed `.bak` path.
 
 ### 7.4 Device-local quick PIN
 
@@ -607,9 +613,11 @@ value. Duplicate or conflicting bindings are rejected before unlock.
 Temporary file names are random. A sanitized suggested basename may provide a
 file extension when required, but cannot add directories or escape the temporary
 root. The directory is removed after normal completion, cancellation, timeout,
-or spawn failure. Startup removes stale Ladon temporary directories after
-validating ownership and an unguessable marker; it never recursively deletes an
-unvalidated path.
+or spawn failure. After acquiring the cross-platform vault instance lock,
+startup removes stale Ladon temporary directories after validating their marker
+and, on Unix, ownership and private modes. Existing Unix roots are inspected
+with no symlink following before any permission change. Ladon never recursively
+deletes an unvalidated path.
 
 Temporary-file binding necessarily writes plaintext to local storage. The GUI
 and tool description prefer environment or stdin and warn that filesystem

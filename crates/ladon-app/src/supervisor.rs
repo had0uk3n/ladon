@@ -42,7 +42,7 @@ impl RunCancellation {
         self.0.store(true, Ordering::Release);
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 }
@@ -81,8 +81,12 @@ impl Supervisor {
         }
     }
 
-    pub fn cleanup_stale_temp_directories() -> Result<(), LadonError> {
-        cleanup_stale_temp_directories_in(&temporary_root())
+    pub(crate) fn temporary_root_path() -> PathBuf {
+        temporary_root()
+    }
+
+    pub(crate) fn cleanup_stale_temp_directories_at(root: &Path) -> Result<(), LadonError> {
+        cleanup_stale_temp_directories_in(root)
     }
 
     pub fn run<F>(
@@ -303,31 +307,59 @@ fn temporary_root() -> PathBuf {
 }
 
 fn prepare_temporary_root(root: &Path) -> Result<(), LadonError> {
-    fs::create_dir_all(root).map_err(|_| LadonError::ProcessFailure)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::io::ErrorKind;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => validate_temporary_root_metadata(&metadata)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                if let Err(error) = builder.create(root) {
+                    if error.kind() != ErrorKind::AlreadyExists {
+                        return Err(LadonError::ProcessFailure);
+                    }
+                }
+            }
+            Err(_) => return Err(LadonError::ProcessFailure),
+        }
+        let metadata = fs::symlink_metadata(root).map_err(|_| LadonError::ProcessFailure)?;
+        validate_temporary_root_metadata(&metadata)?;
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
             .map_err(|_| LadonError::ProcessFailure)?;
-        let metadata = fs::symlink_metadata(root).map_err(|_| LadonError::ProcessFailure)?;
-        // SAFETY: geteuid has no preconditions and no side effects.
-        let owner = unsafe { libc::geteuid() };
-        if !metadata.file_type().is_dir()
-            || metadata.uid() != owner
-            || metadata.permissions().mode() & 0o077 != 0
+    }
+    {
+        #[cfg(not(unix))]
         {
-            return Err(LadonError::ProcessFailure);
+            fs::create_dir_all(root).map_err(|_| LadonError::ProcessFailure)?;
+            if !fs::symlink_metadata(root)
+                .map_err(|_| LadonError::ProcessFailure)?
+                .file_type()
+                .is_dir()
+            {
+                return Err(LadonError::ProcessFailure);
+            }
         }
     }
-    #[cfg(not(unix))]
-    if !fs::symlink_metadata(root)
-        .map_err(|_| LadonError::ProcessFailure)?
-        .file_type()
-        .is_dir()
-    {
-        return Err(LadonError::ProcessFailure);
-    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_temporary_root_metadata(metadata: &fs::Metadata) -> Result<(), LadonError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no preconditions and no side effects.
+    let owner = unsafe { libc::geteuid() };
+    if metadata.file_type().is_dir()
+        && metadata.uid() == owner
+        && metadata.permissions().mode() & 0o077 == 0
+    {
+        Ok(())
+    } else {
+        Err(LadonError::ProcessFailure)
+    }
 }
 
 fn write_run_marker(directory: &Path) -> Result<(), LadonError> {
@@ -770,5 +802,27 @@ mod tests {
 
         assert!(!valid.exists());
         assert!(unmarked.join("keep").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_root_validation_never_follows_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = parent.path().join("runtime");
+        symlink(&target, &root).unwrap();
+
+        assert_eq!(
+            prepare_temporary_root(&root),
+            Err(LadonError::ProcessFailure)
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 }

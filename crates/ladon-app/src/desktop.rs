@@ -14,7 +14,7 @@ use ladon_core::{LadonError, SecretId};
 
 #[cfg(unix)]
 use crate::LocalBrokerHandle;
-use crate::{AddSecretDraft, SensitiveText, VaultController, VaultUiPhase};
+use crate::{AddSecretDraft, SensitiveText, Supervisor, VaultController, VaultUiPhase};
 
 const CANVAS: Color32 = Color32::from_rgb(244, 247, 251);
 const INK: Color32 = Color32::from_rgb(23, 35, 60);
@@ -57,6 +57,7 @@ struct LadonDesktop {
     notice: Option<Notice>,
     selected: Option<SecretId>,
     pending_delete: Option<SecretId>,
+    last_phase: VaultUiPhase,
 }
 
 struct Notice {
@@ -67,8 +68,12 @@ struct Notice {
 impl LadonDesktop {
     fn new(context: &eframe::CreationContext<'_>, path: PathBuf) -> Result<Self, LadonError> {
         configure_style(&context.egui_ctx);
-        let instance_lock = InstanceLock::acquire(&path)?;
+        let instance_lock = acquire_runtime(&path, &Supervisor::temporary_root_path())?;
         let controller = Arc::new(Mutex::new(VaultController::new(path)));
+        let last_phase = controller
+            .lock()
+            .map_err(|_| LadonError::ProcessFailure)?
+            .phase();
         #[cfg(unix)]
         let broker = Some(LocalBrokerHandle::start(Arc::clone(&controller))?);
         Ok(Self {
@@ -82,6 +87,7 @@ impl LadonDesktop {
             notice: None,
             selected: None,
             pending_delete: None,
+            last_phase,
         })
     }
 
@@ -148,6 +154,16 @@ impl LadonDesktop {
             if primary_button(ui, "Restore authenticated backup").clicked() {
                 let result = with_controller(&self.controller, VaultController::restore_backup);
                 self.notice_from(result, "Backup restored");
+            }
+            let can_continue = with_controller(&self.controller, |controller| {
+                Ok(controller.can_continue_with_primary())
+            })
+            .unwrap_or(false);
+            if can_continue && quiet_button(ui, "Continue with current vault").clicked() {
+                let result = with_controller(&self.controller, |controller| {
+                    controller.continue_with_primary()
+                });
+                self.notice_from(result, "Current vault kept");
             }
             self.show_notice(ui);
         });
@@ -379,6 +395,13 @@ impl LadonDesktop {
         self.pending_delete = None;
     }
 
+    fn synchronize_phase(&mut self, phase: VaultUiPhase) {
+        if self.last_phase == VaultUiPhase::Unlocked && phase != VaultUiPhase::Unlocked {
+            self.clear_sensitive_state();
+        }
+        self.last_phase = phase;
+    }
+
     fn notice_from(&mut self, result: Result<(), LadonError>, success: &'static str) {
         self.notice = Some(match result {
             Ok(()) => Notice {
@@ -432,6 +455,15 @@ impl Drop for InstanceLock {
     fn drop(&mut self) {
         unlock_instance_file(&self.file);
     }
+}
+
+fn acquire_runtime(
+    vault_path: &std::path::Path,
+    temp_root: &std::path::Path,
+) -> Result<InstanceLock, LadonError> {
+    let instance_lock = InstanceLock::acquire(vault_path)?;
+    Supervisor::cleanup_stale_temp_directories_at(temp_root)?;
+    Ok(instance_lock)
 }
 
 #[cfg(unix)]
@@ -525,6 +557,7 @@ impl eframe::App for LadonDesktop {
 
         let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
             .unwrap_or(VaultUiPhase::Locked);
+        self.synchronize_phase(phase);
         match phase {
             VaultUiPhase::FirstRun => shell(context, |ui| self.show_first_run(ui)),
             VaultUiPhase::Locked => shell(context, |ui| self.show_locked(ui)),
@@ -661,6 +694,7 @@ fn default_vault_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn vault_instance_lock_is_exclusive_and_recoverable() {
@@ -694,5 +728,72 @@ mod tests {
 
         assert!(!undoer.has_undo(&current));
         assert!(!undoer.is_in_flux());
+    }
+
+    #[test]
+    fn leaving_unlocked_clears_gui_owned_secret_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.ladon");
+        let controller = Arc::new(Mutex::new(VaultController::new(path.clone())));
+        let passphrase = SensitiveText::from("correct horse");
+        {
+            let mut state = controller.lock().unwrap();
+            state.create(&passphrase, &passphrase).unwrap();
+        }
+        let mut draft = AddSecretDraft::new();
+        draft.set_name("unsaved");
+        draft.fields_mut()[0].value_mut().push_str("fake-secret");
+        let mut app = LadonDesktop {
+            _instance_lock: InstanceLock::acquire(&path).unwrap(),
+            controller: Arc::clone(&controller),
+            #[cfg(unix)]
+            broker: None,
+            passphrase: SensitiveText::default(),
+            confirmation: SensitiveText::default(),
+            draft,
+            notice: None,
+            selected: None,
+            pending_delete: None,
+            last_phase: VaultUiPhase::Unlocked,
+        };
+
+        controller.lock().unwrap().lock();
+        app.synchronize_phase(VaultUiPhase::Locked);
+
+        assert!(app.draft.name().is_empty());
+        assert!(app.draft.fields()[0].value().as_str().is_empty());
+    }
+
+    #[test]
+    fn runtime_cleanup_happens_after_the_instance_lock_is_acquired() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data").join("vault.ladon");
+        let temp_root = directory.path().join("runtime");
+        let stale = temp_root.join("run-stale");
+        fs::create_dir_all(&stale).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp_root, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&stale, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(stale.join(".ladon-owner"), Uuid::new_v4().to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                stale.join(".ladon-owner"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+
+        let _guard = acquire_runtime(&path, &temp_root).unwrap();
+
+        assert!(!stale.exists());
+        assert!(matches!(
+            InstanceLock::acquire(&path),
+            Err(LadonError::AlreadyRunning)
+        ));
     }
 }

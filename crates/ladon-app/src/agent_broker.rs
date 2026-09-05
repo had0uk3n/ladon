@@ -1,7 +1,7 @@
 use std::{
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -24,9 +24,101 @@ const MAX_CONNECTION_WORKERS: usize = 8;
 
 pub struct LocalBrokerHandle {
     stop: Arc<AtomicBool>,
-    cancellation: Arc<Mutex<Option<RunCancellation>>>,
-    run_gate: Arc<Mutex<()>>,
+    coordinator: Arc<RunCoordinator>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct RunCoordinator {
+    state: Mutex<RunCoordinatorState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct RunCoordinatorState {
+    active: Option<RunCancellation>,
+    block_new: bool,
+}
+
+struct RunLease {
+    coordinator: Arc<RunCoordinator>,
+}
+
+struct RunBlock {
+    coordinator: Arc<RunCoordinator>,
+}
+
+impl RunCoordinator {
+    fn try_start(self: &Arc<Self>, cancellation: RunCancellation) -> Result<RunLease, LadonError> {
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        if state.block_new || state.active.is_some() {
+            return Err(LadonError::Busy);
+        }
+        state.active = Some(cancellation);
+        Ok(RunLease {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    fn cancel_active(&self) {
+        if let Ok(state) = self.state.lock() {
+            if let Some(cancellation) = state.active.as_ref() {
+                cancellation.cancel();
+            }
+        }
+    }
+
+    fn block_new_runs(self: &Arc<Self>) -> Result<RunBlock, LadonError> {
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        while state.block_new {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| LadonError::ProcessFailure)?;
+        }
+        state.block_new = true;
+        if let Some(cancellation) = state.active.as_ref() {
+            cancellation.cancel();
+        }
+        while state.active.is_some() {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| LadonError::ProcessFailure)?;
+        }
+        Ok(RunBlock {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    fn try_block_new_runs(self: &Arc<Self>) -> Result<Option<RunBlock>, LadonError> {
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        if state.block_new || state.active.is_some() {
+            return Ok(None);
+        }
+        state.block_new = true;
+        Ok(Some(RunBlock {
+            coordinator: Arc::clone(self),
+        }))
+    }
+}
+
+impl Drop for RunLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.coordinator.state.lock() {
+            state.active = None;
+            self.coordinator.changed.notify_all();
+        }
+    }
+}
+
+impl Drop for RunBlock {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.coordinator.state.lock() {
+            state.block_new = false;
+            self.coordinator.changed.notify_all();
+        }
+    }
 }
 
 impl LocalBrokerHandle {
@@ -39,19 +131,15 @@ impl LocalBrokerHandle {
         endpoint: impl AsRef<Path>,
     ) -> Result<Self, LadonError> {
         let server = LocalServer::bind(endpoint)?;
-        Supervisor::cleanup_stale_temp_directories()?;
         server.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let cancellation = Arc::new(Mutex::new(None));
-        let run_gate = Arc::new(Mutex::new(()));
+        let coordinator = Arc::new(RunCoordinator::default());
         let worker_stop = Arc::clone(&stop);
-        let worker_cancellation = Arc::clone(&cancellation);
-        let worker_run_gate = Arc::clone(&run_gate);
+        let worker_coordinator = Arc::clone(&coordinator);
         let thread = thread::spawn(move || {
             let broker = Arc::new(AgentBroker::new(
                 controller,
-                worker_cancellation,
-                worker_run_gate,
+                worker_coordinator,
                 Arc::clone(&worker_stop),
             ));
             let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -84,27 +172,17 @@ impl LocalBrokerHandle {
         });
         Ok(Self {
             stop,
-            cancellation,
-            run_gate,
+            coordinator,
             thread: Some(thread),
         })
     }
 
     pub fn cancel_active_run(&self) {
-        if let Ok(cancellation) = self.cancellation.lock() {
-            if let Some(cancellation) = cancellation.as_ref() {
-                cancellation.cancel();
-            }
-        }
+        self.coordinator.cancel_active();
     }
 
     pub fn cancel_active_run_and_wait(&self) -> Result<(), LadonError> {
-        self.cancel_active_run();
-        drop(
-            self.run_gate
-                .lock()
-                .map_err(|_| LadonError::ProcessFailure)?,
-        );
+        let _block = self.coordinator.block_new_runs()?;
         Ok(())
     }
 
@@ -112,11 +190,7 @@ impl LocalBrokerHandle {
         &self,
         controller: &Arc<Mutex<VaultController>>,
     ) -> Result<(), LadonError> {
-        self.cancel_active_run();
-        let _run_guard = self
-            .run_gate
-            .lock()
-            .map_err(|_| LadonError::ProcessFailure)?;
+        let _block = self.coordinator.block_new_runs()?;
         controller
             .lock()
             .map_err(|_| LadonError::ProcessFailure)?
@@ -128,12 +202,8 @@ impl LocalBrokerHandle {
         &self,
         controller: &Arc<Mutex<VaultController>>,
     ) -> Result<bool, LadonError> {
-        let _run_guard = match self.run_gate.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(LadonError::ProcessFailure);
-            }
+        let Some(_block) = self.coordinator.try_block_new_runs()? else {
+            return Ok(false);
         };
         Ok(controller
             .lock()
@@ -155,23 +225,20 @@ impl Drop for LocalBrokerHandle {
 struct AgentBroker {
     controller: Arc<Mutex<VaultController>>,
     supervisor: Supervisor,
-    cancellation: Arc<Mutex<Option<RunCancellation>>>,
-    run_gate: Arc<Mutex<()>>,
+    coordinator: Arc<RunCoordinator>,
     shutting_down: Arc<AtomicBool>,
 }
 
 impl AgentBroker {
     fn new(
         controller: Arc<Mutex<VaultController>>,
-        cancellation: Arc<Mutex<Option<RunCancellation>>>,
-        run_gate: Arc<Mutex<()>>,
+        coordinator: Arc<RunCoordinator>,
         shutting_down: Arc<AtomicBool>,
     ) -> Self {
         Self {
             controller,
             supervisor: Supervisor::new(),
-            cancellation,
-            run_gate,
+            coordinator,
             shutting_down,
         }
     }
@@ -222,11 +289,7 @@ impl AgentBroker {
                 Ok(RpcResult::List { secrets })
             }
             RpcMethod::Lock => {
-                self.cancel_active_run();
-                let _run_guard = self
-                    .run_gate
-                    .lock()
-                    .map_err(|_| LadonError::ProcessFailure)?;
+                let _block = self.coordinator.block_new_runs()?;
                 self.controller()?.lock();
                 Ok(RpcResult::Locked)
             }
@@ -241,10 +304,11 @@ impl AgentBroker {
                 if self.shutting_down.load(Ordering::Acquire) {
                     return Err(LadonError::EndpointUnavailable);
                 }
-                let _run_guard = self.run_gate.try_lock().map_err(|error| match error {
-                    std::sync::TryLockError::WouldBlock => LadonError::Busy,
-                    std::sync::TryLockError::Poisoned(_) => LadonError::ProcessFailure,
-                })?;
+                let cancellation = connection_cancellation;
+                let _run_lease = self.coordinator.try_start(cancellation.clone())?;
+                if self.shutting_down.load(Ordering::Acquire) {
+                    return Err(LadonError::EndpointUnavailable);
+                }
                 let validated = validate_run_request(
                     RunRequest {
                         executable,
@@ -256,15 +320,12 @@ impl AgentBroker {
                     },
                     RunCaller::Cli,
                 )?;
-                let cancellation = connection_cancellation;
-                self.set_cancellation(Some(cancellation.clone()))?;
                 let result = self.supervisor.run(validated, cancellation, |bindings| {
                     self.controller()?.resolve_bindings(bindings)
                 });
                 if let Ok(mut controller) = self.controller.lock() {
                     controller.record_secret_activity();
                 }
-                self.set_cancellation(None)?;
                 let result = result?;
                 Ok(RpcResult::Run {
                     exit_code: result.exit_code,
@@ -286,20 +347,8 @@ impl AgentBroker {
             .map_err(|_| LadonError::ProcessFailure)
     }
 
-    fn set_cancellation(&self, cancellation: Option<RunCancellation>) -> Result<(), LadonError> {
-        *self
-            .cancellation
-            .lock()
-            .map_err(|_| LadonError::ProcessFailure)? = cancellation;
-        Ok(())
-    }
-
     fn cancel_active_run(&self) {
-        if let Ok(cancellation) = self.cancellation.lock() {
-            if let Some(cancellation) = cancellation.as_ref() {
-                cancellation.cancel();
-            }
-        }
+        self.coordinator.cancel_active();
     }
 }
 
@@ -322,4 +371,38 @@ fn termination_name(termination: RunTermination) -> &'static str {
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocking_new_runs_atomically_cancels_and_waits_for_the_active_run() {
+        let coordinator = Arc::new(RunCoordinator::default());
+        let active = RunCancellation::new();
+        let lease = coordinator.try_start(active.clone()).unwrap();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiting_coordinator = Arc::clone(&coordinator);
+        let waiter = thread::spawn(move || {
+            let block = waiting_coordinator.block_new_runs().unwrap();
+            blocked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(block);
+        });
+        while !active.is_cancelled() {
+            thread::yield_now();
+        }
+        drop(lease);
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(matches!(
+            coordinator.try_start(RunCancellation::new()),
+            Err(LadonError::Busy)
+        ));
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+        assert!(coordinator.try_start(RunCancellation::new()).is_ok());
+    }
 }

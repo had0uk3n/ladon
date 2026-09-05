@@ -118,6 +118,35 @@ fn vault_controller_requires_recovery_when_backup_is_newer() {
     controller.unlock(&passphrase).unwrap();
 
     assert_eq!(controller.phase(), VaultUiPhase::RecoveryRequired);
+    assert!(controller.remaining_unlocked().is_some());
     controller.restore_backup().unwrap();
     assert_eq!(controller.phase(), VaultUiPhase::Unlocked);
+}
+
+#[test]
+fn newer_backup_recovery_can_keep_the_authoritative_primary() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vault.ladon");
+    let store = VaultStore::new(path.clone());
+    let password = SensitiveBytes::new(b"correct horse".to_vec());
+    let vault_id = SecretId::new();
+    let primary = create_vault(VaultPayload::new(vault_id, 1, vec![]).unwrap(), &password)
+        .unwrap()
+        .1;
+    let newer_backup = create_vault(VaultPayload::new(vault_id, 2, vec![]).unwrap(), &password)
+        .unwrap()
+        .1;
+    fs::write(&path, primary).unwrap();
+    fs::write(store.backup_path(), newer_backup).unwrap();
+
+    let passphrase = SensitiveText::from("correct horse");
+    let mut controller = VaultController::new(path);
+    controller.unlock(&passphrase).unwrap();
+    assert!(controller.can_continue_with_primary());
+
+    controller.continue_with_primary().unwrap();
+    assert_eq!(controller.phase(), VaultUiPhase::Unlocked);
+    controller.lock();
+    controller.unlock(&passphrase).unwrap();
+    assert_eq!(controller.phase(), VaultUiPhase::RecoveryRequired);
 }

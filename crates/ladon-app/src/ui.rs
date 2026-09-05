@@ -242,7 +242,11 @@ impl ActivitySink for SessionActivity {
 enum ManagedVault {
     FirstRun,
     Locked,
-    RecoveryRequired(ladon_core::UnlockedVault),
+    RecoveryRequired {
+        primary: Option<ladon_core::UnlockedVault>,
+        backup: ladon_core::UnlockedVault,
+        activity: SessionActivity,
+    },
     Unlocked(VaultSession<SessionActivity>),
 }
 
@@ -271,7 +275,7 @@ impl VaultController {
         match self.state {
             ManagedVault::FirstRun => VaultUiPhase::FirstRun,
             ManagedVault::Locked => VaultUiPhase::Locked,
-            ManagedVault::RecoveryRequired(_) => VaultUiPhase::RecoveryRequired,
+            ManagedVault::RecoveryRequired { .. } => VaultUiPhase::RecoveryRequired,
             ManagedVault::Unlocked(_) => VaultUiPhase::Unlocked,
         }
     }
@@ -309,7 +313,13 @@ impl VaultController {
                 newer_backup,
             } => {
                 if let Some(backup) = newer_backup {
-                    self.state = ManagedVault::RecoveryRequired(backup);
+                    self.state = ManagedVault::RecoveryRequired {
+                        primary: Some(vault),
+                        backup,
+                        activity: SessionActivity {
+                            last: Instant::now(),
+                        },
+                    };
                 } else {
                     self.state = ManagedVault::Unlocked(VaultSession::new(
                         vault,
@@ -320,24 +330,74 @@ impl VaultController {
                 }
             }
             VaultOpen::RestoreRequired { backup } => {
-                self.state = ManagedVault::RecoveryRequired(backup);
+                self.state = ManagedVault::RecoveryRequired {
+                    primary: None,
+                    backup,
+                    activity: SessionActivity {
+                        last: Instant::now(),
+                    },
+                };
             }
         }
         Ok(())
     }
 
     pub fn restore_backup(&mut self) -> Result<(), LadonError> {
-        let ManagedVault::RecoveryRequired(backup) =
-            std::mem::replace(&mut self.state, ManagedVault::Locked)
+        let ManagedVault::RecoveryRequired {
+            primary,
+            backup,
+            activity,
+        } = std::mem::replace(&mut self.state, ManagedVault::Locked)
         else {
             return Err(LadonError::InvalidRequest);
         };
         if let Err(error) = self.store.commit(&backup) {
-            self.state = ManagedVault::RecoveryRequired(backup);
+            self.state = ManagedVault::RecoveryRequired {
+                primary,
+                backup,
+                activity,
+            };
             return Err(error);
         }
         self.state = ManagedVault::Unlocked(VaultSession::new(
             backup,
+            SessionActivity {
+                last: Instant::now(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn can_continue_with_primary(&self) -> bool {
+        matches!(
+            self.state,
+            ManagedVault::RecoveryRequired {
+                primary: Some(_),
+                ..
+            }
+        )
+    }
+
+    pub fn continue_with_primary(&mut self) -> Result<(), LadonError> {
+        let ManagedVault::RecoveryRequired {
+            primary,
+            backup,
+            activity,
+        } = std::mem::replace(&mut self.state, ManagedVault::Locked)
+        else {
+            return Err(LadonError::InvalidRequest);
+        };
+        let Some(primary) = primary else {
+            self.state = ManagedVault::RecoveryRequired {
+                primary: None,
+                backup,
+                activity,
+            };
+            return Err(LadonError::InvalidRequest);
+        };
+        self.state = ManagedVault::Unlocked(VaultSession::new(
+            primary,
             SessionActivity {
                 last: Instant::now(),
             },
@@ -435,6 +495,10 @@ impl VaultController {
             &self.state,
             ManagedVault::Unlocked(session)
                 if session.activity().last.elapsed() >= DEFAULT_IDLE_TIMEOUT
+        ) || matches!(
+            &self.state,
+            ManagedVault::RecoveryRequired { activity, .. }
+                if activity.last.elapsed() >= DEFAULT_IDLE_TIMEOUT
         );
         if should_lock {
             self.lock();
@@ -444,10 +508,15 @@ impl VaultController {
 
     #[must_use]
     pub fn remaining_unlocked(&self) -> Option<Duration> {
-        let ManagedVault::Unlocked(session) = &self.state else {
-            return None;
-        };
-        Some(DEFAULT_IDLE_TIMEOUT.saturating_sub(session.activity().last.elapsed()))
+        match &self.state {
+            ManagedVault::Unlocked(session) => {
+                Some(DEFAULT_IDLE_TIMEOUT.saturating_sub(session.activity().last.elapsed()))
+            }
+            ManagedVault::RecoveryRequired { activity, .. } => {
+                Some(DEFAULT_IDLE_TIMEOUT.saturating_sub(activity.last.elapsed()))
+            }
+            ManagedVault::FirstRun | ManagedVault::Locked => None,
+        }
     }
 }
 
@@ -586,4 +655,31 @@ fn sanitize_untrusted(input: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_plaintext_obeys_the_same_idle_deadline_as_an_unlocked_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let password = SensitiveBytes::new(b"correct horse".to_vec());
+        let payload = VaultPayload::new(SecretId::new(), 1, Vec::new()).unwrap();
+        let (backup, _) = create_vault(payload, &password).unwrap();
+        let mut controller = VaultController {
+            store: VaultStore::new(directory.path().join("vault.ladon")),
+            state: ManagedVault::RecoveryRequired {
+                primary: None,
+                backup,
+                activity: SessionActivity {
+                    last: Instant::now() - DEFAULT_IDLE_TIMEOUT,
+                },
+            },
+        };
+
+        assert!(controller.auto_lock_if_idle());
+        assert_eq!(controller.phase(), VaultUiPhase::Locked);
+        assert!(controller.remaining_unlocked().is_none());
+    }
 }

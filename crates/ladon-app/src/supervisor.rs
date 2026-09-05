@@ -81,10 +81,12 @@ impl Supervisor {
         }
     }
 
+    #[cfg(feature = "gui")]
     pub(crate) fn temporary_root_path() -> PathBuf {
         temporary_root()
     }
 
+    #[cfg(feature = "gui")]
     pub(crate) fn cleanup_stale_temp_directories_at(root: &Path) -> Result<(), LadonError> {
         cleanup_stale_temp_directories_in(root)
     }
@@ -378,6 +380,7 @@ fn write_run_marker(directory: &Path) -> Result<(), LadonError> {
         .map_err(|_| LadonError::ProcessFailure)
 }
 
+#[cfg(any(feature = "gui", test))]
 fn cleanup_stale_temp_directories_in(root: &Path) -> Result<(), LadonError> {
     prepare_temporary_root(root)?;
     for entry in fs::read_dir(root).map_err(|_| LadonError::ProcessFailure)? {

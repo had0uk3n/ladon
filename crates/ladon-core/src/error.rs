@@ -241,7 +241,7 @@ impl LadonError {
             Self::InvalidPassphrase => {
                 "passphrase must match, contain at least 12 Unicode characters, and use at most 1024 UTF-8 bytes"
             }
-            Self::InvalidPin => "PIN must match and contain 6 to 12 ASCII digits",
+            Self::InvalidPin => "PIN must match and contain 4 to 12 ASCII digits",
             Self::ApprovalAuthenticationFailed => "approval authentication failed",
             Self::ApprovalDenied => "agent request was denied",
             Self::ApprovalTimeout => "approval request timed out",

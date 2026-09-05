@@ -1149,7 +1149,7 @@ Document the 4--12 digit optional PIN, dual Touch ID/PIN choice, five-failure va
 Run:
 
 ```bash
-rg -n '6--12|6–12|automatically hides.*ten seconds|choose Touch ID instead|session configured for Touch ID' README.md docs crates/ladon-app/src
+rg -n '6--12|6–12|automatically hides.*ten seconds|choose Touch ID instead|session configured for Touch ID' README.md docs crates/ladon-app/src crates/ladon-core/src
 ```
 
 Expected: no active product documentation or GUI copy contains the obsolete behavior; historical completed plans may retain their original wording.

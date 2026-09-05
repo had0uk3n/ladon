@@ -21,6 +21,14 @@ fn accepts_only_matching_four_to_twelve_ascii_digits() {
 }
 
 #[test]
+fn invalid_pin_safe_message_describes_the_four_to_twelve_digit_requirement() {
+    assert_eq!(
+        LadonError::InvalidPin.safe_message(),
+        "PIN must match and contain 4 to 12 ASCII digits"
+    );
+}
+
+#[test]
 fn verifies_the_correct_pin_and_rejects_a_wrong_one_generically() {
     let verifier = SessionPin::new(
         &SensitiveText::from("123456"),

@@ -61,6 +61,15 @@ remaining Critical or Important issue in the change.
   child launch. Lock and shutdown clear every grant; manual revocation clears
   future use. Session and secret isolation, fixed non-sliding expiry, and the
   no-launch-before-approval boundary have regression tests.
+- Selected-secret viewing and editing are locally authenticated actions. A
+  4–12 digit optional session PIN and strict Touch ID can both be used where
+  available; five consecutive PIN failures lock the vault. Authorization is
+  tied to the vault session, selected immutable secret ID, and selection epoch,
+  so stale Touch ID completions are rejected. The GUI uses an explicit
+  show/hide lifecycle and performs validated whole-record edits atomically.
+  Inline binary replacement is unsupported. Saving or deleting invalidates all
+  agent grants for that secret ID, while CLI, MCP, and local IPC remain
+  value-free.
 
 ## Deliberately deferred preview work
 

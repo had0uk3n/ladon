@@ -14,9 +14,10 @@ owner-authenticated named-pipe transport is not implemented yet.
 ## What works now
 
 - encrypted, portable, passphrase-protected vault;
-- native GUI for first run, unlock, add/list/delete, explicit backup recovery,
-  and 30-minute activity locking;
-- memory-only session PIN on every platform or strict Touch ID on macOS;
+- native GUI for first run, unlock, add/list/delete, protected secret viewing
+  and editing, explicit backup recovery, and 30-minute activity locking;
+- optional memory-only 4–12 digit session PIN on every platform plus strict
+  Touch ID on macOS;
 - one-confirmation, fixed 30-minute access per agent-process/secret pair, with
   manual revocation;
 - generic direct process execution without a shell added by Ladon;
@@ -47,11 +48,29 @@ cargo build --release
 ./target/release/ladon-app
 ```
 
-On first launch, create a passphrase of at least 12 Unicode characters. Then
-choose a 6–12 digit PIN for this app session, or Touch ID on a supported Mac,
-and add a secret. The PIN verifier and all agent permissions stay only in
-memory and are forgotten when Ladon locks or exits. The resulting release
-binaries do not require Rust to be installed on the computer where they run.
+On first launch, create a passphrase of at least 12 Unicode characters. You may
+also configure an optional 4–12 digit PIN for this app session. On a supported
+Mac, Touch ID remains available alongside that PIN, so either method can confirm
+a protected action. Five consecutive wrong PIN submissions lock the vault; a
+successful PIN or Touch ID confirmation resets the counter. The PIN verifier
+and all agent permissions stay only in memory and are forgotten when Ladon
+locks or exits. The resulting release binaries do not require Rust to be
+installed on the computer where they run.
+
+## Viewing and editing a secret
+
+Select a secret in the unlocked GUI to see its metadata and a constant mask,
+never its value. Authenticate the selected secret with Touch ID or the configured
+PIN before choosing **Show value** or **Edit**. Values remain visible only until
+you explicitly choose **Hide value**, navigate away, lock the vault, or close the
+app; a selection requires authentication again after you leave and return.
+
+Edits are prepared and validated before a single atomic vault update, preserving
+the secret ID. Existing binary fields are preserved but cannot be edited inline.
+After saving or deleting a secret, Ladon invalidates every agent grant for that
+secret ID, so a later agent run requires a new approval. If you navigate away or
+close with an unsaved edit, Ladon asks whether to discard it. A Touch ID result
+that arrives after the selection or vault session changed is rejected.
 
 In a second terminal:
 
@@ -119,6 +138,10 @@ the timer. A different MCP process or another secret asks separately. Use
 one-shot `ladon run` invocation has a fresh client identity, so it asks each
 time. Revocation also cancels the active supervised run before returning, and
 locking/reopening always starts with no permissions.
+
+Saving or deleting a secret also revokes every existing grant for that immutable
+secret ID. Agent-facing CLI, MCP, and local IPC APIs remain value-free: they
+expose metadata and redacted run results, never a secret-value read or export.
 
 If the vault is locked, the request returns `vault_locked`; unlock Ladon in the
 local GUI, choose the session confirmation method, and retry it. An approval

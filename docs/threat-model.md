@@ -35,6 +35,16 @@ process already running as the same user. MCP does not provide a universal
 trusted chat identifier, so the scope is an integration process rather than a
 conversation.
 
+Within the GUI, selecting a secret exposes metadata and a constant mask only.
+Viewing or editing its values requires a fresh local confirmation for that
+selection: an optional in-memory 4–12 digit PIN, strict Touch ID where
+available, or either when both are configured. Five consecutive wrong PINs lock
+the vault. Authorization is scoped to the vault session, immutable secret ID,
+and selection epoch; it is cleared on navigation, lock, or exit, and stale
+Touch ID results are rejected. Values are shown and hidden explicitly rather
+than on a timer. Text edits are validated before one atomic whole-record update;
+existing binary fields are retained but cannot be replaced inline.
+
 The operating system, cryptographic libraries, Rust toolchain, and Ladon binary
 are trusted. Repository source is assumed public; no protection depends on code
 secrecy.
@@ -87,6 +97,9 @@ secrecy.
    is used.
 9. Any new vault unlock lifetime invalidates grants from the preceding one;
    grant expiry or revocation is rechecked before plaintext resolution.
+10. Saving or deleting a secret invalidates every grant for that immutable
+    secret ID before future plaintext resolution; agent-facing APIs remain
+    value-free.
 
 ## Review gates before stable v1
 

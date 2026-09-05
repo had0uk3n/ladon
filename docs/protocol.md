@@ -45,6 +45,12 @@ and revocation immediately before plaintext resolution. Manual revocation also
 cancels and waits for the active run; it still cannot erase bytes retained or
 transmitted by a child that was already authorized.
 
+Saving or deleting a secret in the GUI also invalidates every grant for that
+immutable secret ID. This does not add a protocol method: the local selected-
+secret view/edit flow is GUI-only, requires a fresh PIN or Touch ID confirmation,
+and rejects a stale Touch ID completion after the selection or vault session
+changes. CLI, MCP, and local IPC remain value-free.
+
 ## MCP
 
 `ladon mcp` is a local stdio MCP server exposing only:

@@ -1140,11 +1140,11 @@ git commit -m "feat: reveal and edit selected secrets"
 - Consumes: the completed behavior from Tasks 1--6.
 - Produces: accurate operator instructions and a verified release build.
 
-- [ ] **Step 1: Update user and security documentation**
+- [x] **Step 1: Update user and security documentation**
 
 Document the 4--12 digit optional PIN, dual Touch ID/PIN choice, five-failure vault lock, selected-secret unlock lifecycle, explicit show/hide, atomic text editing, binary-field limitation, per-ID grant invalidation, stale Touch ID rejection, and unchanged value-free agent APIs. Remove claims that PIN and Touch ID are mutually exclusive or that reveal automatically expires after ten seconds.
 
-- [ ] **Step 2: Scan documentation for contradictions**
+- [x] **Step 2: Scan documentation for contradictions**
 
 Run:
 
@@ -1154,7 +1154,7 @@ rg -n '6--12|6–12|automatically hides.*ten seconds|choose Touch ID instead|ses
 
 Expected: no active product documentation or GUI copy contains the obsolete behavior; historical completed plans may retain their original wording.
 
-- [ ] **Step 3: Run formatting and lint checks**
+- [x] **Step 3: Run formatting and lint checks**
 
 Run: `cargo fmt --all -- --check`
 
@@ -1162,13 +1162,13 @@ Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 
 Expected: both commands exit 0 with no warnings.
 
-- [ ] **Step 4: Run the complete automated test suite**
+- [x] **Step 4: Run the complete automated test suite**
 
 Run outside restricted sandboxes when local socket creation is denied: `cargo test --workspace --all-features`
 
 Expected: every non-ignored test passes and there are zero failures.
 
-- [ ] **Step 5: Build and launch the release GUI**
+- [x] **Step 5: Build and launch the release GUI**
 
 Run: `cargo build --release -p ladon-app --features gui`
 
@@ -1184,7 +1184,7 @@ Manually verify on macOS with a disposable secret:
 6. verify that a previously granted agent session needs approval again after edit;
 7. verify that closing with a dirty edit asks before discarding.
 
-- [ ] **Step 6: Run a final secret-leak scan**
+- [x] **Step 6: Run a final secret-leak scan**
 
 Use only synthetic canaries from tests. Run:
 
@@ -1194,7 +1194,7 @@ rg -n 'fake-text-canary|fake-broker-secret|fake-original-secret' target/debug ta
 
 Expected: canaries may occur in compiled test fixtures, but never in Ladon logs, generated documentation, IPC captures, or MCP output artifacts. Inspect any match outside compiled binaries before delivery.
 
-- [ ] **Step 7: Commit documentation and verification notes**
+- [x] **Step 7: Commit documentation and verification notes**
 
 ```bash
 git add README.md docs/security-review.md docs/threat-model.md docs/protocol.md docs/superpowers/plans/2026-09-05-secret-view-edit.md

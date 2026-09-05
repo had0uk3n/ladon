@@ -2,6 +2,7 @@ mod broker;
 mod codec;
 mod crypto;
 mod error;
+mod grants;
 mod model;
 mod protocol;
 mod redact;
@@ -17,13 +18,14 @@ pub use broker::{
 pub use codec::{MAX_VAULT_PAYLOAD_BYTES, VaultPayload, decode_payload, encode_payload};
 pub use crypto::{MAX_VAULT_FILE_BYTES, UnlockedVault, create_vault, unlock_vault};
 pub use error::LadonError;
+pub use grants::{GrantStore, SystemMonotonicClock};
 pub use model::{
     FieldName, MAX_FIELD_BYTES, MAX_FIELDS_PER_RECORD, SecretField, SecretId, SecretName,
     SecretRecord, SecretRef, TextHint,
 };
 pub use protocol::{
-    BindingTarget, MAX_FRAME_BYTES, RpcMethod, RpcRequest, RpcResponse, RpcResult,
-    SecretBindingRequest, SecretFieldSummary, SecretSummary, decode_request_frame,
+    BindingTarget, MAX_FRAME_BYTES, PROTOCOL_VERSION, RpcMethod, RpcRequest, RpcResponse,
+    RpcResult, SecretBindingRequest, SecretFieldSummary, SecretSummary, decode_request_frame,
     decode_response_frame, encode_request_frame, encode_response_frame, validate_json_document,
 };
 pub use redact::{

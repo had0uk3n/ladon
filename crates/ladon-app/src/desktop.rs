@@ -14,7 +14,10 @@ use ladon_core::{LadonError, SecretId};
 
 #[cfg(unix)]
 use crate::LocalBrokerHandle;
-use crate::{AddSecretDraft, SensitiveText, Supervisor, VaultController, VaultUiPhase};
+use crate::{
+    AddSecretDraft, PendingRequestView, SensitiveText, SessionPin, Supervisor,
+    TouchIdAuthenticator, VaultController, VaultUiPhase,
+};
 
 const CANVAS: Color32 = Color32::from_rgb(244, 247, 251);
 const INK: Color32 = Color32::from_rgb(23, 35, 60);
@@ -53,11 +56,27 @@ struct LadonDesktop {
     broker: Option<LocalBrokerHandle>,
     passphrase: SensitiveText,
     confirmation: SensitiveText,
+    session_pin: SensitiveText,
+    session_pin_confirmation: SensitiveText,
+    approval_pin: SensitiveText,
+    session_authentication: Option<SessionAuthentication>,
+    touch_id_available: bool,
+    focused_approval: Option<uuid::Uuid>,
     draft: AddSecretDraft,
     notice: Option<Notice>,
     selected: Option<SecretId>,
     pending_delete: Option<SecretId>,
     last_phase: VaultUiPhase,
+}
+
+enum SessionAuthentication {
+    Pin(SessionPin),
+    TouchId,
+}
+
+enum ApprovalAction {
+    Approve,
+    Deny,
 }
 
 struct Notice {
@@ -83,6 +102,12 @@ impl LadonDesktop {
             broker,
             passphrase: SensitiveText::default(),
             confirmation: SensitiveText::default(),
+            session_pin: SensitiveText::default(),
+            session_pin_confirmation: SensitiveText::default(),
+            approval_pin: SensitiveText::default(),
+            session_authentication: None,
+            touch_id_available: TouchIdAuthenticator::is_available(),
+            focused_approval: None,
             draft: AddSecretDraft::new(),
             notice: None,
             selected: None,
@@ -164,6 +189,60 @@ impl LadonDesktop {
                     controller.continue_with_primary()
                 });
                 self.notice_from(result, "Current vault kept");
+            }
+            self.show_notice(ui);
+        });
+    }
+
+    fn show_session_auth_setup(&mut self, ui: &mut egui::Ui) {
+        centered_column(ui, |ui| {
+            ui.label(RichText::new("Confirm agent access").size(28.0).color(INK));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Choose how to approve a secret for one agent session. Nothing is saved to the system keychain.",
+                )
+                .color(MUTED),
+            );
+            ui.add_space(22.0);
+
+            if self.touch_id_available && primary_button(ui, "Use Touch ID").clicked() {
+                self.session_pin.clear();
+                self.session_pin_confirmation.clear();
+                self.session_authentication = Some(SessionAuthentication::TouchId);
+                self.notice = Some(Notice {
+                    text: "Touch ID will confirm new 30-minute access",
+                    danger: false,
+                });
+            }
+
+            if self.touch_id_available {
+                ui.add_space(18.0);
+                ui.label(RichText::new("or use a session PIN").color(MUTED));
+                ui.add_space(12.0);
+            }
+            password_field(ui, &mut self.session_pin, "PIN (6–12 digits)");
+            ui.add_space(10.0);
+            password_field(ui, &mut self.session_pin_confirmation, "Repeat PIN");
+            ui.add_space(18.0);
+            if primary_button(ui, "Set session PIN").clicked() {
+                match SessionPin::new(&self.session_pin, &self.session_pin_confirmation) {
+                    Ok(pin) => {
+                        self.session_authentication = Some(SessionAuthentication::Pin(pin));
+                        self.notice = Some(Notice {
+                            text: "Session PIN set; it will be forgotten when the vault locks",
+                            danger: false,
+                        });
+                    }
+                    Err(error) => {
+                        self.notice = Some(Notice {
+                            text: error.safe_message(),
+                            danger: true,
+                        });
+                    }
+                }
+                self.session_pin.clear();
+                self.session_pin_confirmation.clear();
             }
             self.show_notice(ui);
         });
@@ -303,6 +382,15 @@ impl LadonDesktop {
                         .size(12.0)
                         .color(Color32::from_rgb(173, 187, 214)),
                 );
+                #[cfg(unix)]
+                if quiet_button(ui, "Revoke agent access").clicked() {
+                    let result = self
+                        .broker
+                        .as_ref()
+                        .ok_or(LadonError::EndpointUnavailable)
+                        .and_then(LocalBrokerHandle::revoke_grants);
+                    self.notice_from(result, "Agent access revoked");
+                }
                 ui.add_space(28.0);
                 ui.label(
                     RichText::new("SECRETS")
@@ -390,6 +478,11 @@ impl LadonDesktop {
 
     fn clear_sensitive_state(&mut self) {
         self.clear_unlock_fields();
+        self.session_pin.clear();
+        self.session_pin_confirmation.clear();
+        self.approval_pin.clear();
+        self.session_authentication = None;
+        self.focused_approval = None;
         self.draft = AddSecretDraft::new();
         self.selected = None;
         self.pending_delete = None;
@@ -397,6 +490,10 @@ impl LadonDesktop {
 
     fn synchronize_phase(&mut self, phase: VaultUiPhase) {
         if self.last_phase == VaultUiPhase::Unlocked && phase != VaultUiPhase::Unlocked {
+            #[cfg(unix)]
+            if let Some(broker) = &self.broker {
+                let _ = broker.revoke_grants();
+            }
             self.clear_sensitive_state();
         }
         self.last_phase = phase;
@@ -419,6 +516,142 @@ impl LadonDesktop {
         if let Some(notice) = &self.notice {
             ui.add_space(16.0);
             ui.label(RichText::new(notice.text).color(if notice.danger { DANGER } else { COBALT }));
+        }
+    }
+
+    #[cfg(unix)]
+    fn show_pending_approval(&mut self, context: &egui::Context) {
+        let pending = match self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(LocalBrokerHandle::pending_approval)
+        {
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                update_focused_approval(&mut self.focused_approval, &mut self.approval_pin, None);
+                return;
+            }
+            Err(error) => {
+                update_focused_approval(&mut self.focused_approval, &mut self.approval_pin, None);
+                self.notice_from(Err(error), "");
+                return;
+            }
+        };
+        if update_focused_approval(
+            &mut self.focused_approval,
+            &mut self.approval_pin,
+            Some(pending.id()),
+        ) {
+            context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        let view = PendingRequestView::from_approval(&pending, Duration::from_secs(2 * 60));
+        let mut action = None;
+        egui::Window::new("Agent requests a secret")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                Frame::window(&context.style())
+                    .fill(PANEL)
+                    .inner_margin(Margin::same(24)),
+            )
+            .show(context, |ui| {
+                ui.set_width(540.0);
+                ui.label(
+                    RichText::new(format!("Reported client: {}", view.client_label())).color(MUTED),
+                );
+                ui.add_space(16.0);
+                for (name, fields) in view.secrets() {
+                    ui.label(RichText::new(name).size(19.0).strong().color(INK));
+                    ui.label(RichText::new(fields.join(", ")).color(COBALT));
+                }
+                ui.add_space(16.0);
+                Frame::new()
+                    .fill(CANVAS)
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(view.executable()).monospace().color(INK));
+                        for argument in view.arguments() {
+                            ui.label(RichText::new(argument).monospace().color(MUTED));
+                        }
+                        ui.label(
+                            RichText::new(format!("in {}", view.working_directory()))
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    });
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(
+                        "Approval lasts 30 minutes for only this client session and these secrets.",
+                    )
+                    .color(AMBER),
+                );
+                ui.add_space(16.0);
+                if matches!(
+                    self.session_authentication,
+                    Some(SessionAuthentication::Pin(_))
+                ) {
+                    password_field(ui, &mut self.approval_pin, "Session PIN");
+                    ui.add_space(10.0);
+                }
+                ui.horizontal(|ui| {
+                    if primary_button(
+                        ui,
+                        if matches!(
+                            self.session_authentication,
+                            Some(SessionAuthentication::TouchId)
+                        ) {
+                            "Confirm with Touch ID"
+                        } else {
+                            "Allow for 30 minutes"
+                        },
+                    )
+                    .clicked()
+                    {
+                        action = Some(ApprovalAction::Approve);
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Deny").color(DANGER)).frame(false))
+                        .clicked()
+                    {
+                        action = Some(ApprovalAction::Deny);
+                    }
+                });
+                self.show_notice(ui);
+            });
+
+        match action {
+            Some(ApprovalAction::Approve) => {
+                let authentication = match &self.session_authentication {
+                    Some(SessionAuthentication::Pin(pin)) => pin.verify(&self.approval_pin),
+                    Some(SessionAuthentication::TouchId) => TouchIdAuthenticator::authenticate(
+                        "Allow this agent session to use the displayed Ladon secrets for 30 minutes",
+                    ),
+                    None => Err(LadonError::ApprovalAuthenticationFailed),
+                };
+                self.approval_pin.clear();
+                let result = authentication.and_then(|()| {
+                    self.broker
+                        .as_ref()
+                        .ok_or(LadonError::EndpointUnavailable)?
+                        .approve(pending.id())
+                });
+                self.notice_from(result, "Agent access allowed for 30 minutes");
+            }
+            Some(ApprovalAction::Deny) => {
+                self.approval_pin.clear();
+                let result = self
+                    .broker
+                    .as_ref()
+                    .ok_or(LadonError::EndpointUnavailable)
+                    .and_then(|broker| broker.deny(pending.id()));
+                self.notice_from(result, "Agent request denied");
+            }
+            None => {}
         }
     }
 }
@@ -562,7 +795,14 @@ impl eframe::App for LadonDesktop {
             VaultUiPhase::FirstRun => shell(context, |ui| self.show_first_run(ui)),
             VaultUiPhase::Locked => shell(context, |ui| self.show_locked(ui)),
             VaultUiPhase::RecoveryRequired => shell(context, |ui| self.show_recovery(ui)),
-            VaultUiPhase::Unlocked => self.show_unlocked(context),
+            VaultUiPhase::Unlocked if self.session_authentication.is_none() => {
+                shell(context, |ui| self.show_session_auth_setup(ui));
+            }
+            VaultUiPhase::Unlocked => {
+                self.show_unlocked(context);
+                #[cfg(unix)]
+                self.show_pending_approval(context);
+            }
         }
     }
 
@@ -672,6 +912,19 @@ fn format_remaining(remaining: Duration) -> String {
     format!("locks in {:02}:{:02}", seconds / 60, seconds % 60)
 }
 
+fn update_focused_approval(
+    focused: &mut Option<uuid::Uuid>,
+    approval_pin: &mut SensitiveText,
+    next: Option<uuid::Uuid>,
+) -> bool {
+    if *focused == next {
+        return false;
+    }
+    approval_pin.clear();
+    *focused = next;
+    true
+}
+
 fn default_vault_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = env::var_os("APPDATA").map(PathBuf::from);
@@ -750,6 +1003,18 @@ mod tests {
             broker: None,
             passphrase: SensitiveText::default(),
             confirmation: SensitiveText::default(),
+            session_pin: SensitiveText::from("123456"),
+            session_pin_confirmation: SensitiveText::from("123456"),
+            approval_pin: SensitiveText::from("123456"),
+            session_authentication: Some(SessionAuthentication::Pin(
+                SessionPin::new(
+                    &SensitiveText::from("123456"),
+                    &SensitiveText::from("123456"),
+                )
+                .unwrap(),
+            )),
+            touch_id_available: false,
+            focused_approval: Some(Uuid::new_v4()),
             draft,
             notice: None,
             selected: None,
@@ -762,6 +1027,11 @@ mod tests {
 
         assert!(app.draft.name().is_empty());
         assert!(app.draft.fields()[0].value().as_str().is_empty());
+        assert!(app.session_pin.as_str().is_empty());
+        assert!(app.session_pin_confirmation.as_str().is_empty());
+        assert!(app.approval_pin.as_str().is_empty());
+        assert!(app.session_authentication.is_none());
+        assert!(app.focused_approval.is_none());
     }
 
     #[test]
@@ -795,5 +1065,23 @@ mod tests {
             InstanceLock::acquire(&path),
             Err(LadonError::AlreadyRunning)
         ));
+    }
+
+    #[test]
+    fn approval_pin_is_cleared_when_request_changes_or_disappears() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut focused = Some(first);
+        let mut pin = SensitiveText::from("123456");
+
+        assert!(update_focused_approval(
+            &mut focused,
+            &mut pin,
+            Some(second)
+        ));
+        assert!(pin.as_str().is_empty());
+        pin.push_str("654321");
+        assert!(update_focused_approval(&mut focused, &mut pin, None));
+        assert!(pin.as_str().is_empty());
     }
 }

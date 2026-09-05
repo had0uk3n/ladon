@@ -1,8 +1,8 @@
 use std::{fs, time::Duration};
 
 use ladon_app::{
-    AddSecretDraft, ClipboardLease, PendingRequestView, RevealLease, SensitiveText,
-    VaultController, VaultUiPhase, validate_new_passphrase,
+    AddSecretDraft, ApprovalSecret, ClipboardLease, PendingApproval, PendingRequestView,
+    RevealLease, SensitiveText, VaultController, VaultUiPhase, validate_new_passphrase,
 };
 use ladon_core::{SecretId, SensitiveBytes, VaultPayload, VaultStore, create_vault};
 
@@ -44,15 +44,24 @@ fn clipboard_is_cleared_only_if_the_copied_value_is_still_present() {
 
 #[test]
 fn pending_request_escapes_controls_and_bidi_without_interpreting_markup() {
-    let view = PendingRequestView::new(
+    let approval = PendingApproval::new(
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
         "Codex\n[trusted]",
+        vec![ApprovalSecret::new(
+            SecretId::new(),
+            "prod\u{202e}token",
+            ["value\rname"],
+        )],
         "/usr/bin/tool\u{202e}txt",
-        &["--flag".to_owned(), "line\rbreak".to_owned()],
+        ["--flag", "line\rbreak"],
         "/tmp",
-        Duration::from_secs(120),
     );
+    let view = PendingRequestView::from_approval(&approval, Duration::from_secs(120));
 
     assert_eq!(view.client_label(), "Codex\\u{a}[trusted]");
+    assert_eq!(view.secrets()[0].0, "prod\\u{202e}token");
+    assert_eq!(view.secrets()[0].1, ["value\\u{d}name"]);
     assert_eq!(view.executable(), "/usr/bin/tool\\u{202e}txt");
     assert_eq!(view.arguments()[1], "line\\u{d}break");
     assert_eq!(view.timeout(), Duration::from_secs(120));

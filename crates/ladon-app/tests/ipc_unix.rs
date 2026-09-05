@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 fn request() -> RpcRequest {
     RpcRequest {
-        version: 1,
+        version: 2,
         request_id: Uuid::new_v4(),
+        client_session_id: Uuid::new_v4(),
         client_label: "test-client".to_owned(),
         method: RpcMethod::Status,
     }

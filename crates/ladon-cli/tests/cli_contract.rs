@@ -60,6 +60,7 @@ fn run_sends_only_references_and_an_absolute_executable() {
             .contains("fake-plaintext-value")
     );
     let requests = transport.seen.borrow();
+    assert_eq!(requests[0].version, 2);
     let RpcMethod::Run {
         executable,
         bindings,

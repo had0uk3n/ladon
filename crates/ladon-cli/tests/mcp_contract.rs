@@ -97,3 +97,37 @@ fn list_tool_returns_metadata_only() {
     assert!(!output.contains("fake-plaintext-value"));
     assert!(matches!(transport.seen.borrow()[0].method, RpcMethod::List));
 }
+
+#[test]
+fn one_mcp_process_reuses_one_private_client_session_id() {
+    let transport = FakeTransport::new();
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_status\",\"arguments\":{}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_list_secrets\",\"arguments\":{}}}\n",
+    );
+    let mut output = Vec::new();
+
+    serve_mcp(input.as_bytes(), &mut output, &transport).unwrap();
+
+    let seen = transport.seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].version, 2);
+    assert_eq!(seen[0].client_session_id, seen[1].client_session_id);
+    let rendered = String::from_utf8(output).unwrap();
+    assert!(!rendered.contains(&seen[0].client_session_id.to_string()));
+}
+
+#[test]
+fn a_new_mcp_process_gets_a_different_client_session_id() {
+    let first = FakeTransport::new();
+    let second = FakeTransport::new();
+    let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_status\",\"arguments\":{}}}\n";
+
+    serve_mcp(input.as_slice(), &mut Vec::new(), &first).unwrap();
+    serve_mcp(input.as_slice(), &mut Vec::new(), &second).unwrap();
+
+    assert_ne!(
+        first.seen.borrow()[0].client_session_id,
+        second.seen.borrow()[0].client_session_id
+    );
+}

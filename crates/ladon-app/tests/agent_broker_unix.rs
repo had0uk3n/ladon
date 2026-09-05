@@ -28,31 +28,49 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
     controller.add_secret(&mut draft).unwrap();
 
     let endpoint = directory.path().join("broker.sock");
-    let _server = LocalBrokerHandle::start_at(Arc::new(Mutex::new(controller)), &endpoint).unwrap();
+    let server = LocalBrokerHandle::start_at(Arc::new(Mutex::new(controller)), &endpoint).unwrap();
     let client = LocalClient::new(&endpoint);
+    let client_session_id = Uuid::new_v4();
 
-    let list = client.call(&request(RpcMethod::List)).unwrap();
+    let list = client
+        .call(&request_for(client_session_id, RpcMethod::List))
+        .unwrap();
     let Some(RpcResult::List { secrets }) = list.result() else {
         panic!("expected list response");
     };
     assert_eq!(secrets[0].name, "test-token");
 
-    let run = client
-        .call(&request(RpcMethod::Run {
-            executable: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "printf %s \"$TOKEN\"".to_owned()],
-            working_directory: directory.path().to_string_lossy().into_owned(),
-            bindings: vec![SecretBindingRequest {
-                secret_ref: "test-token".to_owned(),
-                field: "value".to_owned(),
-                target: BindingTarget::Environment {
-                    name: "TOKEN".to_owned(),
-                },
-            }],
-            timeout_ms: 5_000,
-            output_limit_bytes: 64 * 1024,
-        }))
-        .unwrap();
+    let marker = directory.path().join("started");
+    let run_client = client.clone();
+    let run_directory = directory.path().to_string_lossy().into_owned();
+    let running = thread::spawn(move || {
+        run_client.call(&request_for(
+            client_session_id,
+            RpcMethod::Run {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "printf started > started; printf %s \"$TOKEN\"".to_owned(),
+                ],
+                working_directory: run_directory,
+                bindings: vec![SecretBindingRequest {
+                    secret_ref: "test-token".to_owned(),
+                    field: "value".to_owned(),
+                    target: BindingTarget::Environment {
+                        name: "TOKEN".to_owned(),
+                    },
+                }],
+                timeout_ms: 5_000,
+                output_limit_bytes: 64 * 1024,
+            },
+        ))
+    });
+    let approval = wait_for_pending(&server);
+    assert!(!marker.exists(), "child process started before approval");
+    assert_eq!(approval.secrets()[0].name(), "test-token");
+    assert_eq!(approval.secrets()[0].fields(), &["value"]);
+    server.approve(approval.id()).unwrap();
+    let run = running.join().unwrap().unwrap();
     let Some(RpcResult::Run {
         stdout,
         redaction_count,
@@ -67,36 +85,45 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
 
     let run_client = client.clone();
     let running = thread::spawn(move || {
-        run_client.call(&request(RpcMethod::Run {
-            executable: "/bin/sh".to_owned(),
-            arguments: vec![
-                "-c".to_owned(),
-                "trap '' TERM; while :; do sleep 1; done".to_owned(),
-            ],
-            working_directory: "/tmp".to_owned(),
-            bindings: vec![SecretBindingRequest {
-                secret_ref: "test-token".to_owned(),
-                field: "value".to_owned(),
-                target: BindingTarget::Environment {
-                    name: "TOKEN".to_owned(),
-                },
-            }],
-            timeout_ms: 1_000,
-            output_limit_bytes: 64 * 1024,
-        }))
+        run_client.call(&request_for(
+            client_session_id,
+            RpcMethod::Run {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "trap '' TERM; while :; do sleep 1; done".to_owned(),
+                ],
+                working_directory: "/tmp".to_owned(),
+                bindings: vec![SecretBindingRequest {
+                    secret_ref: "test-token".to_owned(),
+                    field: "value".to_owned(),
+                    target: BindingTarget::Environment {
+                        name: "TOKEN".to_owned(),
+                    },
+                }],
+                timeout_ms: 1_000,
+                output_limit_bytes: 64 * 1024,
+            },
+        ))
     });
     thread::sleep(Duration::from_millis(100));
-    let lock_started = Instant::now();
-    let lock = client.call(&request(RpcMethod::Lock)).unwrap();
-    assert!(matches!(lock.result(), Some(RpcResult::Locked)));
-    assert!(lock_started.elapsed() >= Duration::from_millis(400));
+    let revoke_started = Instant::now();
+    server.revoke_grants().unwrap();
+    assert!(revoke_started.elapsed() >= Duration::from_millis(400));
     let run = running.join().unwrap().unwrap();
     let Some(RpcResult::Run { termination, .. }) = run.result() else {
         panic!("expected cancelled run response");
     };
     assert_eq!(termination, "cancelled");
 
-    let locked_use = client.call(&request(RpcMethod::List)).unwrap();
+    let lock = client
+        .call(&request_for(client_session_id, RpcMethod::Lock))
+        .unwrap();
+    assert!(matches!(lock.result(), Some(RpcResult::Locked)));
+
+    let locked_use = client
+        .call(&request_for(client_session_id, RpcMethod::List))
+        .unwrap();
     assert_eq!(
         locked_use.error_details(),
         Some(("vault_locked", "vault is locked"))
@@ -115,36 +142,16 @@ fn disconnecting_the_client_cancels_its_secret_bearing_run() {
     controller.add_secret(&mut draft).unwrap();
 
     let endpoint = directory.path().join("broker.sock");
-    let _server = LocalBrokerHandle::start_at(Arc::new(Mutex::new(controller)), &endpoint).unwrap();
-    let runaway = request(RpcMethod::Run {
-        executable: "/bin/sh".to_owned(),
-        arguments: vec![
-            "-c".to_owned(),
-            "trap '' TERM; while :; do sleep 1; done".to_owned(),
-        ],
-        working_directory: "/tmp".to_owned(),
-        bindings: vec![SecretBindingRequest {
-            secret_ref: "test-token".to_owned(),
-            field: "value".to_owned(),
-            target: BindingTarget::Environment {
-                name: "TOKEN".to_owned(),
-            },
-        }],
-        timeout_ms: 5_000,
-        output_limit_bytes: 64 * 1024,
-    });
-    let mut abandoned = UnixStream::connect(&endpoint).unwrap();
-    abandoned
-        .write_all(&encode_request_frame(&runaway).unwrap())
-        .unwrap();
-    drop(abandoned);
-    thread::sleep(Duration::from_secs(1));
-
-    let client = LocalClient::new(&endpoint);
-    let replacement = client
-        .call(&request(RpcMethod::Run {
+    let server = LocalBrokerHandle::start_at(Arc::new(Mutex::new(controller)), &endpoint).unwrap();
+    let client_session_id = Uuid::new_v4();
+    let runaway = request_for(
+        client_session_id,
+        RpcMethod::Run {
             executable: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "printf replacement-finished".to_owned()],
+            arguments: vec![
+                "-c".to_owned(),
+                "trap '' TERM; while :; do sleep 1; done".to_owned(),
+            ],
             working_directory: "/tmp".to_owned(),
             bindings: vec![SecretBindingRequest {
                 secret_ref: "test-token".to_owned(),
@@ -155,16 +162,138 @@ fn disconnecting_the_client_cancels_its_secret_bearing_run() {
             }],
             timeout_ms: 5_000,
             output_limit_bytes: 64 * 1024,
-        }))
+        },
+    );
+    let mut abandoned = UnixStream::connect(&endpoint).unwrap();
+    abandoned
+        .write_all(&encode_request_frame(&runaway).unwrap())
         .unwrap();
+    wait_for_pending(&server);
+    drop(abandoned);
+    wait_for_no_pending(&server);
+
+    let client = LocalClient::new(&endpoint);
+    let replacement_client = client.clone();
+    let replacement = thread::spawn(move || {
+        replacement_client.call(&request_for(
+            client_session_id,
+            RpcMethod::Run {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), "printf replacement-finished".to_owned()],
+                working_directory: "/tmp".to_owned(),
+                bindings: vec![SecretBindingRequest {
+                    secret_ref: "test-token".to_owned(),
+                    field: "value".to_owned(),
+                    target: BindingTarget::Environment {
+                        name: "TOKEN".to_owned(),
+                    },
+                }],
+                timeout_ms: 5_000,
+                output_limit_bytes: 64 * 1024,
+            },
+        ))
+    });
+    let approval = wait_for_pending(&server);
+    server.approve(approval.id()).unwrap();
+    let replacement = replacement.join().unwrap().unwrap();
     assert!(matches!(replacement.result(), Some(RpcResult::Run { .. })));
 }
 
-fn request(method: RpcMethod) -> RpcRequest {
+#[test]
+fn approved_name_cannot_switch_to_a_replacement_secret_before_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let passphrase = SensitiveText::from("correct horse");
+    let mut controller = VaultController::new(directory.path().join("vault.ladon"));
+    controller.create(&passphrase, &passphrase).unwrap();
+    let mut original = AddSecretDraft::new();
+    original.set_name("rotating-token");
+    original.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-original-secret");
+    let original_id = controller.add_secret(&mut original).unwrap();
+    let controller = Arc::new(Mutex::new(controller));
+
+    let endpoint = directory.path().join("broker.sock");
+    let server = LocalBrokerHandle::start_at(Arc::clone(&controller), &endpoint).unwrap();
+    let marker = directory.path().join("started");
+    let client = LocalClient::new(&endpoint);
+    let client_session_id = Uuid::new_v4();
+    let run_directory = directory.path().to_string_lossy().into_owned();
+    let running = thread::spawn(move || {
+        client.call(&request_for(
+            client_session_id,
+            RpcMethod::Run {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), "printf started > started".to_owned()],
+                working_directory: run_directory,
+                bindings: vec![SecretBindingRequest {
+                    secret_ref: "rotating-token".to_owned(),
+                    field: "value".to_owned(),
+                    target: BindingTarget::Environment {
+                        name: "TOKEN".to_owned(),
+                    },
+                }],
+                timeout_ms: 5_000,
+                output_limit_bytes: 64 * 1024,
+            },
+        ))
+    });
+    let pending = wait_for_pending(&server);
+
+    {
+        let mut controller = controller.lock().unwrap();
+        controller.delete_secret(original_id).unwrap();
+        let mut replacement = AddSecretDraft::new();
+        replacement.set_name("rotating-token");
+        replacement.fields_mut()[0]
+            .value_mut()
+            .push_str("fake-replacement-secret");
+        controller.add_secret(&mut replacement).unwrap();
+    }
+    server.approve(pending.id()).unwrap();
+
+    let response = running.join().unwrap().unwrap();
+    assert_eq!(
+        response.error_details(),
+        Some(("invalid_binding", "secret binding is invalid"))
+    );
+    assert!(
+        !marker.exists(),
+        "replacement secret reached a child process"
+    );
+}
+
+fn request_for(client_session_id: Uuid, method: RpcMethod) -> RpcRequest {
     RpcRequest {
-        version: 1,
+        version: 2,
         request_id: Uuid::new_v4(),
+        client_session_id,
         client_label: "integration test".to_owned(),
         method,
+    }
+}
+
+fn wait_for_pending(server: &LocalBrokerHandle) -> ladon_app::PendingApproval {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(pending) = server.pending_approval().unwrap() {
+            return pending;
+        }
+        assert!(Instant::now() < deadline, "approval never became pending");
+        thread::yield_now();
+    }
+}
+
+fn wait_for_no_pending(server: &LocalBrokerHandle) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if server.pending_approval().unwrap().is_none() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled approval remained pending"
+        );
+        thread::yield_now();
     }
 }

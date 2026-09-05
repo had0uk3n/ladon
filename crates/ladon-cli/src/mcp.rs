@@ -2,8 +2,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 use ladon_core::{
     BindingTarget, DEFAULT_OUTPUT_LIMIT_BYTES, DEFAULT_RUN_TIMEOUT, LadonError, MAX_FRAME_BYTES,
-    RpcMethod, RpcRequest, RunCaller, RunRequest, SecretBindingRequest, validate_json_document,
-    validate_run_request,
+    PROTOCOL_VERSION, RpcMethod, RpcRequest, RunCaller, RunRequest, SecretBindingRequest,
+    validate_json_document, validate_run_request,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,6 +20,7 @@ pub fn serve_mcp(
     transport: &impl RpcTransport,
 ) -> Result<(), LadonError> {
     let mut input = BufReader::new(input);
+    let client_session_id = Uuid::new_v4();
     loop {
         let mut line = String::new();
         let read = input
@@ -37,7 +38,7 @@ pub fn serve_mcp(
         if trimmed.is_empty() {
             continue;
         }
-        let response = handle_message(trimmed.as_bytes(), transport);
+        let response = handle_message(trimmed.as_bytes(), client_session_id, transport);
         if let Some(response) = response {
             serde_json::to_writer(&mut *output, &response)
                 .map_err(|_| LadonError::InvalidRequest)?;
@@ -49,7 +50,11 @@ pub fn serve_mcp(
     }
 }
 
-fn handle_message(input: &[u8], transport: &impl RpcTransport) -> Option<Value> {
+fn handle_message(
+    input: &[u8],
+    client_session_id: Uuid,
+    transport: &impl RpcTransport,
+) -> Option<Value> {
     if validate_json_document(input).is_err() {
         return Some(jsonrpc_error(Value::Null, -32700, "invalid JSON"));
     }
@@ -92,12 +97,22 @@ fn handle_message(input: &[u8], transport: &impl RpcTransport) -> Option<Value> 
             "id": id,
             "result": { "tools": tools() }
         })),
-        "tools/call" => Some(call_tool(id, request.get("params"), transport)),
+        "tools/call" => Some(call_tool(
+            id,
+            request.get("params"),
+            client_session_id,
+            transport,
+        )),
         _ => Some(jsonrpc_error(id, -32601, "method not found")),
     }
 }
 
-fn call_tool(id: Value, params: Option<&Value>, transport: &impl RpcTransport) -> Value {
+fn call_tool(
+    id: Value,
+    params: Option<&Value>,
+    client_session_id: Uuid,
+    transport: &impl RpcTransport,
+) -> Value {
     let Some(params) = params else {
         return jsonrpc_error(id, -32602, "invalid params");
     };
@@ -120,8 +135,9 @@ fn call_tool(id: Value, params: Option<&Value>, transport: &impl RpcTransport) -
         Err(error) => return tool_error(id, error.code(), error.safe_message()),
     };
     let request = RpcRequest {
-        version: 1,
+        version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
+        client_session_id,
         client_label: "MCP client (unverified)".to_owned(),
         method,
     };

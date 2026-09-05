@@ -6,8 +6,9 @@ use std::{
 };
 
 use ladon_core::{
-    BindingTarget, DEFAULT_OUTPUT_LIMIT_BYTES, DEFAULT_RUN_TIMEOUT, LadonError, RpcMethod,
-    RpcRequest, RpcResponse, RunCaller, RunRequest, SecretBindingRequest, validate_run_request,
+    BindingTarget, DEFAULT_OUTPUT_LIMIT_BYTES, DEFAULT_RUN_TIMEOUT, LadonError, PROTOCOL_VERSION,
+    RpcMethod, RpcRequest, RpcResponse, RunCaller, RunRequest, SecretBindingRequest,
+    validate_run_request,
 };
 use uuid::Uuid;
 
@@ -55,8 +56,9 @@ fn call_and_render(
     stdout: &mut impl Write,
 ) -> Result<(), LadonError> {
     let request = RpcRequest {
-        version: 1,
+        version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
+        client_session_id: Uuid::new_v4(),
         client_label: "Ladon CLI".to_owned(),
         method,
     };

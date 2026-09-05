@@ -15,8 +15,8 @@ use ladon_core::{
 use uuid::Uuid;
 
 use crate::{
-    LocalServer, RunCancellation, RunTermination, Supervisor, VaultController, VaultUiPhase,
-    default_endpoint_path,
+    ApprovalCoordinator, LocalServer, PendingApproval, RunCancellation, RunTermination, Supervisor,
+    VaultController, VaultUiPhase, default_endpoint_path,
 };
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -25,6 +25,7 @@ const MAX_CONNECTION_WORKERS: usize = 8;
 pub struct LocalBrokerHandle {
     stop: Arc<AtomicBool>,
     coordinator: Arc<RunCoordinator>,
+    approval: Arc<ApprovalCoordinator>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -134,12 +135,15 @@ impl LocalBrokerHandle {
         server.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let coordinator = Arc::new(RunCoordinator::default());
+        let approval = Arc::new(ApprovalCoordinator::session_defaults());
         let worker_stop = Arc::clone(&stop);
         let worker_coordinator = Arc::clone(&coordinator);
+        let worker_approval = Arc::clone(&approval);
         let thread = thread::spawn(move || {
             let broker = Arc::new(AgentBroker::new(
                 controller,
                 worker_coordinator,
+                worker_approval,
                 Arc::clone(&worker_stop),
             ));
             let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -173,6 +177,7 @@ impl LocalBrokerHandle {
         Ok(Self {
             stop,
             coordinator,
+            approval,
             thread: Some(thread),
         })
     }
@@ -182,6 +187,7 @@ impl LocalBrokerHandle {
     }
 
     pub fn cancel_active_run_and_wait(&self) -> Result<(), LadonError> {
+        self.approval.cancel_pending()?;
         let _block = self.coordinator.block_new_runs()?;
         Ok(())
     }
@@ -190,6 +196,8 @@ impl LocalBrokerHandle {
         &self,
         controller: &Arc<Mutex<VaultController>>,
     ) -> Result<(), LadonError> {
+        self.approval.cancel_pending()?;
+        self.approval.revoke_all()?;
         let _block = self.coordinator.block_new_runs()?;
         controller
             .lock()
@@ -205,16 +213,41 @@ impl LocalBrokerHandle {
         let Some(_block) = self.coordinator.try_block_new_runs()? else {
             return Ok(false);
         };
-        Ok(controller
+        let locked = controller
             .lock()
             .map_err(|_| LadonError::ProcessFailure)?
-            .auto_lock_if_idle())
+            .auto_lock_if_idle();
+        if locked {
+            self.approval.cancel_pending()?;
+            self.approval.revoke_all()?;
+        }
+        Ok(locked)
+    }
+
+    pub fn pending_approval(&self) -> Result<Option<PendingApproval>, LadonError> {
+        self.approval.pending()
+    }
+
+    pub fn approve(&self, approval_id: Uuid) -> Result<(), LadonError> {
+        self.approval.approve(approval_id)
+    }
+
+    pub fn deny(&self, approval_id: Uuid) -> Result<(), LadonError> {
+        self.approval.deny(approval_id)
+    }
+
+    pub fn revoke_grants(&self) -> Result<(), LadonError> {
+        self.approval.cancel_pending()?;
+        let _block = self.coordinator.block_new_runs()?;
+        self.approval.revoke_all()
     }
 }
 
 impl Drop for LocalBrokerHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let _ = self.approval.cancel_pending();
+        let _ = self.approval.revoke_all();
         let _ = self.cancel_active_run_and_wait();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -226,6 +259,7 @@ struct AgentBroker {
     controller: Arc<Mutex<VaultController>>,
     supervisor: Supervisor,
     coordinator: Arc<RunCoordinator>,
+    approval: Arc<ApprovalCoordinator>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -233,19 +267,26 @@ impl AgentBroker {
     fn new(
         controller: Arc<Mutex<VaultController>>,
         coordinator: Arc<RunCoordinator>,
+        approval: Arc<ApprovalCoordinator>,
         shutting_down: Arc<AtomicBool>,
     ) -> Self {
         Self {
             controller,
             supervisor: Supervisor::new(),
             coordinator,
+            approval,
             shutting_down,
         }
     }
 
     fn handle(&self, request: RpcRequest, cancellation: RunCancellation) -> RpcResponse {
         let request_id = request.request_id;
-        match self.handle_method(request.method, cancellation) {
+        match self.handle_method(
+            request.client_session_id,
+            request.client_label,
+            request.method,
+            cancellation,
+        ) {
             Ok(result) => RpcResponse::success(request_id, result),
             Err(error) => RpcResponse::error(request_id, error),
         }
@@ -253,6 +294,8 @@ impl AgentBroker {
 
     fn handle_method(
         &self,
+        client_session_id: Uuid,
+        client_label: String,
         method: RpcMethod,
         connection_cancellation: RunCancellation,
     ) -> Result<RpcResult, LadonError> {
@@ -289,6 +332,8 @@ impl AgentBroker {
                 Ok(RpcResult::List { secrets })
             }
             RpcMethod::Lock => {
+                self.approval.cancel_pending()?;
+                self.approval.revoke_all()?;
                 let _block = self.coordinator.block_new_runs()?;
                 self.controller()?.lock();
                 Ok(RpcResult::Locked)
@@ -304,11 +349,6 @@ impl AgentBroker {
                 if self.shutting_down.load(Ordering::Acquire) {
                     return Err(LadonError::EndpointUnavailable);
                 }
-                let cancellation = connection_cancellation;
-                let _run_lease = self.coordinator.try_start(cancellation.clone())?;
-                if self.shutting_down.load(Ordering::Acquire) {
-                    return Err(LadonError::EndpointUnavailable);
-                }
                 let validated = validate_run_request(
                     RunRequest {
                         executable,
@@ -320,23 +360,44 @@ impl AgentBroker {
                     },
                     RunCaller::Cli,
                 )?;
+                let cancellation = connection_cancellation;
+                let _run_lease = self.coordinator.try_start(cancellation.clone())?;
+                if self.shutting_down.load(Ordering::Acquire) {
+                    return Err(LadonError::EndpointUnavailable);
+                }
+                if !validated.bindings().is_empty() {
+                    let approval_plan = self.controller()?.approval_plan(validated.bindings())?;
+                    let ticket = self.approval.authorize(
+                        PendingApproval::new(
+                            approval_plan.vault_session_id,
+                            client_session_id,
+                            client_label,
+                            approval_plan.secrets,
+                            validated.executable(),
+                            validated.arguments().iter().map(String::as_str),
+                            validated.working_directory(),
+                        ),
+                        &cancellation,
+                    )?;
+                    let binding_secret_ids = approval_plan.binding_secret_ids;
+                    let result = self.supervisor.run(validated, cancellation, |bindings| {
+                        self.approval.with_valid_grant(&ticket, || {
+                            self.controller()?
+                                .resolve_bindings_for_ids(bindings, &binding_secret_ids)
+                        })
+                    });
+                    if let Ok(mut controller) = self.controller.lock() {
+                        controller.record_secret_activity();
+                    }
+                    return run_result(result);
+                }
                 let result = self.supervisor.run(validated, cancellation, |bindings| {
                     self.controller()?.resolve_bindings(bindings)
                 });
                 if let Ok(mut controller) = self.controller.lock() {
                     controller.record_secret_activity();
                 }
-                let result = result?;
-                Ok(RpcResult::Run {
-                    exit_code: result.exit_code,
-                    termination: termination_name(result.termination).to_owned(),
-                    stdout: result.stdout,
-                    stderr: result.stderr,
-                    duration_ms: duration_millis(result.duration),
-                    redaction_count: result.redaction_count,
-                    output_truncated: result.output_truncated || result.output_suppressed,
-                    temp_cleanup_warning: result.temp_cleanup_warning,
-                })
+                run_result(result)
             }
         }
     }
@@ -371,6 +432,20 @@ fn termination_name(termination: RunTermination) -> &'static str {
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn run_result(result: Result<crate::RunResult, LadonError>) -> Result<RpcResult, LadonError> {
+    let result = result?;
+    Ok(RpcResult::Run {
+        exit_code: result.exit_code,
+        termination: termination_name(result.termination).to_owned(),
+        stdout: result.stdout,
+        stderr: result.stderr,
+        duration_ms: duration_millis(result.duration),
+        redaction_count: result.redaction_count,
+        output_truncated: result.output_truncated || result.output_suppressed,
+        temp_cleanup_warning: result.temp_cleanup_warning,
+    })
 }
 
 #[cfg(test)]

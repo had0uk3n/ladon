@@ -25,6 +25,16 @@ They may request metadata, locking, or a bounded run, but cannot request secret
 plaintext. A launched child is trusted for the fields deliberately injected
 into it and untrusted for all other fields.
 
+Secret-bearing runs also require an unexpired in-memory grant for every
+referenced secret. A grant is scoped to a random client-session UUID and an
+immutable secret ID for a fixed 30 minutes, within one vault unlock lifetime.
+The broker revalidates that grant immediately before reading plaintext and
+serializes resolution against revocation. This prevents accidental reuse by a
+different integration instance; it is not authentication against a malicious
+process already running as the same user. MCP does not provide a universal
+trusted chat identifier, so the scope is an integration process rather than a
+conversation.
+
 The operating system, cryptographic libraries, Rust toolchain, and Ladon binary
 are trusted. Repository source is assumed public; no protection depends on code
 secrecy.
@@ -46,6 +56,8 @@ secrecy.
   a client.
 - An authorized child can transmit a secret directly, encrypt it, hash it,
   split it, or otherwise transform it beyond exact-pattern redaction.
+- Grant expiry and revocation prevent future Ladon resolutions but cannot erase
+  a value already delivered to an authorized child process.
 - Clipboard managers, swap, hibernation, terminal recording, accessibility
   APIs, keyboard capture, screenshots, filesystem snapshots, and backups may
   retain data outside Ladon's control.
@@ -70,6 +82,11 @@ secrecy.
    session.
 7. Setup writes only an absolute local MCP command and makes a backup before
    changing an existing client configuration.
+8. Session PIN verifiers, Touch ID choice, pending approvals, and grants are
+   memory-only and are removed when the app exits; no native credential store
+   is used.
+9. Any new vault unlock lifetime invalidates grants from the preceding one;
+   grant expiry or revocation is rechecked before plaintext resolution.
 
 ## Review gates before stable v1
 

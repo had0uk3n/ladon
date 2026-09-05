@@ -16,6 +16,9 @@ owner-authenticated named-pipe transport is not implemented yet.
 - encrypted, portable, passphrase-protected vault;
 - native GUI for first run, unlock, add/list/delete, explicit backup recovery,
   and 30-minute activity locking;
+- memory-only session PIN on every platform or strict Touch ID on macOS;
+- one-confirmation, fixed 30-minute access per agent-process/secret pair, with
+  manual revocation;
 - generic direct process execution without a shell added by Ladon;
 - environment, stdin, and temporary-file injection by secret name or ID;
 - bounded stdout/stderr capture and redaction of common raw/encoded forms;
@@ -24,20 +27,31 @@ owner-authenticated named-pipe transport is not implemented yet.
 - preview-before-write `ladon integrate codex|claude`, with a timestamped
   configuration backup and idempotent updates.
 
-Quick PIN, tray/background lifecycle, OS screen-lock handling, Windows named
-pipes, binary file drag-and-drop, and signed installers remain release work.
+Tray/background lifecycle, OS screen-lock handling, Windows named pipes, binary
+file drag-and-drop, and signed installers remain release work.
 
 ## Build and run
 
-Ladon requires Rust 1.85 or newer.
+Building Ladon requires Rust 1.85 or newer and the platform's normal native
+linker. On Ubuntu 24.04, install the GUI development packages used by CI first:
+
+```sh
+sudo apt-get install libxcb-render0-dev libxcb-shape0-dev \
+  libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+```
+
+Then build both the GUI and CLI:
 
 ```sh
 cargo build --release
 ./target/release/ladon-app
 ```
 
-On first launch, create a passphrase of at least 12 Unicode characters, then add
-a secret. Keep the app open and the vault unlocked while an agent uses it.
+On first launch, create a passphrase of at least 12 Unicode characters. Then
+choose a 6–12 digit PIN for this app session, or Touch ID on a supported Mac,
+and add a secret. The PIN verifier and all agent permissions stay only in
+memory and are forgotten when Ladon locks or exits. The resulting release
+binaries do not require Rust to be installed on the computer where they run.
 
 In a second terminal:
 
@@ -97,8 +111,18 @@ Secret names, field names, executable paths, arguments, and working directories
 are metadata visible to the agent. Do not put secret material in those names or
 arguments.
 
-The current preview does not open an approval dialog for a locked agent request.
-It returns `vault_locked`; unlock Ladon in the local GUI and retry the request.
+The first run from an MCP process that needs a particular secret opens a local
+approval window. Confirm once with the session PIN or Touch ID and that MCP
+process may use the displayed secret for a fixed 30 minutes; use does not extend
+the timer. A different MCP process or another secret asks separately. Use
+**Revoke agent access** in the GUI to clear every permission immediately. A
+one-shot `ladon run` invocation has a fresh client identity, so it asks each
+time. Revocation also cancels the active supervised run before returning, and
+locking/reopening always starts with no permissions.
+
+If the vault is locked, the request returns `vault_locked`; unlock Ladon in the
+local GUI, choose the session confirmation method, and retry it. An approval
+waits for at most two minutes and starts no child process before confirmation.
 
 ## Security boundary
 
@@ -109,7 +133,9 @@ rest and rejects other OS users at the local Unix endpoint.
 It cannot protect a secret from malware already running as your user, a
 malicious authorized child process, screen/keyboard capture, or deliberate
 transformation and exfiltration by a child. Redaction recognizes common exact
-representations; it is not semantic DLP. Read [SECURITY.md](SECURITY.md) and the
+representations; it is not semantic DLP. Expiry or revocation prevents future
+resolution but cannot erase a value already delivered to a running authorized
+child. Read [SECURITY.md](SECURITY.md) and the
 [threat model](docs/threat-model.md) before using real credentials.
 
 ## Development
@@ -118,10 +144,15 @@ representations; it is not semantic DLP. Read [SECURITY.md](SECURITY.md) and the
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+scripts/smoke-test.sh
 ```
+
+Unix socket integration tests need permission to create a local Unix socket;
+some restricted sandboxes block that operation even when the code is correct.
 
 The detailed [design specification](docs/superpowers/specs/2026-09-04-ladon-design.md),
 [implementation plan](docs/superpowers/plans/2026-09-04-ladon-v1-implementation.md),
+[session-grants plan](docs/superpowers/plans/2026-09-05-session-secret-grants.md),
 [file format](docs/file-format.md), and [protocol](docs/protocol.md) are kept in
 the repository so the security design is reviewable alongside the code.
 

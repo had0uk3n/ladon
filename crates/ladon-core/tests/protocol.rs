@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 fn status_request() -> RpcRequest {
     RpcRequest {
-        version: 1,
+        version: 2,
         request_id: Uuid::parse_str("018f6f65-1f16-7c5a-9b52-6cf413b9db65").unwrap(),
+        client_session_id: Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
         client_label: "Codex".to_owned(),
         method: RpcMethod::Status,
     }
@@ -61,7 +62,7 @@ fn framed(json: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn request_round_trip_has_version_uuid_label_method_and_typed_params() {
+fn request_round_trip_has_version_request_and_client_uuids_label_method_and_typed_params() {
     let request = RpcRequest {
         method: RpcMethod::Run {
             executable: "/usr/bin/env".to_owned(),
@@ -83,6 +84,11 @@ fn request_round_trip_has_version_uuid_label_method_and_typed_params() {
     let decoded = decode_request_frame(&encode_request_frame(&request).unwrap()).unwrap();
 
     assert_eq!(decoded, request);
+    assert_eq!(decoded.version, 2);
+    assert_eq!(
+        decoded.client_session_id,
+        Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap()
+    );
 }
 
 #[test]
@@ -110,20 +116,20 @@ fn rejects_zero_partial_oversized_and_trailing_frames() {
 
 #[test]
 fn rejects_duplicate_keys_unknown_methods_and_incompatible_versions() {
-    let duplicate = br#"{"version":1,"version":1,"request_id":"018f6f65-1f16-7c5a-9b52-6cf413b9db65","client_label":"Codex","method":"status","params":{}}"#;
+    let duplicate = br#"{"version":2,"version":2,"request_id":"018f6f65-1f16-7c5a-9b52-6cf413b9db65","client_session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","client_label":"Codex","method":"status","params":{}}"#;
     assert_eq!(
         decode_request_frame(&framed(duplicate)).unwrap_err(),
         LadonError::InvalidRequest
     );
 
-    let unknown = br#"{"version":1,"request_id":"018f6f65-1f16-7c5a-9b52-6cf413b9db65","client_label":"Codex","method":"reveal","params":{}}"#;
+    let unknown = br#"{"version":2,"request_id":"018f6f65-1f16-7c5a-9b52-6cf413b9db65","client_session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","client_label":"Codex","method":"reveal","params":{}}"#;
     assert_eq!(
         decode_request_frame(&framed(unknown)).unwrap_err(),
         LadonError::InvalidRequest
     );
 
     let mut incompatible = status_request();
-    incompatible.version = 2;
+    incompatible.version = 1;
     assert_eq!(
         decode_request_frame(&encode_request_frame(&incompatible).unwrap()).unwrap_err(),
         LadonError::UnsupportedProtocolVersion
@@ -134,7 +140,7 @@ fn rejects_duplicate_keys_unknown_methods_and_incompatible_versions() {
 fn rejects_excessive_nesting_and_client_labels() {
     let nested_value = format!("{}0{}", "[".repeat(17), "]".repeat(17));
     let nested = format!(
-        "{{\"version\":1,\"request_id\":\"018f6f65-1f16-7c5a-9b52-6cf413b9db65\",\"client_label\":\"Codex\",\"method\":\"status\",\"params\":{{\"nested\":{nested_value}}}}}"
+        "{{\"version\":2,\"request_id\":\"018f6f65-1f16-7c5a-9b52-6cf413b9db65\",\"client_session_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"client_label\":\"Codex\",\"method\":\"status\",\"params\":{{\"nested\":{nested_value}}}}}"
     );
     assert_eq!(
         decode_request_frame(&framed(nested.as_bytes())).unwrap_err(),

@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::LadonError;
 
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_JSON_DEPTH: usize = 16;
 const MAX_CLIENT_LABEL_BYTES: usize = 64;
 const MAX_ARGUMENTS: usize = 256;
@@ -19,6 +20,7 @@ const MAX_PATH_BYTES: usize = 32 * 1024;
 pub struct RpcRequest {
     pub version: u16,
     pub request_id: Uuid,
+    pub client_session_id: Uuid,
     pub client_label: String,
     #[serde(flatten)]
     pub method: RpcMethod,
@@ -123,7 +125,7 @@ impl RpcResponse {
     #[must_use]
     pub const fn success(request_id: Uuid, result: RpcResult) -> Self {
         Self {
-            version: 1,
+            version: PROTOCOL_VERSION,
             request_id,
             outcome: RpcOutcome::Success { result },
         }
@@ -132,7 +134,7 @@ impl RpcResponse {
     #[must_use]
     pub fn error(request_id: Uuid, error: LadonError) -> Self {
         Self {
-            version: 1,
+            version: PROTOCOL_VERSION,
             request_id,
             outcome: RpcOutcome::Failure {
                 error: RpcErrorBody {
@@ -173,7 +175,7 @@ pub fn decode_response_frame(frame: &[u8]) -> Result<RpcResponse, LadonError> {
     validate_json_document(json)?;
     let response: RpcResponse =
         serde_json::from_slice(json).map_err(|_| LadonError::InvalidRequest)?;
-    if response.version != 1 {
+    if response.version != PROTOCOL_VERSION {
         return Err(LadonError::UnsupportedProtocolVersion);
     }
     Ok(response)
@@ -223,7 +225,7 @@ fn checked_frame_payload(frame: &[u8]) -> Result<&[u8], LadonError> {
 }
 
 fn validate_request(request: &RpcRequest) -> Result<(), LadonError> {
-    if request.version != 1 {
+    if request.version != PROTOCOL_VERSION {
         return Err(LadonError::UnsupportedProtocolVersion);
     }
     if request.client_label.is_empty()

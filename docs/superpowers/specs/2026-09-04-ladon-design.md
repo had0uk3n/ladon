@@ -76,18 +76,19 @@ Ladon provides limited defense against:
 - prompt injection causing an unintended use of a secret;
 - another process running as the same operating-system user;
 - replacement of the vault with an older authenticated generation;
-- offline guessing of a short device PIN after both the vault and the native
-  device credential store are compromised;
+- guessing of a short session PIN by a process already executing as the same
+  operating-system user;
 - memory inspection, swap, hibernation images, crash dumps, or privileged
   debugging;
 - filesystem snapshots, backups, or forensic remnants of an explicitly
   requested plaintext temporary-file binding.
 
-These risks are reduced by explicit unlock context, OS-level IPC permissions,
-short unlocked sessions, device-bound PIN material, output redaction,
-best-effort memory locking and zeroization, and disabled core dumps. Ladon does
-not claim to eliminate them. In particular, unlocking authorizes requests from
-other processes running as the same OS user until the idle session expires.
+These risks are reduced by explicit approval context, OS-level IPC permissions,
+fixed per-client/per-secret grants, output redaction, best-effort memory locking
+and zeroization, and disabled core dumps. Ladon does not claim to eliminate
+them. A grant is an application policy boundary against accidental use, not
+protection from a process that already controls the user's session or can
+inspect Ladon's memory.
 
 ### 4.3 Security invariant
 
@@ -107,8 +108,10 @@ operating-system access controls, never on hidden implementation details.
    composition rules.
 4. Ladon explains that a lost passphrase cannot be reset and offers an immediate
    encrypted vault backup.
-5. When a supported native credential store is available, Ladon offers a
-   device-local quick PIN. The passphrase remains the portable recovery method.
+5. After the vault opens, Ladon asks the user to choose a temporary approval
+   method for this application lifetime: a 6--12 digit PIN, or Touch ID on a Mac
+   where biometric authentication is available. The PIN, verifier, and
+   authentication choice are never persisted.
 6. Ladon offers one-click setup for Codex and Claude Code.
 
 ### 5.2 Adding a secret
@@ -160,28 +163,30 @@ current-session activity, and create/read/update/delete operations. Closing the
 window keeps the tray process running. Autostart at login is disabled by default
 and can be enabled in settings.
 
-### 5.4 Unlock-on-request
+### 5.4 Approve-on-request
 
-When an agent request arrives while the vault is locked, Ladon opens a native
-window containing:
+When a secret-bearing agent request arrives without an active grant, Ladon opens
+its native window and shows:
 
 - an explicit **unverified local client label**, such as Codex or Claude Code;
 - any secret references and fields exactly as supplied by the client;
 - the requested operation and, for a run, the executable, arguments, and working
   directory;
-- a PIN field when quick unlock is available, plus an option to use the
-  passphrase;
-- **Deny** and **Unlock and continue** actions.
+- the names and fields of secrets for which this client session lacks a grant;
+- a PIN field when the session uses PIN, or a **Use Touch ID** action on a Mac
+  session configured for Touch ID;
+- **Deny** and **Allow for 30 minutes** actions.
 
 All client-controlled strings are rendered with control and bidi characters
 escaped and cannot supply markup. The request waits for up to two minutes. A
-successful unlock resumes the exact
-pending request without asking the agent to retry. Denial, timeout, window
-closure, or authentication failure returns a structured error and never starts
-the child process.
+successful authentication creates fixed grants for the missing secrets and
+resumes the exact pending request without asking the agent to retry. Denial,
+timeout, window closure, client disconnect, or authentication failure returns a
+structured error and never starts the child process.
 
-Only one unlock request is pending at a time. Additional run or list requests
-receive `busy`; Ladon does not merge dialogs or silently queue commands.
+Only one approval request is pending at a time. Additional ungranted run
+requests receive `busy`; Ladon does not merge dialogs or silently queue
+commands. Metadata-only list requests do not create grants.
 
 ### 5.5 Unlocked session
 
@@ -203,11 +208,29 @@ Run admission and locking share one synchronized state: entering a locking
 transition atomically blocks new runs, cancels the active token if present, and
 waits for process-tree cleanup before dropping the unlocked session.
 
-While unlocked, requests from the same OS user do not require confirmation per
-operation in version 1. This is a deliberate usability trade-off, not a
-client identity guarantee. The tray keeps the unlocked state and remaining time
-visible. Per-client or per-secret grants are deferred until real usage shows
-that their additional prompts justify the complexity.
+Opening the vault does not globally authorize agent use. Approval creates a
+grant keyed by the requesting client-session UUID and each immutable secret ID
+referenced by the request. A grant expires exactly 30 minutes after approval;
+use does not extend it. A request containing several secrets grants each shown
+secret to that client session. Another secret or another client session needs a
+separate approval. Grants are also scoped to the current vault unlock lifetime,
+so no permission survives a lock/reopen cycle or an emergency lock after a
+persistence failure. Immediately before resolving plaintext, the broker
+revalidates the grant while excluding concurrent revocation. The user can revoke
+every active grant without locking the vault; revocation cancels and waits for
+the active supervised run before it reports success.
+
+The client-session UUID identifies one running Ladon integration instance. It
+is randomly generated by the client and kept out of MCP tool arguments and
+results. It is not a cryptographic identity against another process running as
+the same OS user, and Ladon does not call it a chat identity because MCP hosts
+do not expose one universal trusted conversation identifier. `ladon mcp` keeps
+one UUID for its process lifetime; a one-shot human CLI invocation gets a new
+UUID.
+
+Expiry or revocation prevents future resolution by Ladon. It cannot make an
+authorized child forget bytes already delivered to that process. This is an
+inherent boundary and is shown in the security documentation.
 
 ### 5.6 Human reveal and copy
 
@@ -231,6 +254,12 @@ The workspace has three primary packages:
 - `ladon-app`: tray GUI, unlocked session, platform services, local IPC server,
   and process runner;
 - `ladon`: human CLI and the `ladon mcp` stdio bridge.
+
+The approval layer has a platform-neutral grant table and PIN verifier. A
+narrow macOS adapter calls the operating system's LocalAuthentication framework
+for Touch ID. Other platforms compile the same application with PIN approval
+and an unavailable Touch ID adapter. No external credential-store service or
+user-installed runtime is required.
 
 `ladon-core` must not depend on `egui`, MCP, or platform GUI code. Secret values
 are represented by dedicated non-cloneable zeroizing byte containers rather
@@ -315,13 +344,11 @@ to be equivalent.
 
 A passphrase change requires the current passphrase even while the vault is
 unlocked. A successful change generates a fresh salt, KEK, and DEK and
-re-encrypts the payload. If quick PIN is enabled, its replacement wrapper is
-prepared before the vault commit. Failure to prepare it aborts the change; a
-failure while committing it after the new vault is durable disables quick PIN
-and leaves the new passphrase usable. This is intentionally a less frequent
-operation than ordinary vault writes and gives a
+re-encrypts the payload. It also clears all in-memory grants and requires the
+user to configure a new session approval method. This is intentionally a less
+frequent operation than ordinary vault writes and gives a
 passphrase change clear revocation semantics for files managed by Ladon.
-Previously copied vaults, sidecars, backups outside Ladon's managed paths, and
+Previously copied vaults, backups outside Ladon's managed paths, and
 storage-forensic remnants cannot be revoked and are explicitly outside this
 guarantee.
 
@@ -382,9 +409,9 @@ CBOR nesting, and the string limits defined by their model fields. Aggregate
 plaintext remains capped at 64 MiB. These values are format limits, not tunable
 settings.
 
-Device-specific settings such as autostart, native credential-store handles,
-window placement, and quick-PIN configuration remain outside the portable
-payload and never contain managed secret values.
+Device-specific settings such as autostart and window placement remain outside
+the portable payload and never contain managed secret values. Session approval
+configuration is intentionally not written anywhere.
 
 An unsupported file version or extra version 1 header key causes a hard failure.
 Unknown top-level payload keys are preserved during read/write; a future feature
@@ -427,44 +454,26 @@ change and secret deletion use the same two-candidate procedure, so a
 successfully completed operation does not leave an old-password or
 deleted-secret generation in Ladon's managed `.bak` path.
 
-### 7.4 Device-local quick PIN
+### 7.4 Temporary approval authentication
 
-Quick unlock is available only when Ladon can store a random 256-bit device
-secret in macOS Keychain, Windows DPAPI/Credential Manager, or a compatible Linux
-Secret Service implementation.
+The passphrase is the only credential that decrypts the portable vault. After a
+successful passphrase unlock, the user configures an approval method for the
+current application lifetime. A PIN contains 6--12 ASCII digits. Ladon stores
+only a randomly salted Argon2id verifier in zeroizing process memory; the PIN,
+salt, verifier, retry state, and all grants are absent from the vault and from
+sidecar files and disappear when the app exits.
 
-Enabling a PIN creates a device-local sidecar containing:
+On macOS, the user may choose Touch ID instead. Ladon evaluates the strict
+biometric-only LocalAuthentication policy with no password fallback and no reuse
+of an earlier device-unlock match. The framework returns only success or
+failure; Ladon never receives fingerprint data. Touch ID gates the same
+in-memory grant transition as PIN and is not described as cryptographic key
+unwrapping. If Touch ID is unavailable or becomes locked out, the user can lock
+and reopen the vault with the passphrase and choose a session PIN.
 
-- a cleartext sidecar format version and vault UUID;
-- a random PIN salt;
-- Argon2id parameters;
-- a nonce;
-- the DEK encrypted by a quick-unlock KEK and its AEAD tag;
-- the cleartext fields above as associated data.
-
-The quick-unlock KEK is produced by Argon2id using the PIN as its password input,
-the sidecar salt as its salt input, and the device secret as Argon2's optional
-secret input. The vault UUID and wrapper format version are included in the
-authenticated context. Neither the sidecar nor the native credential item is
-sufficient alone. After quick unwrap, Ladon accepts the session only if payload
-authentication succeeds and its encrypted vault UUID matches the sidecar UUID.
-
-The sidecar uses owner-only permissions and versioned canonical CBOR and is
-replaced atomically. It is not copied by the GUI backup action. Native credential
-items are requested as device-local and non-synchronizing where the platform
-offers that distinction; otherwise the setup screen states the platform's actual
-behavior.
-
-PINs contain 6--12 digits. The sidecar decoder applies the same KDF bounds as
-the vault header before running Argon2id. Five consecutive failures introduce an
-exponential in-process delay. This delay is not claimed to resist an attacker
-who has extracted both device artifacts and can perform an offline attack.
-
-If the device store is missing, locked, or unavailable, Ladon falls back to the
-passphrase. **Disable quick PIN** requires the passphrase, rotates the DEK using
-the same durable procedure, then removes the native item and sidecar. Changing
-the passphrase rotates the DEK and updates the sidecar instead. Copying a vault
-never copies a usable PIN unlock mechanism.
+No Keychain, DPAPI/Credential Manager, Secret Service, persistent wrapper, or
+native credential-store item is used. This keeps the portable vault and startup
+requirements independent of optional platform services.
 
 ### 7.5 Memory handling
 
@@ -505,15 +514,16 @@ user logon context.
 
 ### 8.3 Protocol
 
-Messages are length-prefixed UTF-8 JSON with:
+Protocol version 2 messages are length-prefixed UTF-8 JSON with:
 
 - protocol version;
 - request UUID;
+- random client-session UUID;
 - claimed client label;
 - method;
 - typed parameters.
 
-Protocol version 1 permits at most 16 levels of JSON nesting, a 64-byte client
+Protocol version 2 permits at most 16 levels of JSON nesting, a 64-byte client
 label, 256 arguments, 256 KiB of arguments in total, and 32 KiB each for an
 executable or working directory. Runner-specific binding and output limits apply
 in addition.
@@ -525,9 +535,10 @@ excessive lengths, duplicate object keys, unknown methods, and incompatible
 versions are rejected. Responses echo the request UUID and contain either a
 typed result or a stable error code plus a redacted human message.
 
-No shared IPC token is used. A token readable by every process under the same
-user would not improve the selected security boundary. The client label shown
-in the GUI is informational and is not represented as a cryptographic identity.
+No persistent shared IPC token is used. The random client-session UUID scopes
+grants but is not treated as authentication against a malicious same-user
+process. The client label shown in the GUI is informational and is not
+represented as a cryptographic identity.
 
 ### 8.4 RPC authorization
 
@@ -776,13 +787,12 @@ configuration.
 
 - **Wrong passphrase/PIN:** one generic authentication failure; no distinction
   between wrong credentials and damaged wrapped-key bytes.
-- **Lost passphrase:** no reset or recovery bypass exists. A device PIN is not a
-  portable backup.
-- **Unavailable keychain:** offer passphrase immediately and leave the vault
-  usable.
+- **Lost passphrase:** no reset or recovery bypass exists. A session PIN cannot
+  decrypt a vault and is lost when the app exits.
+- **Unavailable Touch ID:** use a session PIN and leave the vault usable.
 - **Unknown secret/field:** return a stable not-found error without opening a
   process.
-- **Locked request timeout:** deny and return `unlock_timeout`.
+- **Approval timeout:** deny and return `approval_timeout`.
 - **No interactive desktop:** a locked request returns `ui_unavailable`; MCP
   never falls back to asking for a passphrase or PIN in the agent transcript.
 - **Vault corruption:** never overwrite the primary; validate the encrypted
@@ -815,7 +825,7 @@ not claim that one host can cross-compile and sign every platform. Packages
 contain both `ladon-app` and `ladon` and require no Rust toolchain.
 
 Security-preview builds may reach the three platforms sequentially. A platform
-is not called supported until its native credential store, IPC, lock events,
+is not called supported until its session authentication, IPC, lock events,
 process supervision, installer, and leakage tests pass. This preserves the
 three-platform product goal without making simultaneous parity a release gate
 for early feedback.
@@ -846,14 +856,14 @@ Advisories until a fixed release is available.
 
 ### 14.1 Cryptography and vault
 
-- fixed test vectors for KDF, DEK wrapping, payload encryption, and quick unlock;
+- fixed test vectors for KDF, DEK wrapping, and payload encryption;
 - whole-file byte-for-byte vectors for every format version;
 - round-trip tests for every supported format version;
 - mutation tests proving that header, nonce, ciphertext, and tag changes fail;
-- wrong passphrase, wrong PIN, wrong device secret, and wrong vault UUID tests;
+- wrong passphrase and wrong vault UUID tests, plus separate session PIN tests;
 - KDF-boundary tests proving oversized parameters fail before Argon2 allocation;
-- passphrase-rotation tests proving the old passphrase and old PIN wrapper cannot
-  open the new primary or managed backup;
+- passphrase-rotation tests proving the old passphrase cannot open the new
+  primary or managed backup;
 - property tests for atomic generations and preserved unknown payload keys;
 - fuzzing for the locked header and decrypted CBOR decoder;
 - fault injection at every atomic-write step, including recovery from `.bak`.
@@ -870,6 +880,8 @@ Advisories until a fixed release is available.
   reveal operation;
 - fuzzing of request decoding and dispatch;
 - startup races proving only one tray owner becomes ready.
+- grant tests for client/secret isolation, fixed expiry, revocation, denial,
+  timeout, and client disconnect.
 
 ### 14.3 Runner and leakage
 
@@ -904,7 +916,7 @@ must not remove the security-preview label until an independent reviewer has
 assessed at minimum:
 
 - vault format and key lifecycle;
-- native quick unlock;
+- temporary PIN and macOS Touch ID approval;
 - IPC access control;
 - process creation and cleanup;
 - output redaction limitations;
@@ -917,8 +929,8 @@ Stable version 1 is feature-complete when all of the following are true:
 1. A new user can create, lock, unlock, back up, and reopen a portable vault.
 2. A user can add a single value with only a name and value, add multiple fields,
    and import a file.
-3. Quick PIN unlock works where a supported native credential store is present,
-   and passphrase fallback always works.
+3. A temporary 6--12 digit PIN confirms grants on every platform; strict Touch
+   ID confirmation is available on supported Macs; neither method is persisted.
 4. The 30-minute idle timer and immediate lock events behave as specified.
 5. `ladon run` supports environment, stdin, and temporary-file bindings without
    managed values in process arguments.

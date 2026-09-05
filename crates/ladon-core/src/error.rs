@@ -78,6 +78,18 @@ pub enum LadonError {
     InvalidPeer,
     #[error("passphrase does not meet the local vault requirements")]
     InvalidPassphrase,
+    #[error("PIN does not meet the session requirements")]
+    InvalidPin,
+    #[error("approval authentication failed")]
+    ApprovalAuthenticationFailed,
+    #[error("approval request was denied")]
+    ApprovalDenied,
+    #[error("approval request timed out")]
+    ApprovalTimeout,
+    #[error("approval request was cancelled")]
+    ApprovalCancelled,
+    #[error("Touch ID is unavailable")]
+    TouchIdUnavailable,
     #[error("coding-agent integration configuration failed")]
     IntegrationFailure,
 }
@@ -124,6 +136,12 @@ impl LadonError {
             "endpoint_unavailable" => Self::EndpointUnavailable,
             "invalid_peer" => Self::InvalidPeer,
             "invalid_passphrase" => Self::InvalidPassphrase,
+            "invalid_pin" => Self::InvalidPin,
+            "approval_authentication_failed" => Self::ApprovalAuthenticationFailed,
+            "approval_denied" => Self::ApprovalDenied,
+            "approval_timeout" => Self::ApprovalTimeout,
+            "approval_cancelled" => Self::ApprovalCancelled,
+            "touch_id_unavailable" => Self::TouchIdUnavailable,
             "integration_failure" => Self::IntegrationFailure,
             _ => return None,
         })
@@ -170,6 +188,12 @@ impl LadonError {
             Self::EndpointUnavailable => "endpoint_unavailable",
             Self::InvalidPeer => "invalid_peer",
             Self::InvalidPassphrase => "invalid_passphrase",
+            Self::InvalidPin => "invalid_pin",
+            Self::ApprovalAuthenticationFailed => "approval_authentication_failed",
+            Self::ApprovalDenied => "approval_denied",
+            Self::ApprovalTimeout => "approval_timeout",
+            Self::ApprovalCancelled => "approval_cancelled",
+            Self::TouchIdUnavailable => "touch_id_unavailable",
             Self::IntegrationFailure => "integration_failure",
         }
     }
@@ -217,6 +241,12 @@ impl LadonError {
             Self::InvalidPassphrase => {
                 "passphrase must match, contain at least 12 Unicode characters, and use at most 1024 UTF-8 bytes"
             }
+            Self::InvalidPin => "PIN must match and contain 6 to 12 ASCII digits",
+            Self::ApprovalAuthenticationFailed => "approval authentication failed",
+            Self::ApprovalDenied => "request was denied",
+            Self::ApprovalTimeout => "approval request timed out",
+            Self::ApprovalCancelled => "approval request was cancelled",
+            Self::TouchIdUnavailable => "Touch ID is unavailable; use a session PIN",
             Self::IntegrationFailure => "coding-agent integration configuration failed",
         }
     }

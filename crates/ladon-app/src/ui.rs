@@ -11,6 +11,8 @@ use ladon_core::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::ApprovalSecret;
+
 const MIN_PASSPHRASE_SCALARS: usize = 12;
 const MAX_PASSPHRASE_BYTES: usize = 1024;
 const REVEAL_MILLIS: u64 = 10_000;
@@ -253,6 +255,13 @@ enum ManagedVault {
 pub struct VaultController {
     store: VaultStore,
     state: ManagedVault,
+    session_id: Option<uuid::Uuid>,
+}
+
+pub(crate) struct ApprovalPlan {
+    pub(crate) vault_session_id: uuid::Uuid,
+    pub(crate) secrets: Vec<ApprovalSecret>,
+    pub(crate) binding_secret_ids: Vec<SecretId>,
 }
 
 impl VaultController {
@@ -267,6 +276,7 @@ impl VaultController {
             } else {
                 ManagedVault::FirstRun
             },
+            session_id: None,
         }
     }
 
@@ -300,6 +310,7 @@ impl VaultController {
                 last: Instant::now(),
             },
         ));
+        self.session_id = Some(uuid::Uuid::new_v4());
         Ok(())
     }
 
@@ -327,6 +338,7 @@ impl VaultController {
                             last: Instant::now(),
                         },
                     ));
+                    self.session_id = Some(uuid::Uuid::new_v4());
                 }
             }
             VaultOpen::RestoreRequired { backup } => {
@@ -365,6 +377,7 @@ impl VaultController {
                 last: Instant::now(),
             },
         ));
+        self.session_id = Some(uuid::Uuid::new_v4());
         Ok(())
     }
 
@@ -402,6 +415,7 @@ impl VaultController {
                 last: Instant::now(),
             },
         ));
+        self.session_id = Some(uuid::Uuid::new_v4());
         Ok(())
     }
 
@@ -423,6 +437,7 @@ impl VaultController {
         let id = session.add(draft.name(), fields)?;
         if let Err(error) = session.commit_to(&self.store) {
             self.state = ManagedVault::Locked;
+            self.session_id = None;
             return Err(error);
         }
         *draft = AddSecretDraft::new();
@@ -436,6 +451,7 @@ impl VaultController {
         session.delete(&ladon_core::SecretRef::Id(id))?;
         if let Err(error) = session.commit_to(&self.store) {
             self.state = ManagedVault::Locked;
+            self.session_id = None;
             return Err(error);
         }
         Ok(())
@@ -445,13 +461,26 @@ impl VaultController {
         &mut self,
         bindings: &[ValidatedSecretBinding],
     ) -> Result<Vec<ResolvedSecretBinding>, LadonError> {
+        let secret_ids = self.binding_secret_ids(bindings)?;
+        self.resolve_bindings_for_ids(bindings, &secret_ids)
+    }
+
+    pub(crate) fn resolve_bindings_for_ids(
+        &mut self,
+        bindings: &[ValidatedSecretBinding],
+        expected_secret_ids: &[SecretId],
+    ) -> Result<Vec<ResolvedSecretBinding>, LadonError> {
+        if bindings.len() != expected_secret_ids.len() {
+            return Err(LadonError::InvalidBinding);
+        }
         let ManagedVault::Unlocked(session) = &mut self.state else {
             return Err(LadonError::VaultLocked);
         };
         let metadata = session.list();
         bindings
             .iter()
-            .map(|binding| {
+            .zip(expected_secret_ids)
+            .map(|(binding, expected_id)| {
                 let id = metadata
                     .iter()
                     .find(|secret| match binding.secret_ref() {
@@ -460,10 +489,72 @@ impl VaultController {
                     })
                     .map(|secret| secret.id)
                     .ok_or(LadonError::SecretNotFound)?;
+                if id != *expected_id {
+                    return Err(LadonError::InvalidBinding);
+                }
                 let value = session.with_field(binding.secret_ref(), binding.field(), |bytes| {
                     SensitiveBytes::new(bytes.to_vec())
                 })?;
                 ResolvedSecretBinding::new(&id.to_string(), binding.field().as_str(), value)
+            })
+            .collect()
+    }
+
+    pub(crate) fn approval_plan(
+        &self,
+        bindings: &[ValidatedSecretBinding],
+    ) -> Result<ApprovalPlan, LadonError> {
+        let binding_secret_ids = self.binding_secret_ids(bindings)?;
+        let ManagedVault::Unlocked(session) = &self.state else {
+            return Err(LadonError::VaultLocked);
+        };
+        let metadata = session.list();
+        let mut requested = Vec::<ApprovalSecret>::new();
+        for (binding, secret_id) in bindings.iter().zip(&binding_secret_ids) {
+            let secret = metadata
+                .iter()
+                .find(|secret| secret.id == *secret_id)
+                .ok_or(LadonError::SecretNotFound)?;
+            let field = binding.field().as_str();
+            if !secret.field_names.iter().any(|name| name == field) {
+                return Err(LadonError::FieldNotFound);
+            }
+            if let Some(existing) = requested.iter_mut().find(|item| item.id() == secret.id) {
+                if !existing.fields().iter().any(|name| name == field) {
+                    let mut fields = existing.fields().to_vec();
+                    fields.push(field.to_owned());
+                    *existing = ApprovalSecret::new(secret.id, &secret.name, fields);
+                }
+            } else {
+                requested.push(ApprovalSecret::new(secret.id, &secret.name, [field]));
+            }
+        }
+        Ok(ApprovalPlan {
+            vault_session_id: self.session_id.ok_or(LadonError::VaultLocked)?,
+            secrets: requested,
+            binding_secret_ids,
+        })
+    }
+
+    fn binding_secret_ids(
+        &self,
+        bindings: &[ValidatedSecretBinding],
+    ) -> Result<Vec<SecretId>, LadonError> {
+        let ManagedVault::Unlocked(session) = &self.state else {
+            return Err(LadonError::VaultLocked);
+        };
+        let metadata = session.list();
+        bindings
+            .iter()
+            .map(|binding| {
+                metadata
+                    .iter()
+                    .find(|secret| match binding.secret_ref() {
+                        ladon_core::SecretRef::Name(name) => secret.name == name.as_str(),
+                        ladon_core::SecretRef::Id(id) => secret.id == *id,
+                    })
+                    .map(|secret| secret.id)
+                    .ok_or(LadonError::SecretNotFound)
             })
             .collect()
     }
@@ -488,6 +579,7 @@ impl VaultController {
         } else {
             ManagedVault::Locked
         };
+        self.session_id = None;
     }
 
     pub fn auto_lock_if_idle(&mut self) -> bool {
@@ -585,6 +677,7 @@ impl fmt::Debug for ClipboardLease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingRequestView {
     client_label: String,
+    secrets: Vec<(String, Vec<String>)>,
     executable: String,
     arguments: Vec<String>,
     working_directory: String,
@@ -602,6 +695,7 @@ impl PendingRequestView {
     ) -> Self {
         Self {
             client_label: sanitize_untrusted(client_label),
+            secrets: Vec::new(),
             executable: sanitize_untrusted(executable),
             arguments: arguments
                 .iter()
@@ -613,8 +707,39 @@ impl PendingRequestView {
     }
 
     #[must_use]
+    pub fn from_approval(approval: &crate::PendingApproval, timeout: Duration) -> Self {
+        let mut view = Self::new(
+            approval.client_label(),
+            approval.executable(),
+            approval.arguments(),
+            approval.working_directory(),
+            timeout,
+        );
+        view.secrets = approval
+            .secrets()
+            .iter()
+            .map(|secret| {
+                (
+                    sanitize_untrusted(secret.name()),
+                    secret
+                        .fields()
+                        .iter()
+                        .map(|field| sanitize_untrusted(field))
+                        .collect(),
+                )
+            })
+            .collect();
+        view
+    }
+
+    #[must_use]
     pub fn client_label(&self) -> &str {
         &self.client_label
+    }
+
+    #[must_use]
+    pub fn secrets(&self) -> &[(String, Vec<String>)] {
+        &self.secrets
     }
 
     #[must_use]
@@ -676,10 +801,37 @@ mod tests {
                     last: Instant::now() - DEFAULT_IDLE_TIMEOUT,
                 },
             },
+            session_id: None,
         };
 
         assert!(controller.auto_lock_if_idle());
         assert_eq!(controller.phase(), VaultUiPhase::Locked);
         assert!(controller.remaining_unlocked().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistence_failure_clears_the_unlock_session_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.ladon");
+        let passphrase = SensitiveText::from("correct horse");
+        let mut controller = VaultController::new(path);
+        controller.create(&passphrase, &passphrase).unwrap();
+        let first_session = controller.session_id.unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o500)).unwrap();
+
+        let mut draft = AddSecretDraft::new();
+        draft.set_name("will-not-persist");
+        draft.fields_mut()[0].value_mut().push_str("fake-value");
+        let result = controller.add_secret(&mut draft);
+
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result, Err(LadonError::StorageFailure));
+        assert_eq!(controller.phase(), VaultUiPhase::Locked);
+        assert!(controller.session_id.is_none());
+        controller.unlock(&passphrase).unwrap();
+        assert_ne!(controller.session_id, Some(first_session));
     }
 }

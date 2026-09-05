@@ -5,6 +5,7 @@ mod approval;
 mod desktop;
 #[cfg(unix)]
 mod ipc;
+mod secret_editor;
 mod session_auth;
 mod supervisor;
 mod touch_id;
@@ -17,6 +18,7 @@ pub use approval::{ApprovalCoordinator, ApprovalSecret, GrantTicket, PendingAppr
 pub use desktop::run_desktop;
 #[cfg(unix)]
 pub use ipc::{LocalClient, LocalServer, default_endpoint_path};
+pub use secret_editor::{EditSecretDraft, EditableField, EditableValue};
 pub use session_auth::{PinVerification, SessionConfirmation, SessionPin};
 pub use supervisor::{RunCancellation, RunResult, RunTermination, Supervisor};
 pub use touch_id::TouchIdAuthenticator;

@@ -5,13 +5,14 @@ use std::{
 };
 
 use ladon_core::{
-    ActivitySink, FieldName, LadonError, ResolvedSecretBinding, SecretField, SecretId,
-    SecretMetadata, SensitiveBytes, TextHint, ValidatedSecretBinding, VaultOpen, VaultPayload,
-    VaultSession, VaultStore, create_vault,
+    ActivitySink, FieldName, LadonError, PreparedRecordReplacement, ResolvedSecretBinding,
+    SecretField, SecretId, SecretMetadata, SecretRef, SensitiveBytes, TextHint,
+    ValidatedSecretBinding, VaultOpen, VaultPayload, VaultSession, VaultStore, create_vault,
 };
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ApprovalSecret;
+use crate::EditSecretDraft;
 
 const MIN_PASSPHRASE_SCALARS: usize = 12;
 const MAX_PASSPHRASE_BYTES: usize = 1024;
@@ -288,6 +289,60 @@ impl VaultController {
             ManagedVault::RecoveryRequired { .. } => VaultUiPhase::RecoveryRequired,
             ManagedVault::Unlocked(_) => VaultUiPhase::Unlocked,
         }
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> Option<uuid::Uuid> {
+        self.session_id
+    }
+
+    pub fn load_secret(&mut self, id: SecretId) -> Result<EditSecretDraft, LadonError> {
+        let ManagedVault::Unlocked(session) = &mut self.state else {
+            return Err(LadonError::VaultLocked);
+        };
+        session.with_record(&SecretRef::Id(id), EditSecretDraft::from_record)
+    }
+
+    pub fn prepare_secret_update(
+        &self,
+        draft: &EditSecretDraft,
+    ) -> Result<PreparedRecordReplacement, LadonError> {
+        let ManagedVault::Unlocked(session) = &self.state else {
+            return Err(LadonError::VaultLocked);
+        };
+        session.prepare_record_replacement(
+            &SecretRef::Id(draft.id()),
+            draft.name(),
+            draft.to_fields()?,
+        )
+    }
+
+    pub fn apply_secret_update(
+        &mut self,
+        update: PreparedRecordReplacement,
+    ) -> Result<(), LadonError> {
+        let ManagedVault::Unlocked(session) = &mut self.state else {
+            return Err(LadonError::VaultLocked);
+        };
+        session.apply_record_replacement(update)?;
+        if let Err(error) = session.commit_to(&self.store) {
+            self.state = ManagedVault::Locked;
+            self.session_id = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn ensure_secret_exists(&self, id: SecretId) -> Result<(), LadonError> {
+        let ManagedVault::Unlocked(session) = &self.state else {
+            return Err(LadonError::VaultLocked);
+        };
+        session
+            .list()
+            .iter()
+            .any(|secret| secret.id == id)
+            .then_some(())
+            .ok_or(LadonError::SecretNotFound)
     }
 
     pub fn create(

@@ -1,4 +1,9 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{
+    env,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
@@ -6,6 +11,8 @@ use eframe::egui::{
 };
 use ladon_core::{LadonError, SecretId};
 
+#[cfg(unix)]
+use crate::LocalBrokerHandle;
 use crate::{AddSecretDraft, SensitiveText, VaultController, VaultUiPhase};
 
 const CANVAS: Color32 = Color32::from_rgb(244, 247, 251);
@@ -35,7 +42,9 @@ pub fn run_desktop() -> Result<(), &'static str> {
 }
 
 struct LadonDesktop {
-    controller: VaultController,
+    controller: Arc<Mutex<VaultController>>,
+    #[cfg(unix)]
+    broker: Option<LocalBrokerHandle>,
     passphrase: SensitiveText,
     confirmation: SensitiveText,
     draft: AddSecretDraft,
@@ -52,12 +61,28 @@ struct Notice {
 impl LadonDesktop {
     fn new(context: &eframe::CreationContext<'_>, path: PathBuf) -> Self {
         configure_style(&context.egui_ctx);
+        let controller = Arc::new(Mutex::new(VaultController::new(path)));
+        #[cfg(unix)]
+        let (broker, notice) = match LocalBrokerHandle::start(Arc::clone(&controller)) {
+            Ok(broker) => (Some(broker), None),
+            Err(error) => (
+                None,
+                Some(Notice {
+                    text: error.safe_message(),
+                    danger: true,
+                }),
+            ),
+        };
+        #[cfg(not(unix))]
+        let notice = None;
         Self {
-            controller: VaultController::new(path),
+            controller,
+            #[cfg(unix)]
+            broker,
             passphrase: SensitiveText::default(),
             confirmation: SensitiveText::default(),
             draft: AddSecretDraft::new(),
-            notice: None,
+            notice,
             selected: None,
             pending_delete: None,
         }
@@ -81,7 +106,9 @@ impl LadonDesktop {
             password_field(ui, &mut self.confirmation, "Repeat passphrase");
             ui.add_space(18.0);
             if primary_button(ui, "Create vault").clicked() {
-                let result = self.controller.create(&self.passphrase, &self.confirmation);
+                let result = with_controller(&self.controller, |controller| {
+                    controller.create(&self.passphrase, &self.confirmation)
+                });
                 self.clear_unlock_fields();
                 self.notice_from(result, "Vault created on this device");
             }
@@ -100,7 +127,9 @@ impl LadonDesktop {
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             ui.add_space(18.0);
             if primary_button(ui, "Unlock").clicked() || submit {
-                let result = self.controller.unlock(&self.passphrase);
+                let result = with_controller(&self.controller, |controller| {
+                    controller.unlock(&self.passphrase)
+                });
                 self.clear_unlock_fields();
                 self.notice_from(result, "Vault unlocked");
             }
@@ -120,7 +149,7 @@ impl LadonDesktop {
             );
             ui.add_space(18.0);
             if primary_button(ui, "Restore authenticated backup").clicked() {
-                let result = self.controller.restore_backup();
+                let result = with_controller(&self.controller, VaultController::restore_backup);
                 self.notice_from(result, "Backup restored");
             }
             self.show_notice(ui);
@@ -144,7 +173,14 @@ impl LadonDesktop {
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if quiet_button(ui, "Lock now").clicked() {
-                            self.controller.lock();
+                            #[cfg(unix)]
+                            if let Some(broker) = &self.broker {
+                                broker.cancel_active_run();
+                            }
+                            let _ = with_controller(&self.controller, |controller| {
+                                controller.lock();
+                                Ok(())
+                            });
                             self.selected = None;
                             self.pending_delete = None;
                             self.notice = None;
@@ -202,7 +238,9 @@ impl LadonDesktop {
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if primary_button(ui, "Save secret").clicked() {
-                                    let result = self.controller.add_secret(&mut self.draft);
+                                    let result = with_controller(&self.controller, |controller| {
+                                        controller.add_secret(&mut self.draft)
+                                    });
                                     self.notice_from(result.map(|_| ()), "Secret saved locally");
                                 }
                             });
@@ -233,7 +271,10 @@ impl LadonDesktop {
                     });
                 });
                 ui.add_space(18.0);
-                let remaining = self.controller.remaining_unlocked().unwrap_or_default();
+                let remaining = with_controller(&self.controller, |controller| {
+                    Ok(controller.remaining_unlocked().unwrap_or_default())
+                })
+                .unwrap_or_default();
                 ui.label(RichText::new("●  UNLOCKED").strong().color(COBALT));
                 ui.label(
                     RichText::new(format_remaining(remaining))
@@ -248,7 +289,9 @@ impl LadonDesktop {
                 );
                 ui.add_space(8.0);
 
-                let secrets = self.controller.secrets();
+                let secrets =
+                    with_controller(&self.controller, |controller| Ok(controller.secrets()))
+                        .unwrap_or_default();
                 if secrets.is_empty() {
                     ui.label(
                         RichText::new("No secrets yet").color(Color32::from_rgb(173, 187, 214)),
@@ -287,7 +330,9 @@ impl LadonDesktop {
                                     )
                                     .clicked()
                                 {
-                                    let result = self.controller.delete_secret(selected);
+                                    let result = with_controller(&self.controller, |controller| {
+                                        controller.delete_secret(selected)
+                                    });
                                     if result.is_ok() {
                                         self.selected = None;
                                     }
@@ -344,7 +389,15 @@ impl LadonDesktop {
 
 impl eframe::App for LadonDesktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.controller.auto_lock_if_idle() {
+        let auto_locked = with_controller(&self.controller, |controller| {
+            Ok(controller.auto_lock_if_idle())
+        })
+        .unwrap_or(false);
+        if auto_locked {
+            #[cfg(unix)]
+            if let Some(broker) = &self.broker {
+                broker.cancel_active_run();
+            }
             self.selected = None;
             self.pending_delete = None;
             self.notice = Some(Notice {
@@ -354,7 +407,9 @@ impl eframe::App for LadonDesktop {
         }
         context.request_repaint_after(Duration::from_secs(1));
 
-        match self.controller.phase() {
+        let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
+            .unwrap_or(VaultUiPhase::Locked);
+        match phase {
             VaultUiPhase::FirstRun => shell(context, |ui| self.show_first_run(ui)),
             VaultUiPhase::Locked => shell(context, |ui| self.show_locked(ui)),
             VaultUiPhase::RecoveryRequired => shell(context, |ui| self.show_recovery(ui)),
@@ -363,9 +418,24 @@ impl eframe::App for LadonDesktop {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.controller.lock();
+        #[cfg(unix)]
+        if let Some(broker) = &self.broker {
+            broker.cancel_active_run();
+        }
+        let _ = with_controller(&self.controller, |controller| {
+            controller.lock();
+            Ok(())
+        });
         self.clear_unlock_fields();
     }
+}
+
+fn with_controller<T>(
+    controller: &Arc<Mutex<VaultController>>,
+    operation: impl FnOnce(&mut VaultController) -> Result<T, LadonError>,
+) -> Result<T, LadonError> {
+    let mut controller = controller.lock().map_err(|_| LadonError::ProcessFailure)?;
+    operation(&mut controller)
 }
 
 fn configure_style(context: &egui::Context) {

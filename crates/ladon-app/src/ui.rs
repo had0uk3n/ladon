@@ -5,8 +5,9 @@ use std::{
 };
 
 use ladon_core::{
-    ActivitySink, FieldName, LadonError, SecretField, SecretId, SecretMetadata, SensitiveBytes,
-    TextHint, VaultOpen, VaultPayload, VaultSession, VaultStore, create_vault,
+    ActivitySink, FieldName, LadonError, ResolvedSecretBinding, SecretField, SecretId,
+    SecretMetadata, SensitiveBytes, TextHint, ValidatedSecretBinding, VaultOpen, VaultPayload,
+    VaultSession, VaultStore, create_vault,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -371,6 +372,33 @@ impl VaultController {
             return Err(error);
         }
         Ok(())
+    }
+
+    pub fn resolve_bindings(
+        &mut self,
+        bindings: &[ValidatedSecretBinding],
+    ) -> Result<Vec<ResolvedSecretBinding>, LadonError> {
+        let ManagedVault::Unlocked(session) = &mut self.state else {
+            return Err(LadonError::VaultUnavailable);
+        };
+        let metadata = session.list();
+        bindings
+            .iter()
+            .map(|binding| {
+                let id = metadata
+                    .iter()
+                    .find(|secret| match binding.secret_ref() {
+                        ladon_core::SecretRef::Name(name) => secret.name == name.as_str(),
+                        ladon_core::SecretRef::Id(id) => secret.id == *id,
+                    })
+                    .map(|secret| secret.id)
+                    .ok_or(LadonError::SecretNotFound)?;
+                let value = session.with_field(binding.secret_ref(), binding.field(), |bytes| {
+                    SensitiveBytes::new(bytes.to_vec())
+                })?;
+                ResolvedSecretBinding::new(&id.to_string(), binding.field().as_str(), value)
+            })
+            .collect()
     }
 
     #[must_use]

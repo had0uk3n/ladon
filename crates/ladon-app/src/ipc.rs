@@ -7,6 +7,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use ladon_core::{
@@ -18,6 +19,10 @@ use ladon_core::{
 pub struct LocalServer {
     listener: UnixListener,
     path: PathBuf,
+}
+
+pub(crate) struct LocalConnection {
+    stream: UnixStream,
 }
 
 impl LocalServer {
@@ -49,6 +54,7 @@ impl LocalServer {
             .listener
             .accept()
             .map_err(|_| LadonError::EndpointUnavailable)?;
+        configure_stream(&stream)?;
         verify_peer(stream.as_raw_fd())?;
         let frame = read_frame(&mut stream)?;
         let request = decode_request_frame(&frame)?;
@@ -58,6 +64,68 @@ impl LocalServer {
             .write_all(&frame)
             .map_err(|_| LadonError::EndpointUnavailable)
     }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), LadonError> {
+        self.listener
+            .set_nonblocking(nonblocking)
+            .map_err(|_| LadonError::EndpointUnavailable)
+    }
+
+    pub fn try_serve_once(
+        &self,
+        handler: impl FnOnce(RpcRequest) -> RpcResponse,
+    ) -> Result<bool, LadonError> {
+        let (mut stream, _) = match self.listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(_) => return Err(LadonError::EndpointUnavailable),
+        };
+        configure_stream(&stream)?;
+        verify_peer(stream.as_raw_fd())?;
+        let frame = read_frame(&mut stream)?;
+        let request = decode_request_frame(&frame)?;
+        let response = handler(request);
+        let frame = encode_response_frame(&response)?;
+        stream
+            .write_all(&frame)
+            .map_err(|_| LadonError::EndpointUnavailable)?;
+        Ok(true)
+    }
+
+    pub(crate) fn try_accept(&self) -> Result<Option<LocalConnection>, LadonError> {
+        let (stream, _) = match self.listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(_) => return Err(LadonError::EndpointUnavailable),
+        };
+        configure_stream(&stream)?;
+        verify_peer(stream.as_raw_fd())?;
+        Ok(Some(LocalConnection { stream }))
+    }
+}
+
+impl LocalConnection {
+    pub(crate) fn serve(
+        mut self,
+        handler: impl FnOnce(RpcRequest) -> RpcResponse,
+    ) -> Result<(), LadonError> {
+        let frame = read_frame(&mut self.stream)?;
+        let request = decode_request_frame(&frame)?;
+        let response = handler(request);
+        let frame = encode_response_frame(&response)?;
+        self.stream
+            .write_all(&frame)
+            .map_err(|_| LadonError::EndpointUnavailable)
+    }
+}
+
+fn configure_stream(stream: &UnixStream) -> Result<(), LadonError> {
+    let timeout = Some(Duration::from_secs(5));
+    stream
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(timeout))
+        .and_then(|()| stream.set_write_timeout(timeout))
+        .map_err(|_| LadonError::EndpointUnavailable)
 }
 
 impl Drop for LocalServer {

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod agent_broker;
 #[cfg(feature = "gui")]
 mod desktop;
 #[cfg(unix)]
@@ -5,6 +7,8 @@ mod ipc;
 mod supervisor;
 mod ui;
 
+#[cfg(unix)]
+pub use agent_broker::LocalBrokerHandle;
 #[cfg(feature = "gui")]
 pub use desktop::run_desktop;
 #[cfg(unix)]

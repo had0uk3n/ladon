@@ -177,6 +177,7 @@ release gates, not required for exercising the end-to-end local MVP.
 - [x] Write CLI/MCP contract tests proving stdout/JSON-RPC never contains injected values, list returns metadata only, run resolves executable names client-side then sends an absolute path, and MCP caps timeouts at 15 minutes while CLI caps at 2 hours.
 - [x] Run focused tests; expect failure.
 - [x] Implement Unix sockets in a `0700` runtime directory with peer credentials (`getpeereid`/`SO_PEERCRED`) and fail-closed stale endpoint checks.
+- [x] Wire the GUI-owned unlocked session to the Unix broker, bound concurrent same-user connections, and verify add → list → run → redaction → concurrent lock/cancel end to end.
 - [ ] Implement Windows named pipes with an owner-only security descriptor and client impersonation/SID validation.
 - [x] Implement `ladon status|list|lock|run`, structured exit codes, and stdio MCP tools `ladon_status`, `ladon_list_secrets`, `ladon_lock`, `ladon_run`; ensure diagnostics go to stderr and never include plaintext. Support both the current stateless MCP discovery call and the preceding initialization handshake used by existing local clients.
 - [ ] Implement `ladon setup codex|claude` as an idempotent, preview-before-write configuration edit with a timestamped backup.
@@ -194,6 +195,14 @@ release gates, not required for exercising the end-to-end local MVP.
 - Create: `crates/ladon-app/src/quick_unlock/linux.rs`
 - Create: `crates/ladon-app/tests/ui_state.rs`
 - Modify: `crates/ladon-app/src/main.rs`
+
+Current checkpoint: the native manager implements first run, passphrase unlock,
+30-minute activity locking, add/list/delete, authenticated backup recovery, and
+the live Unix broker. Tray lifecycle, pending unlock approval, binary-file drag
+and drop, quick PIN, and screen-lock integration remain open release work.
+
+- [x] Add headless state coverage for passphrase rules, simple/multi-field drafts, reveal/clipboard leases, untrusted request text, persistent CRUD, and redacted sensitive debug output.
+- [x] Render a minimal native `eframe` manager and keep GUI text-entry backing in zeroizing wrappers.
 
 - [ ] Write headless UI-state tests for first-run passphrase validation, one-field default add flow, additional fields, locked/unlocked views, ten-second reveal, clipboard-clear eligibility, sanitized unlock-request rendering, deny/timeout, and exact pending-request resumption.
 - [ ] Run `cargo test -p ladon-app --test ui_state`; expect failure.

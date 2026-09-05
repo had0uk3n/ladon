@@ -192,6 +192,6 @@ Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-
 
 Review the complete diff against this plan, fix every Critical/Important issue, and rerun the affected tests.
 
-- [ ] **Step 4: Synchronize and land**
+- [x] **Step 4: Synchronize and land**
 
 Fetch `origin/main`, incorporate concurrent changes without rewriting them, rerun verification on the exact tree, commit all in-scope changes, push `main`, and confirm `origin/main` resolves to the landed SHA.

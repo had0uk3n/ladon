@@ -11,7 +11,7 @@ use ladon_core::{
 };
 use uuid::Uuid;
 
-use crate::{RpcTransport, serve_mcp};
+use crate::{RpcTransport, integrate::execute_integration, serve_mcp};
 
 pub fn execute_cli(
     arguments: impl IntoIterator<Item = String>,
@@ -19,7 +19,7 @@ pub fn execute_cli(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
-    match execute(arguments, transport, stdout) {
+    match execute(arguments, transport, stdout, stderr) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(stderr, "{}: {}", error.code(), error.safe_message());
@@ -32,6 +32,7 @@ fn execute(
     arguments: impl IntoIterator<Item = String>,
     transport: &impl RpcTransport,
     stdout: &mut impl Write,
+    stderr: &mut impl Write,
 ) -> Result<(), LadonError> {
     let mut arguments = arguments.into_iter();
     let _program = arguments.next();
@@ -43,6 +44,7 @@ fn execute(
         "lock" if rest.is_empty() => call_and_render(RpcMethod::Lock, transport, stdout),
         "run" => call_and_render(parse_run(rest, RunCaller::Cli)?, transport, stdout),
         "mcp" if rest.is_empty() => serve_mcp(std::io::stdin(), stdout, transport),
+        "integrate" => execute_integration(&rest, stdout, stderr),
         _ => Err(LadonError::InvalidRequest),
     }
 }

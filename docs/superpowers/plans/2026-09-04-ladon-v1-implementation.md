@@ -180,7 +180,7 @@ release gates, not required for exercising the end-to-end local MVP.
 - [x] Wire the GUI-owned unlocked session to the Unix broker, bound concurrent same-user connections, and verify add → list → run → redaction → concurrent lock/cancel end to end.
 - [ ] Implement Windows named pipes with an owner-only security descriptor and client impersonation/SID validation.
 - [x] Implement `ladon status|list|lock|run`, structured exit codes, and stdio MCP tools `ladon_status`, `ladon_list_secrets`, `ladon_lock`, `ladon_run`; ensure diagnostics go to stderr and never include plaintext. Support both the current stateless MCP discovery call and the preceding initialization handshake used by existing local clients.
-- [ ] Implement `ladon setup codex|claude` as an idempotent, preview-before-write configuration edit with a timestamped backup.
+- [x] Implement `ladon integrate codex|claude` as an idempotent, preview-before-write configuration edit with a timestamped backup and a 16-minute Codex tool timeout.
 - [x] Re-run focused and workspace tests; expect pass on the implemented Unix transport, plus strict Windows compilation of the platform-independent client and MCP layers.
 - [ ] Commit the complete cross-platform transport and setup flow as `feat: add local IPC CLI and MCP bridge`.
 

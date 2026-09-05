@@ -76,6 +76,8 @@ pub enum LadonError {
     InvalidPeer,
     #[error("passphrase does not meet the local vault requirements")]
     InvalidPassphrase,
+    #[error("coding-agent integration configuration failed")]
+    IntegrationFailure,
 }
 
 impl LadonError {
@@ -119,6 +121,7 @@ impl LadonError {
             "endpoint_unavailable" => Self::EndpointUnavailable,
             "invalid_peer" => Self::InvalidPeer,
             "invalid_passphrase" => Self::InvalidPassphrase,
+            "integration_failure" => Self::IntegrationFailure,
             _ => return None,
         })
     }
@@ -163,6 +166,7 @@ impl LadonError {
             Self::EndpointUnavailable => "endpoint_unavailable",
             Self::InvalidPeer => "invalid_peer",
             Self::InvalidPassphrase => "invalid_passphrase",
+            Self::IntegrationFailure => "integration_failure",
         }
     }
 
@@ -206,6 +210,7 @@ impl LadonError {
             Self::EndpointUnavailable => "local Ladon endpoint is unavailable",
             Self::InvalidPeer => "local IPC peer is not the current user",
             Self::InvalidPassphrase => "passphrase must match and contain 12 to 1024 characters",
+            Self::IntegrationFailure => "coding-agent integration configuration failed",
         }
     }
 }

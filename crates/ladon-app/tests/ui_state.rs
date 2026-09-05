@@ -6,8 +6,8 @@ use ladon_app::{
     validate_new_passphrase,
 };
 use ladon_core::{
-    ActivitySink, FieldName, LadonError, SecretField, SecretId, SensitiveBytes, TextHint,
-    VaultOpen, VaultPayload, VaultSession, VaultStore, create_vault,
+    ActivitySink, FieldName, LadonError, MAX_FIELD_BYTES, SecretField, SecretId, SensitiveBytes,
+    TextHint, VaultOpen, VaultPayload, VaultSession, VaultStore, create_vault,
 };
 
 #[test]
@@ -241,6 +241,37 @@ fn duplicate_name_update_leaves_stored_record_and_revision_unchanged() {
     };
     assert_eq!(revision_after, revision_before);
     assert_eq!(controller.load_secret(id).unwrap().name(), "first");
+}
+
+#[test]
+fn editor_field_validation_rejects_invalid_names_and_oversized_values() {
+    let invalid_name = EditSecretDraft::from_parts(
+        SecretId::new(),
+        "example",
+        vec![EditableField::binary(
+            "invalid name",
+            SensitiveBytes::new(b"fake-invalid-name-value".to_vec()),
+            TextHint::Binary,
+        )],
+    );
+    assert_eq!(
+        invalid_name.to_fields().unwrap_err(),
+        LadonError::InvalidFieldName
+    );
+
+    let oversized_value = EditSecretDraft::from_parts(
+        SecretId::new(),
+        "example",
+        vec![EditableField::binary(
+            "value",
+            SensitiveBytes::new(vec![0xff; MAX_FIELD_BYTES + 1]),
+            TextHint::Binary,
+        )],
+    );
+    assert_eq!(
+        oversized_value.to_fields().unwrap_err(),
+        LadonError::FieldTooLarge
+    );
 }
 
 #[test]

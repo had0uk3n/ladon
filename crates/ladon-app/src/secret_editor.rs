@@ -1,7 +1,8 @@
 use std::fmt;
 
 use ladon_core::{
-    FieldName, LadonError, SecretField, SecretId, SecretRecord, SensitiveBytes, TextHint,
+    FieldName, LadonError, MAX_FIELD_BYTES, SecretField, SecretId, SecretRecord, SensitiveBytes,
+    TextHint,
 };
 
 use crate::ui::SensitiveText;
@@ -178,20 +179,31 @@ impl EditSecretDraft {
         self.fields
             .iter()
             .map(|field| {
-                let (value, text_hint) = match field.value() {
-                    EditableValue::Text(value) => (
-                        value.to_sensitive_bytes().expose(<[u8]>::to_vec),
-                        TextHint::Text,
-                    ),
+                let (value_len, text_hint) = match field.value() {
+                    EditableValue::Text(value) => (value.as_str().len(), TextHint::Text),
                     EditableValue::Binary {
                         bytes,
                         original_hint,
-                    } => (bytes.expose(<[u8]>::to_vec), *original_hint),
+                    } => (bytes.len(), *original_hint),
                 };
-                SecretField::new(FieldName::parse(field.name())?, value, text_hint)
+                let name = validate_field(field.name(), value_len)?;
+                let value = match field.value() {
+                    EditableValue::Text(value) => value.to_sensitive_bytes().expose(<[u8]>::to_vec),
+                    EditableValue::Binary { bytes, .. } => bytes.expose(<[u8]>::to_vec),
+                };
+                Ok(SecretField::new(name, value, text_hint)
+                    .expect("field name and byte length were validated before copying"))
             })
             .collect()
     }
+}
+
+fn validate_field(name: &str, value_len: usize) -> Result<FieldName, LadonError> {
+    let name = FieldName::parse(name)?;
+    if value_len > MAX_FIELD_BYTES {
+        return Err(LadonError::FieldTooLarge);
+    }
+    Ok(name)
 }
 
 impl fmt::Debug for EditSecretDraft {
@@ -202,5 +214,19 @@ impl fmt::Debug for EditSecretDraft {
             .field("name", &self.name)
             .field("fields", &format_args!("[{} REDACTED]", self.fields.len()))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_field;
+    use ladon_core::{LadonError, MAX_FIELD_BYTES};
+
+    #[test]
+    fn field_validation_rejects_an_invalid_name_before_an_oversized_value() {
+        assert_eq!(
+            validate_field("invalid name", MAX_FIELD_BYTES + 1).unwrap_err(),
+            LadonError::InvalidFieldName
+        );
     }
 }

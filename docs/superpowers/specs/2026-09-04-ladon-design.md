@@ -34,6 +34,8 @@ MCP bridge. Both connect to the tray process through operating-system-local IPC.
 5. Ship ready-to-run desktop packages for macOS, Windows, and Linux.
 6. Keep the storage format portable across supported operating systems.
 7. Use public, standard cryptographic primitives and permit independent review.
+8. Let the owner inspect and update stored values in the desktop GUI without
+   adding a plaintext-returning agent or CLI API.
 
 ## 3. Non-goals for version 1
 
@@ -63,6 +65,7 @@ Ladon must protect against:
 - an agent including a secret in a shell command or MCP argument;
 - a child program accidentally printing the injected value;
 - logs or error messages recording a managed secret;
+- the GUI revealing a value merely because its metadata was selected;
 - shell history or process inspection exposing a managed secret in arguments;
 - theft of a vault file without the passphrase;
 - a different local operating-system user connecting to Ladon's IPC endpoint;
@@ -80,6 +83,8 @@ Ladon provides limited defense against:
   operating-system user;
 - memory inspection, swap, hibernation images, crash dumps, or privileged
   debugging;
+- screen capture, accessibility inspection, or observation after the user has
+  explicitly chosen to show a plaintext value;
 - filesystem snapshots, backups, or forensic remnants of an explicitly
   requested plaintext temporary-file binding.
 
@@ -108,10 +113,15 @@ operating-system access controls, never on hidden implementation details.
    composition rules.
 4. Ladon explains that a lost passphrase cannot be reset and offers an immediate
    encrypted vault backup.
-5. After the vault opens, Ladon asks the user to choose a temporary approval
-   method for this application lifetime: a 6--12 digit PIN, or Touch ID on a Mac
-   where biometric authentication is available. The PIN, verifier, and
-   authentication choice are never persisted.
+5. After the vault opens, Ladon configures temporary confirmation for the
+   current unlocked session. Touch ID is available whenever the Mac adapter
+   reports strict biometric authentication. On such a Mac the user can continue
+   with Touch ID alone or additionally configure a 4--12 digit session PIN. On
+   systems without Touch ID, configuring a PIN is required before secret use.
+   The PIN and verifier are never persisted. PIN setup is available only in
+   this post-passphrase step. Adding a PIN later requires locking the vault,
+   unlocking it again with the passphrase, and using the same step; an already
+   open metadata view can never establish a new confirmation credential.
 6. Ladon offers one-click setup for Codex and Claude Code.
 
 ### 5.2 Adding a secret
@@ -173,8 +183,8 @@ its native window and shows:
 - the requested operation and, for a run, the executable, arguments, and working
   directory;
 - the names and fields of secrets for which this client session lacks a grant;
-- a PIN field when the session uses PIN, or a **Use Touch ID** action on a Mac
-  session configured for Touch ID;
+- a **Confirm with Touch ID** action whenever strict biometric authentication
+  is available, plus a PIN field when a session PIN has been configured;
 - **Deny** and **Allow for 30 minutes** actions.
 
 All client-controlled strings are rendered with control and bidi characters
@@ -186,7 +196,9 @@ structured error and never starts the child process.
 
 Only one approval request is pending at a time. Additional ungranted run
 requests receive `busy`; Ladon does not merge dialogs or silently queue
-commands. Metadata-only list requests do not create grants.
+commands. The approval window is modal with respect to secret-management
+actions, and only one Touch ID system prompt may be active. Metadata-only list
+requests do not create grants.
 
 ### 5.5 Unlocked session
 
@@ -232,12 +244,83 @@ Expiry or revocation prevents future resolution by Ladon. It cannot make an
 authorized child forget bytes already delivered to that process. This is an
 inherent boundary and is shown in the security documentation.
 
-### 5.6 Human reveal and copy
+### 5.6 Human view and edit
 
-Only the GUI may reveal or copy a plaintext value. Reveal is an explicit action
-and automatically hides the value after ten seconds. Copy shows a warning that
-clipboard managers are outside Ladon's control and attempts to clear an
-unchanged clipboard after 30 seconds. Agent-facing APIs never reveal or copy.
+The manager opens on the add-secret form. Selecting a list item replaces that
+form with the selected secret's detail card. **New secret** returns to the add
+form and is treated like selecting a different item: it first applies the
+unsaved-edit rule below, then clears selected-secret authorization and buffers.
+
+Selecting a secret opens its detail card using metadata only. Field values stay
+masked with a constant placeholder that does not encode their byte or character
+length. **Show**, **Edit**, and **Save changes** remain unavailable until the user
+chooses **Unlock this secret** and confirms with any currently available
+temporary method. Touch ID is accepted whenever the strict biometric adapter is
+available. A PIN is accepted only when the user configured one for this
+unlocked session.
+
+A successful confirmation authorizes only the selected immutable secret ID. It
+does not create or extend an agent grant. The authorization has no independent
+timer: it ends when the user selects another secret, the secret is deleted, the
+vault locks, or the application exits. Selection changes also clear reveal and
+editor buffers before loading the next secret's metadata.
+
+Selecting another secret or closing the manager window while an edit has
+unsaved changes keeps the current view open and asks the user to discard or
+continue editing. After discard, the authorization and buffers are cleared.
+Explicit vault lock, screen lock, suspend, logout, and application exit never
+wait for this prompt: they discard unsaved changes and wipe the unlocked state.
+Ordinary loss of focus does not hide values or discard an edit, because the
+user may need to compare a value with another local window.
+
+The confirmation form exists only in the trusted desktop GUI. Agent-facing IPC
+cannot submit a PIN, initiate Touch ID, or create selected-secret authorization.
+Each confirmation attempt is bound to the current vault-session UUID, protected
+action, and exact target secret or pending-approval ID. Ladon revalidates that
+context after authentication and before changing state. A late Touch ID result
+is ignored if the vault locked, the selection changed, or the agent request
+ended while the system dialog was open.
+
+After authorization, **Show** reveals text fields until the user chooses
+**Hide** or the selected-secret authorization ends. **Edit** loads the selected
+record into sensitive GUI buffers and permits changes to its name, field names,
+and text values, including adding or removing fields while retaining at least
+one. **Save changes** constructs and validates one complete replacement record
+before changing live vault state, then changes its name and fields in one
+revision. A record containing only some of the submitted changes is never
+observable. Successful save and **Cancel** both clear editor buffers and return
+to a masked detail card. The selected secret remains authorized after a
+successful save, but future agent use needs a new grant as described below.
+
+If durable commit fails, Ladon clears the local authorization and locks the
+vault. The primary and backup generations are then handled by the recovery
+state machine in section 7.3; a failed call does not promise that the old
+generation is the only recoverable generation.
+
+Binary fields are never decoded lossily for display. The detail card shows
+their type and byte count; inline binary replacement is outside this change and
+continues to use the file-import flow specified in section 5.2. A field marked
+as text whose bytes are not valid UTF-8 is treated as binary by the GUI rather
+than repaired or displayed lossily.
+
+Before mutating a validated edit, Ladon cancels a pending approval that includes
+the same secret ID and invalidates all existing agent grants for that ID. The
+approval coordinator remains locked until the vault mutation has either been
+durably committed or failed closed, so no concurrent request can validate an
+old grant and then resolve the new value. Every path that needs both locks uses
+the order approval coordinator, then vault controller. Deletion follows the
+same rule. Validation failures occur before revocation and leave both the record
+and grants unchanged.
+
+Already-started child processes may retain bytes previously delivered to them;
+grant invalidation applies only to future resolution. A persistence failure may
+therefore revoke access even though recovery later retains the previous record;
+this conservative failure is acceptable.
+
+Only the GUI may reveal or edit plaintext values. Copy, when provided, shows a
+warning that clipboard managers are outside Ladon's control and attempts to
+clear an unchanged clipboard after 30 seconds. Agent-facing APIs never reveal,
+edit, or copy.
 
 ## 6. Architecture
 
@@ -255,7 +338,7 @@ The workspace has three primary packages:
   and process runner;
 - `ladon`: human CLI and the `ladon mcp` stdio bridge.
 
-The approval layer has a platform-neutral grant table and PIN verifier. A
+The approval layer has a platform-neutral grant table and optional PIN verifier. A
 narrow macOS adapter calls the operating system's LocalAuthentication framework
 for Touch ID. Other platforms compile the same application with PIN approval
 and an unavailable Touch ID adapter. No external credential-store service or
@@ -457,19 +540,42 @@ deleted-secret generation in Ladon's managed `.bak` path.
 ### 7.4 Temporary approval authentication
 
 The passphrase is the only credential that decrypts the portable vault. After a
-successful passphrase unlock, the user configures an approval method for the
-current application lifetime. A PIN contains 6--12 ASCII digits. Ladon stores
-only a randomly salted Argon2id verifier in zeroizing process memory; the PIN,
-salt, verifier, retry state, and all grants are absent from the vault and from
-sidecar files and disappear when the app exits.
+successful passphrase unlock, the user may configure a PIN containing 4--12
+ASCII digits. Ladon stores only a randomly salted Argon2id verifier in zeroizing
+process memory; the PIN, salt, verifier, retry state, selected-secret
+authorization, and all grants are absent from the vault and from sidecar files
+and disappear when the vault locks or the app exits.
 
-On macOS, the user may choose Touch ID instead. Ladon evaluates the strict
-biometric-only LocalAuthentication policy with no password fallback and no reuse
-of an earlier device-unlock match. The framework returns only success or
-failure; Ladon never receives fingerprint data. Touch ID gates the same
-in-memory grant transition as PIN and is not described as cryptographic key
-unwrapping. If Touch ID is unavailable or becomes locked out, the user can lock
-and reopen the vault with the passphrase and choose a session PIN.
+On macOS, strict Touch ID and the optional PIN are independent confirmation
+capabilities rather than mutually exclusive modes. Ladon checks
+`canEvaluatePolicy` immediately before every protected action and never caches
+its result. Every attempt uses a fresh `LAContext`, the biometric-only policy,
+zero authentication-reuse duration, and no system-password or Apple Watch
+fallback. The system prompt states the concrete action and secret name or agent
+request being confirmed, using escaped metadata only. The framework returns
+only success or failure; Ladon never receives fingerprint data. Touch ID gates
+the same in-memory transitions as PIN and is not described as cryptographic key
+unwrapping. If Touch ID becomes unavailable or locked out, a configured PIN
+remains usable. Without one, secret reveal, edit, and new agent grants remain
+blocked; the user can retry Touch ID or lock the vault, unlock it with the
+passphrase, and configure a PIN in the post-passphrase step.
+
+The confirmation capability matrix is:
+
+| Strict Touch ID available | Session PIN configured | Accepted confirmation |
+| --- | --- | --- |
+| yes | yes | Touch ID or PIN |
+| yes | no | Touch ID |
+| no | yes | PIN |
+| no | no | none; PIN setup is required |
+
+A four-digit PIN is deliberately a convenience confirmation against casual or
+accidental use, not a cryptographic replacement for the vault passphrase. Five
+consecutive incorrect PIN submissions across all protected GUI actions in the
+current unlocked session lock the vault and clear the verifier, retry counter,
+local authorization, editor buffers, pending approvals, and grants. A successful
+PIN or Touch ID confirmation resets the counter. Cancelling a Touch ID prompt is
+not a failed PIN submission.
 
 No Keychain, DPAPI/Credential Manager, Secret Service, persistent wrapper, or
 native credential-store item is used. This keeps the portable vault and startup
@@ -785,11 +891,15 @@ configuration.
 
 ## 11. Failure handling
 
-- **Wrong passphrase/PIN:** one generic authentication failure; no distinction
-  between wrong credentials and damaged wrapped-key bytes.
+- **Wrong passphrase:** return one generic vault-authentication failure without
+  distinguishing an incorrect credential from damaged wrapped-key bytes.
+- **Wrong PIN:** return one generic confirmation failure. Five consecutive wrong
+  PIN submissions lock the vault as specified in section 7.4.
 - **Lost passphrase:** no reset or recovery bypass exists. A session PIN cannot
-  decrypt a vault and is lost when the app exits.
-- **Unavailable Touch ID:** use a session PIN and leave the vault usable.
+  decrypt a vault and is lost when the vault locks or the app exits.
+- **Unavailable Touch ID:** use a configured session PIN. Without one, metadata
+  remains visible but secret reveal, edit, and new grants stay unavailable until
+  Touch ID returns, or lock and reopen with the passphrase to configure a PIN.
 - **Unknown secret/field:** return a stable not-found error without opening a
   process.
 - **Approval timeout:** deny and return `approval_timeout`.
@@ -860,7 +970,9 @@ Advisories until a fixed release is available.
 - whole-file byte-for-byte vectors for every format version;
 - round-trip tests for every supported format version;
 - mutation tests proving that header, nonce, ciphertext, and tag changes fail;
-- wrong passphrase and wrong vault UUID tests, plus separate session PIN tests;
+- wrong passphrase and wrong vault UUID tests, plus session PIN boundary tests
+  covering 4 and 12 ASCII digits and rejecting shorter, longer, non-ASCII, and
+  mismatched values;
 - KDF-boundary tests proving oversized parameters fail before Argon2 allocation;
 - passphrase-rotation tests proving the old passphrase cannot open the new
   primary or managed backup;
@@ -901,8 +1013,16 @@ Advisories until a fixed release is available.
 
 ### 14.4 GUI and integration
 
-- deterministic UI state tests for setup, add/edit, lock, PIN failure, request
-  denial, request timeout, and automatic continuation;
+- deterministic UI state tests for setup, add/edit, masked selection, per-secret
+  authorization, show/hide, selection-change cleanup, lock cleanup, PIN failure,
+  five-failure vault lock, manager-window close, unsaved-edit close handling,
+  constant-length masking, the Touch-ID/PIN capability matrix, dynamic Touch ID
+  availability, stale-authentication-result rejection, request denial, request
+  timeout, and automatic continuation;
+- controller tests proving read buffers are sensitive, edits commit the name and
+  all fields in one revision, validation failures preserve the previous record,
+  persistence failures enter recovery safely, and edit/delete cannot race a
+  pending or granted use of the affected secret;
 - accessibility checks for keyboard navigation, focus, and screen-reader labels;
 - packaged smoke tests on all supported OS targets;
 - protocol-level MCP conformance tests;
@@ -929,8 +1049,9 @@ Stable version 1 is feature-complete when all of the following are true:
 1. A new user can create, lock, unlock, back up, and reopen a portable vault.
 2. A user can add a single value with only a name and value, add multiple fields,
    and import a file.
-3. A temporary 6--12 digit PIN confirms grants on every platform; strict Touch
-   ID confirmation is available on supported Macs; neither method is persisted.
+3. A temporary 4--12 digit PIN confirms protected actions on every platform;
+   strict Touch ID is always accepted on supported Macs and either method works
+   when both are available; neither method is persisted.
 4. The 30-minute idle timer and immediate lock events behave as specified.
 5. `ladon run` supports environment, stdin, and temporary-file bindings without
    managed values in process arguments.
@@ -943,8 +1064,12 @@ Stable version 1 is feature-complete when all of the following are true:
 9. Interrupted vault writes recover without losing both the primary and backup
    generations, and successful passphrase rotation leaves neither managed file
    decryptable with the old passphrase.
-10. Signed installable artifacts and SBOMs are produced from a tagged public
-    commit for every supported platform.
+10. Selecting a secret reveals metadata only; after Touch ID or configured PIN
+    confirmation, the owner can explicitly show and atomically edit that secret,
+    and selecting another secret or **New secret** clears the local authorization
+    and GUI buffers after handling any unsaved edit.
+11. Signed installable artifacts and SBOMs are produced from a tagged public
+     commit for every supported platform.
 
 ## 16. References
 

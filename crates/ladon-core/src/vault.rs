@@ -2,6 +2,7 @@ use crate::{
     FieldName, LadonError, SecretField, SecretId, SecretRecord, SecretRef, UnlockedVault,
     VaultStore,
 };
+use std::fmt;
 
 pub trait ActivitySink {
     fn secret_activity(&mut self);
@@ -17,6 +18,23 @@ pub struct SecretMetadata {
 pub struct VaultSession<A> {
     vault: UnlockedVault,
     activity: A,
+}
+
+pub struct PreparedRecordReplacement {
+    expected_revision: u64,
+    target_id: SecretId,
+    replacement: SecretRecord,
+}
+
+impl fmt::Debug for PreparedRecordReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedRecordReplacement")
+            .field("expected_revision", &self.expected_revision)
+            .field("target_id", &self.target_id)
+            .field("replacement", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl<A: ActivitySink> VaultSession<A> {
@@ -37,6 +55,62 @@ impl<A: ActivitySink> VaultSession<A> {
 
     pub fn record_activity(&mut self) {
         self.activity.secret_activity();
+    }
+
+    pub fn with_record<R>(
+        &mut self,
+        reference: &SecretRef,
+        operation: impl FnOnce(&SecretRecord) -> R,
+    ) -> Result<R, LadonError> {
+        let Self { vault, activity } = self;
+        let target = find_record_index(vault.payload().records(), reference)?;
+        let result = operation(&vault.payload().records()[target]);
+        activity.secret_activity();
+        Ok(result)
+    }
+
+    pub fn prepare_record_replacement(
+        &self,
+        reference: &SecretRef,
+        new_name: &str,
+        fields: Vec<SecretField>,
+    ) -> Result<PreparedRecordReplacement, LadonError> {
+        let target = find_record_index(self.vault.payload().records(), reference)?;
+        let current = &self.vault.payload().records()[target];
+        let replacement = SecretRecord::from_parts(current.id(), new_name, fields)?;
+        if self
+            .vault
+            .payload()
+            .records()
+            .iter()
+            .enumerate()
+            .any(|(index, record)| index != target && record.name() == replacement.name())
+        {
+            return Err(LadonError::DuplicateSecretName);
+        }
+        Ok(PreparedRecordReplacement {
+            expected_revision: self.vault.payload().revision(),
+            target_id: current.id(),
+            replacement,
+        })
+    }
+
+    pub fn apply_record_replacement(
+        &mut self,
+        prepared: PreparedRecordReplacement,
+    ) -> Result<(), LadonError> {
+        if self.vault.payload().revision() != prepared.expected_revision {
+            return Err(LadonError::InvalidRequest);
+        }
+        let target = find_record_index(
+            self.vault.payload().records(),
+            &SecretRef::Id(prepared.target_id),
+        )?;
+        let payload = self.vault.payload_mut();
+        payload.increment_revision()?;
+        payload.records_mut()[target] = prepared.replacement;
+        self.activity.secret_activity();
+        Ok(())
     }
 
     #[must_use]

@@ -164,3 +164,54 @@ fn missing_fields_fail_without_exposing_another_value() {
     );
     assert_eq!(session.activity().touches, touches);
 }
+
+#[test]
+fn whole_record_read_and_replace_preserve_id_and_increment_once() {
+    let mut session = session();
+    let id = session.add("before", vec![field("value", b"old")]).unwrap();
+    let reference = SecretRef::parse(&format!("id:{id}")).unwrap();
+    let before = session.revision();
+
+    let observed = session
+        .with_record(&reference, |record| {
+            (record.id(), record.name().to_owned(), record.fields().len())
+        })
+        .unwrap();
+    assert_eq!(observed, (id, "before".to_owned(), 1));
+
+    let prepared = session
+        .prepare_record_replacement(&reference, "after", vec![field("token", b"new")])
+        .unwrap();
+    assert_eq!(session.revision(), before);
+    session.apply_record_replacement(prepared).unwrap();
+    assert_eq!(session.revision(), before + 1);
+    assert_eq!(session.list()[0].id, id);
+    assert_eq!(session.list()[0].name, "after");
+    assert_eq!(session.list()[0].field_names, vec!["token".to_owned()]);
+}
+
+#[test]
+fn rejected_whole_record_replace_changes_nothing() {
+    let mut session = session();
+    let id = session.add("first", vec![field("value", b"one")]).unwrap();
+    session
+        .add("occupied", vec![field("value", b"two")])
+        .unwrap();
+    let revision = session.revision();
+    let touches = session.activity().touches;
+    let reference = SecretRef::parse(&format!("id:{id}")).unwrap();
+
+    assert_eq!(
+        session
+            .prepare_record_replacement(
+                &reference,
+                "occupied",
+                vec![field("value", b"replacement")],
+            )
+            .unwrap_err(),
+        LadonError::DuplicateSecretName
+    );
+    assert_eq!(session.revision(), revision);
+    assert_eq!(session.activity().touches, touches);
+    assert_eq!(session.list()[0].name, "first");
+}

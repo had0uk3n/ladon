@@ -40,4 +40,4 @@ pub use runner::{
 };
 pub use sensitive::SensitiveBytes;
 pub use store::{VaultOpen, VaultStore};
-pub use vault::{ActivitySink, SecretMetadata, VaultSession};
+pub use vault::{ActivitySink, PreparedRecordReplacement, SecretMetadata, VaultSession};

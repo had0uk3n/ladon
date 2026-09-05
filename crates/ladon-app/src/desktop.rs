@@ -14,10 +14,11 @@ use ladon_core::{LadonError, SecretId, SecretMetadata};
 
 #[cfg(unix)]
 use crate::LocalBrokerHandle;
+use crate::touch_id::TouchIdAttempt;
 use crate::{
-    AddSecretDraft, DetailMode, NavigationResult, NavigationTarget, PendingRequestView,
-    PinVerification, SecretDetailState, SensitiveText, SessionConfirmation, SessionPin, Supervisor,
-    TouchIdAuthenticator, VaultController, VaultUiPhase,
+    AddSecretDraft, DetailMode, LocalAuthAttempt, NavigationResult, NavigationTarget,
+    PendingRequestView, PinVerification, SecretDetailState, SensitiveText, SessionConfirmation,
+    SessionPin, Supervisor, TouchIdAuthenticator, VaultController, VaultUiPhase,
 };
 use crate::{EditableValue, ui::ReadOnlySensitiveText};
 
@@ -62,6 +63,7 @@ struct LadonDesktop {
     session_pin_confirmation: SensitiveText,
     local_pin: SensitiveText,
     session_confirmation: Option<SessionConfirmation>,
+    pending_touch_id: Option<PendingTouchId>,
     focused_approval: Option<uuid::Uuid>,
     draft: AddSecretDraft,
     notice: Option<Notice>,
@@ -75,6 +77,23 @@ struct LadonDesktop {
 enum ApprovalAction {
     Approve(ConfirmationAction),
     Deny,
+}
+
+struct PendingTouchId {
+    authentication: TouchIdAttempt,
+    target: TouchIdTarget,
+}
+
+enum TouchIdTarget {
+    Secret {
+        attempt: LocalAuthAttempt,
+        vault_session_id: uuid::Uuid,
+    },
+    #[cfg(unix)]
+    Approval {
+        approval_id: uuid::Uuid,
+        vault_session_id: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -122,7 +141,13 @@ impl LadonDesktop {
             .map_err(|_| LadonError::ProcessFailure)?
             .phase();
         #[cfg(unix)]
-        let broker = Some(LocalBrokerHandle::start(Arc::clone(&controller))?);
+        let broker = {
+            let repaint = context.egui_ctx.clone();
+            Some(LocalBrokerHandle::start_for_desktop(
+                Arc::clone(&controller),
+                Arc::new(move || repaint.request_repaint()),
+            )?)
+        };
         Ok(Self {
             _instance_lock: instance_lock,
             controller,
@@ -134,6 +159,7 @@ impl LadonDesktop {
             session_pin_confirmation: SensitiveText::default(),
             local_pin: SensitiveText::default(),
             session_confirmation: None,
+            pending_touch_id: None,
             focused_approval: None,
             draft: AddSecretDraft::new(),
             notice: None,
@@ -682,6 +708,7 @@ impl LadonDesktop {
     fn request_navigation(&mut self, target: NavigationTarget) {
         match self.detail.request_navigation(target) {
             NavigationResult::Applied => {
+                self.pending_touch_id = None;
                 self.unlock_confirmation = false;
                 self.discard_confirmation = false;
                 self.local_pin.clear();
@@ -741,6 +768,7 @@ impl LadonDesktop {
             });
 
         if cancel {
+            self.pending_touch_id = None;
             self.unlock_confirmation = false;
             self.local_pin.clear();
         } else if let Some(action) = action {
@@ -761,31 +789,24 @@ impl LadonDesktop {
 
         match action {
             ConfirmationAction::TouchId => {
-                let result = TouchIdAuthenticator::authenticate_secret(secret_name);
-                if let Err(error) = result {
-                    self.notice_from(Err(error), "");
+                if self.pending_touch_id.is_some() {
                     return;
                 }
-                let current_session_id = self.vault_session_id().ok();
-                if current_session_id == Some(captured_session_id)
-                    && self
-                        .detail
-                        .accept_authentication(attempt, captured_session_id)
-                {
-                    if let Some(confirmation) = &mut self.session_confirmation {
-                        confirmation.record_touch_id_success();
+                match TouchIdAuthenticator::authenticate_secret(secret_name) {
+                    Ok(authentication) => {
+                        self.pending_touch_id = Some(PendingTouchId {
+                            authentication,
+                            target: TouchIdTarget::Secret {
+                                attempt,
+                                vault_session_id: captured_session_id,
+                            },
+                        });
                     }
-                    self.unlock_confirmation = false;
-                    self.local_pin.clear();
-                    self.notice = Some(Notice {
-                        text: "Secret unlocked for this selection".to_owned(),
-                        danger: false,
-                    });
-                } else {
-                    self.reject_stale_authentication();
+                    Err(error) => self.notice_from(Err(error), ""),
                 }
             }
             ConfirmationAction::Pin => {
+                self.pending_touch_id = None;
                 let verification = self
                     .session_confirmation
                     .as_mut()
@@ -823,6 +844,7 @@ impl LadonDesktop {
     }
 
     fn reject_stale_authentication(&mut self) {
+        self.pending_touch_id = None;
         let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
             .unwrap_or(VaultUiPhase::Locked);
         self.synchronize_phase(phase);
@@ -834,22 +856,85 @@ impl LadonDesktop {
         });
     }
 
+    fn process_touch_id_result(&mut self) {
+        let result = self
+            .pending_touch_id
+            .as_ref()
+            .and_then(|pending| pending.authentication.try_result());
+        let Some(result) = result else {
+            return;
+        };
+        let Some(pending) = self.pending_touch_id.take() else {
+            return;
+        };
+        match (pending.target, result) {
+            (
+                TouchIdTarget::Secret {
+                    attempt,
+                    vault_session_id,
+                },
+                Ok(()),
+            ) => self.finish_selected_touch_id(attempt, vault_session_id),
+            #[cfg(unix)]
+            (
+                TouchIdTarget::Approval {
+                    approval_id,
+                    vault_session_id,
+                },
+                Ok(()),
+            ) => self.finish_approval_touch_id(approval_id, vault_session_id),
+            (_, Err(LadonError::ApprovalCancelled)) => {}
+            (_, Err(error)) => self.notice_from(Err(error), ""),
+        }
+    }
+
+    fn finish_selected_touch_id(
+        &mut self,
+        attempt: LocalAuthAttempt,
+        captured_session_id: uuid::Uuid,
+    ) {
+        let current_session_id = self.vault_session_id().ok();
+        if current_session_id == Some(captured_session_id)
+            && self
+                .detail
+                .accept_authentication(attempt, captured_session_id)
+        {
+            if let Some(confirmation) = &mut self.session_confirmation {
+                confirmation.record_touch_id_success();
+            }
+            self.unlock_confirmation = false;
+            self.local_pin.clear();
+            self.notice = Some(Notice {
+                text: "Secret unlocked for this selection".to_owned(),
+                danger: false,
+            });
+        } else {
+            self.reject_stale_authentication();
+        }
+    }
+
     fn handle_detail_action(&mut self, action: DetailAction) {
         match action {
             DetailAction::Show | DetailAction::Edit => {
                 let Some(selected) = self.detail.selected() else {
                     return;
                 };
-                let result = with_controller(&self.controller, |controller| {
-                    controller.load_secret(selected)
-                });
+                let result = (|| {
+                    let mut controller = self
+                        .controller
+                        .lock()
+                        .map_err(|_| LadonError::ProcessFailure)?;
+                    let session_id = controller.session_id().ok_or(LadonError::VaultLocked)?;
+                    let draft = controller.load_secret(selected)?;
+                    let transition = if matches!(action, DetailAction::Show) {
+                        self.detail.begin_reveal(session_id, draft)
+                    } else {
+                        self.detail.begin_edit(session_id, draft)
+                    };
+                    Ok::<_, LadonError>(transition)
+                })();
                 match result {
-                    Ok(draft) => {
-                        let state_result = if matches!(action, DetailAction::Show) {
-                            self.detail.begin_reveal(draft)
-                        } else {
-                            self.detail.begin_edit(draft)
-                        };
+                    Ok(state_result) => {
                         if state_result.is_err() {
                             self.notice = Some(Notice {
                                 text: "The selected secret changed before it could be opened"
@@ -925,6 +1010,7 @@ impl LadonDesktop {
     fn handle_delete_result(&mut self, result: Result<(), LadonError>) {
         match result {
             Ok(()) => {
+                self.pending_touch_id = None;
                 self.detail.navigate_now(NavigationTarget::Add);
                 self.unlock_confirmation = false;
                 self.local_pin.clear();
@@ -1021,6 +1107,31 @@ impl LadonDesktop {
         }
     }
 
+    #[cfg(unix)]
+    fn process_external_lock(&mut self) {
+        let pending = self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(LocalBrokerHandle::pending_external_lock);
+        match pending {
+            Ok(Some(request_id)) => {
+                self.clear_sensitive_state();
+                self.last_phase = VaultUiPhase::Locked;
+                let result = self
+                    .broker
+                    .as_ref()
+                    .ok_or(LadonError::EndpointUnavailable)
+                    .and_then(|broker| broker.acknowledge_external_lock(request_id));
+                if let Err(error) = result {
+                    self.notice_from(Err(error), "");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.notice_from(Err(error), ""),
+        }
+    }
+
     fn clear_unlock_fields(&mut self) {
         self.passphrase.clear();
         self.confirmation.clear();
@@ -1032,6 +1143,7 @@ impl LadonDesktop {
         self.session_pin_confirmation.clear();
         self.local_pin.clear();
         self.session_confirmation = None;
+        self.pending_touch_id = None;
         self.focused_approval = None;
         self.draft = AddSecretDraft::new();
         self.detail.clear_for_vault_lock();
@@ -1044,7 +1156,10 @@ impl LadonDesktop {
         if self.last_phase == VaultUiPhase::Unlocked && phase != VaultUiPhase::Unlocked {
             #[cfg(unix)]
             if let Some(broker) = &self.broker {
-                let _ = broker.revoke_grants();
+                let external_lock_in_progress = broker.external_lock_in_progress().unwrap_or(true);
+                if !external_lock_in_progress {
+                    let _ = broker.revoke_grants();
+                }
             }
             self.clear_sensitive_state();
         }
@@ -1085,15 +1200,18 @@ impl LadonDesktop {
         {
             Ok(Some(pending)) => pending,
             Ok(None) => {
+                self.cancel_stale_approval_touch_id(None);
                 update_focused_approval(&mut self.focused_approval, &mut self.local_pin, None);
                 return;
             }
             Err(error) => {
+                self.cancel_stale_approval_touch_id(None);
                 update_focused_approval(&mut self.focused_approval, &mut self.local_pin, None);
                 self.notice_from(Err(error), "");
                 return;
             }
         };
+        self.cancel_stale_approval_touch_id(Some((pending.id(), pending.vault_session_id())));
         if update_focused_approval(
             &mut self.focused_approval,
             &mut self.local_pin,
@@ -1187,6 +1305,7 @@ impl LadonDesktop {
                 self.authenticate_pending_approval(method, &pending);
             }
             Some(ApprovalAction::Deny) => {
+                self.pending_touch_id = None;
                 self.local_pin.clear();
                 let result = self
                     .broker
@@ -1212,9 +1331,29 @@ impl LadonDesktop {
             return;
         }
 
+        if method == ConfirmationAction::TouchId {
+            if self.pending_touch_id.is_some() {
+                return;
+            }
+            match TouchIdAuthenticator::authenticate_agent_session() {
+                Ok(authentication) => {
+                    self.pending_touch_id = Some(PendingTouchId {
+                        authentication,
+                        target: TouchIdTarget::Approval {
+                            approval_id: captured_id,
+                            vault_session_id: captured_session_id,
+                        },
+                    });
+                }
+                Err(error) => self.notice_from(Err(error), ""),
+            }
+            return;
+        }
+
+        self.pending_touch_id = None;
         let authenticated = match method {
             ConfirmationAction::TouchId => {
-                TouchIdAuthenticator::authenticate_agent_session().map(|()| true)
+                unreachable!("Touch ID starts asynchronously")
             }
             ConfirmationAction::Pin => {
                 let verification = self
@@ -1251,6 +1390,39 @@ impl LadonDesktop {
             return;
         }
 
+        self.finish_authenticated_approval(captured_id, captured_session_id, false);
+    }
+
+    #[cfg(unix)]
+    fn cancel_stale_approval_touch_id(&mut self, current: Option<(uuid::Uuid, uuid::Uuid)>) {
+        let stale = matches!(
+            self.pending_touch_id.as_ref().map(|pending| &pending.target),
+            Some(TouchIdTarget::Approval {
+                approval_id,
+                vault_session_id,
+            }) if current != Some((*approval_id, *vault_session_id))
+        );
+        if stale {
+            self.pending_touch_id = None;
+        }
+    }
+
+    #[cfg(unix)]
+    fn finish_approval_touch_id(
+        &mut self,
+        captured_id: uuid::Uuid,
+        captured_session_id: uuid::Uuid,
+    ) {
+        self.finish_authenticated_approval(captured_id, captured_session_id, true);
+    }
+
+    #[cfg(unix)]
+    fn finish_authenticated_approval(
+        &mut self,
+        captured_id: uuid::Uuid,
+        captured_session_id: uuid::Uuid,
+        touch_id_succeeded: bool,
+    ) {
         let current_session_id = self.vault_session_id().ok();
         let current_pending = self
             .broker
@@ -1274,7 +1446,7 @@ impl LadonDesktop {
             .ok_or(LadonError::EndpointUnavailable)
             .and_then(|broker| broker.approve(captured_id));
         if result.is_ok()
-            && method == ConfirmationAction::TouchId
+            && touch_id_succeeded
             && let Some(confirmation) = &mut self.session_confirmation
         {
             confirmation.record_touch_id_success();
@@ -1392,6 +1564,9 @@ fn unlock_instance_file(file: &File) {
 impl eframe::App for LadonDesktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(unix)]
+        self.process_external_lock();
+
+        #[cfg(unix)]
         let auto_locked = if let Some(broker) = &self.broker {
             broker
                 .auto_lock_controller_if_idle(&self.controller)
@@ -1419,6 +1594,7 @@ impl eframe::App for LadonDesktop {
         let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
             .unwrap_or(VaultUiPhase::Locked);
         self.synchronize_phase(phase);
+        self.process_touch_id_result();
         if phase == VaultUiPhase::Unlocked
             && context.input(|input| input.viewport().close_requested())
             && self.detail.request_navigation(NavigationTarget::Close)
@@ -1443,6 +1619,9 @@ impl eframe::App for LadonDesktop {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(unix)]
+        self.process_external_lock();
+
         #[cfg(unix)]
         let _ = if let Some(broker) = &self.broker {
             broker.cancel_active_run_and_lock(&self.controller)
@@ -1585,6 +1764,216 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[cfg(unix)]
+    fn app_with_sensitive_detail(editing: bool) -> (LadonDesktop, PathBuf, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("vault.ladon");
+        let endpoint = root.join("broker.sock");
+        let controller = Arc::new(Mutex::new(VaultController::new(path.clone())));
+        let passphrase = SensitiveText::from("correct horse");
+        let (secret_id, session_id, loaded) = {
+            let mut controller = controller.lock().unwrap();
+            controller.create(&passphrase, &passphrase).unwrap();
+            let mut draft = AddSecretDraft::new();
+            draft.set_name("external-lock-target");
+            draft.fields_mut()[0]
+                .value_mut()
+                .push_str("fake-external-lock-secret");
+            let secret_id = controller.add_secret(&mut draft).unwrap();
+            let session_id = controller.session_id().unwrap();
+            let loaded = controller.load_secret(secret_id).unwrap();
+            (secret_id, session_id, loaded)
+        };
+        let mut detail = SecretDetailState::default();
+        detail.navigate_now(NavigationTarget::Secret(secret_id));
+        let attempt = detail.authentication_attempt(session_id).unwrap();
+        assert!(detail.accept_authentication(attempt, session_id));
+        if editing {
+            detail.begin_edit(session_id, loaded).unwrap();
+            detail.mark_dirty();
+        } else {
+            detail.begin_reveal(session_id, loaded).unwrap();
+        }
+        let broker = LocalBrokerHandle::start_at_for_desktop(
+            Arc::clone(&controller),
+            &endpoint,
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let session_pin =
+            SessionPin::new(&SensitiveText::from("1234"), &SensitiveText::from("1234")).unwrap();
+        (
+            LadonDesktop {
+                _instance_lock: InstanceLock::acquire(&path).unwrap(),
+                controller,
+                broker: Some(broker),
+                passphrase: SensitiveText::default(),
+                confirmation: SensitiveText::default(),
+                session_pin: SensitiveText::default(),
+                session_pin_confirmation: SensitiveText::default(),
+                local_pin: SensitiveText::from("1234"),
+                session_confirmation: Some(SessionConfirmation::with_pin(session_pin)),
+                pending_touch_id: None,
+                focused_approval: None,
+                draft: AddSecretDraft::new(),
+                notice: None,
+                detail,
+                unlock_confirmation: false,
+                discard_confirmation: editing,
+                pending_delete: None,
+                last_phase: VaultUiPhase::Unlocked,
+            },
+            endpoint,
+            directory,
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_external_lock_waits_for_sensitive_detail_wipe(editing: bool) {
+        let (mut app, endpoint, directory) = app_with_sensitive_detail(editing);
+        let client = crate::LocalClient::new(endpoint);
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let locking = std::thread::spawn(move || {
+            let response = client.call(&ladon_core::RpcRequest {
+                version: 2,
+                request_id: Uuid::new_v4(),
+                client_session_id: Uuid::new_v4(),
+                client_label: "desktop lock regression".to_owned(),
+                method: ladon_core::RpcMethod::Lock,
+            });
+            response_tx.send(response).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if app
+                .broker
+                .as_ref()
+                .unwrap()
+                .pending_external_lock()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "external lock notification never arrived"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert!(response_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(app.detail.has_sensitive_buffer());
+
+        app.process_external_lock();
+
+        assert!(!app.detail.has_sensitive_buffer());
+        assert!(app.detail.selected().is_none());
+        assert!(app.session_confirmation.is_none());
+        assert!(app.local_pin.as_str().is_empty());
+        assert!(!app.discard_confirmation);
+        let response = response_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response.result(),
+            Some(ladon_core::RpcResult::Locked)
+        ));
+        assert!(!format!("{response:?}").contains("fake-external-lock-secret"));
+        locking.join().unwrap();
+        drop(app);
+        drop(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_lock_waits_until_revealed_secret_is_wiped() {
+        assert_external_lock_waits_for_sensitive_detail_wipe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_lock_waits_until_unsaved_edit_is_wiped_without_prompt() {
+        assert_external_lock_waits_for_sensitive_detail_wipe(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_lock_cancels_pending_touch_id_before_acknowledgement() {
+        let (mut app, endpoint, directory) = app_with_sensitive_detail(false);
+        let session_id = app.vault_session_id().unwrap();
+        let auth_attempt = app.detail.authentication_attempt(session_id).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let authentication = TouchIdAttempt::spawn_with(move |cancelled| {
+            started_tx.send(()).unwrap();
+            while !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            cancelled_tx.send(()).unwrap();
+            Err(LadonError::ApprovalCancelled)
+        })
+        .unwrap();
+        app.pending_touch_id = Some(PendingTouchId {
+            authentication,
+            target: TouchIdTarget::Secret {
+                attempt: auth_attempt,
+                vault_session_id: session_id,
+            },
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let client = crate::LocalClient::new(endpoint);
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let locking = std::thread::spawn(move || {
+            let response = client.call(&ladon_core::RpcRequest {
+                version: 2,
+                request_id: Uuid::new_v4(),
+                client_session_id: Uuid::new_v4(),
+                client_label: "pending Touch ID lock regression".to_owned(),
+                method: ladon_core::RpcMethod::Lock,
+            });
+            response_tx.send(response).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if app
+                .broker
+                .as_ref()
+                .unwrap()
+                .pending_external_lock()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "external lock notification never arrived"
+            );
+            std::thread::yield_now();
+        }
+        assert!(response_rx.recv_timeout(Duration::from_millis(30)).is_err());
+
+        app.process_external_lock();
+
+        assert!(app.pending_touch_id.is_none());
+        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let response = response_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response.result(),
+            Some(ladon_core::RpcResult::Locked)
+        ));
+        locking.join().unwrap();
+        drop(app);
+        drop(directory);
+    }
+
     #[test]
     fn session_setup_requires_pin_only_when_touch_id_is_unavailable() {
         assert!(can_finish_session_setup(true, false));
@@ -1664,14 +2053,17 @@ mod tests {
         let attempt = detail.authentication_attempt(session_id).unwrap();
         assert!(detail.accept_authentication(attempt, session_id));
         detail
-            .begin_edit(crate::EditSecretDraft::from_parts(
-                selected,
-                "selected",
-                vec![crate::EditableField::text(
-                    "value",
-                    SensitiveText::from("fake-selected-secret"),
-                )],
-            ))
+            .begin_edit(
+                session_id,
+                crate::EditSecretDraft::from_parts(
+                    selected,
+                    "selected",
+                    vec![crate::EditableField::text(
+                        "value",
+                        SensitiveText::from("fake-selected-secret"),
+                    )],
+                ),
+            )
             .unwrap();
         let mut app = LadonDesktop {
             _instance_lock: InstanceLock::acquire(&path).unwrap(),
@@ -1690,6 +2082,7 @@ mod tests {
                 )
                 .unwrap(),
             )),
+            pending_touch_id: None,
             focused_approval: Some(Uuid::new_v4()),
             draft,
             notice: None,
@@ -1741,6 +2134,7 @@ mod tests {
                 )
                 .unwrap(),
             )),
+            pending_touch_id: None,
             focused_approval: Some(Uuid::new_v4()),
             draft,
             notice: None,

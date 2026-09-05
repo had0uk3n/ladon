@@ -147,6 +147,7 @@ pub struct GrantTicket {
 
 struct PendingState {
     request: PendingApproval,
+    requested_secret_ids: Vec<SecretId>,
     decision: Option<ApprovalDecision>,
 }
 
@@ -212,6 +213,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         let approval_id = request.id;
         state.pending = Some(PendingState {
             request,
+            requested_secret_ids: ticket.secret_ids.clone(),
             decision: None,
         });
         self.changed.notify_all();
@@ -301,11 +303,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         let mut state = self.lock_state()?;
         let prepared = prepare()?;
         if let Some(pending) = state.pending.as_mut()
-            && pending
-                .request
-                .secrets()
-                .iter()
-                .any(|secret| secret.id() == secret_id)
+            && pending.requested_secret_ids.contains(&secret_id)
         {
             pending.decision = Some(ApprovalDecision::Cancel);
             self.changed.notify_all();

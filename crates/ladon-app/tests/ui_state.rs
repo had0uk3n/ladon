@@ -68,8 +68,8 @@ fn authorization_is_bound_to_session_secret_and_selection_epoch() {
 
 #[test]
 fn dirty_edit_requires_discard_before_navigation_but_lock_never_waits() {
-    let (mut state, _, secret) = authorized_state();
-    state.begin_edit(text_draft(secret)).unwrap();
+    let (mut state, session, secret) = authorized_state();
+    state.begin_edit(session, text_draft(secret)).unwrap();
     state.mark_dirty();
     assert_eq!(
         state.request_navigation(NavigationTarget::Add),
@@ -84,7 +84,7 @@ fn dirty_edit_requires_discard_before_navigation_but_lock_never_waits() {
 #[test]
 fn hiding_drops_values_but_keeps_current_secret_authorized() {
     let (mut state, session, secret) = authorized_state();
-    state.begin_reveal(text_draft(secret)).unwrap();
+    state.begin_reveal(session, text_draft(secret)).unwrap();
     state.hide_values();
     assert!(!state.has_sensitive_buffer());
     assert!(state.is_authorized(session));
@@ -93,12 +93,29 @@ fn hiding_drops_values_but_keeps_current_secret_authorized() {
 #[test]
 fn finishing_save_drops_the_editor_but_keeps_current_secret_authorized() {
     let (mut state, session, secret) = authorized_state();
-    state.begin_edit(text_draft(secret)).unwrap();
+    state.begin_edit(session, text_draft(secret)).unwrap();
     state.mark_dirty();
     state.finish_save();
     assert!(!state.has_sensitive_buffer());
     assert!(!state.is_editing());
     assert!(state.is_authorized(session));
+}
+
+#[test]
+fn reveal_and_edit_reject_authorization_from_a_stale_vault_session() {
+    let (mut state, _, secret) = authorized_state();
+    let reopened_session = uuid::Uuid::new_v4();
+
+    assert_eq!(
+        state.begin_reveal(reopened_session, text_draft(secret)),
+        Err(ladon_app::DetailStateError::NotAuthorized)
+    );
+    assert!(!state.has_sensitive_buffer());
+    assert_eq!(
+        state.begin_edit(reopened_session, text_draft(secret)),
+        Err(ladon_app::DetailStateError::NotAuthorized)
+    );
+    assert!(!state.has_sensitive_buffer());
 }
 
 #[test]

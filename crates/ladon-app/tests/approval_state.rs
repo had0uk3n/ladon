@@ -451,3 +451,110 @@ fn secret_mutation_cancels_pending_and_revokes_only_the_changed_secret() {
         Ok(9)
     );
 }
+
+#[test]
+fn mutation_of_already_granted_secret_cancels_mixed_pending_without_expanding_display() {
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+    ));
+    let client = Uuid::new_v4();
+    let already_granted = SecretId::new();
+    let missing = SecretId::new();
+    let initial = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(already_granted, "granted")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator.approve(pending.id()).unwrap();
+    assert!(initial.join().unwrap().is_ok());
+
+    let mixed = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(
+                    client,
+                    &[(already_granted, "granted"), (missing, "missing")],
+                ),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    assert_eq!(
+        pending
+            .secrets()
+            .iter()
+            .map(ApprovalSecret::id)
+            .collect::<Vec<_>>(),
+        vec![missing]
+    );
+
+    assert_eq!(
+        coordinator.coordinate_secret_mutation(already_granted, || Ok(()), Ok),
+        Ok(())
+    );
+    assert_eq!(mixed.join().unwrap(), Err(LadonError::ApprovalCancelled));
+}
+
+#[test]
+fn mutation_commit_failure_stays_revoked_and_requires_future_reapproval() {
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    let approved = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "commit-failure")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator.approve(pending.id()).unwrap();
+    let old_ticket = approved.join().unwrap().unwrap();
+
+    let commit_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let commit_observation = Arc::clone(&commit_ran);
+    assert_eq!(
+        coordinator.coordinate_secret_mutation(
+            secret,
+            || Ok("validated replacement"),
+            move |_| {
+                commit_observation.store(true, Ordering::Release);
+                Err::<(), _>(LadonError::StorageFailure)
+            },
+        ),
+        Err(LadonError::StorageFailure)
+    );
+    assert!(commit_ran.load(Ordering::Acquire));
+    assert_eq!(
+        coordinator.with_valid_grant(&old_ticket, || Ok(())),
+        Err(LadonError::ApprovalCancelled)
+    );
+
+    let retry = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "commit-failure")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator.deny(pending.id()).unwrap();
+    assert_eq!(retry.join().unwrap(), Err(LadonError::ApprovalDenied));
+}

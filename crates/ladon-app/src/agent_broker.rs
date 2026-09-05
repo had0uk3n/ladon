@@ -26,6 +26,7 @@ pub struct LocalBrokerHandle {
     stop: Arc<AtomicBool>,
     coordinator: Arc<RunCoordinator>,
     approval: Arc<ApprovalCoordinator>,
+    ui_locks: Option<Arc<UiLockCoordinator>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -47,6 +48,140 @@ struct RunLease {
 
 struct RunBlock {
     coordinator: Arc<RunCoordinator>,
+}
+
+struct UiLockCoordinator {
+    state: Mutex<UiLockState>,
+    changed: Condvar,
+    wake_ui: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[derive(Default)]
+struct UiLockState {
+    requested: u64,
+    acknowledged: u64,
+    ready: Option<u64>,
+    local_operation: bool,
+    connected: bool,
+}
+
+struct UiLocalOperation {
+    coordinator: Arc<UiLockCoordinator>,
+}
+
+impl UiLockCoordinator {
+    fn new(wake_ui: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            state: Mutex::new(UiLockState {
+                connected: true,
+                ..UiLockState::default()
+            }),
+            changed: Condvar::new(),
+            wake_ui,
+        }
+    }
+
+    fn begin_request(&self) -> Result<u64, LadonError> {
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        while (state.requested > state.acknowledged || state.local_operation) && state.connected {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| LadonError::ProcessFailure)?;
+        }
+        if !state.connected {
+            return Err(LadonError::EndpointUnavailable);
+        }
+        state.requested = state
+            .requested
+            .checked_add(1)
+            .ok_or(LadonError::ProcessFailure)?;
+        Ok(state.requested)
+    }
+
+    fn try_begin_local_operation(self: &Arc<Self>) -> Result<Option<UiLocalOperation>, LadonError> {
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        if !state.connected {
+            return Err(LadonError::EndpointUnavailable);
+        }
+        if state.requested > state.acknowledged {
+            return Ok(None);
+        }
+        if state.local_operation {
+            return Err(LadonError::Busy);
+        }
+        state.local_operation = true;
+        Ok(Some(UiLocalOperation {
+            coordinator: Arc::clone(self),
+        }))
+    }
+
+    fn finish_request(&self, request_id: u64) -> Result<(), LadonError> {
+        {
+            let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+            if request_id != state.requested || request_id <= state.acknowledged {
+                return Err(LadonError::InvalidRequest);
+            }
+            state.ready = Some(request_id);
+        }
+        (self.wake_ui)();
+
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        while state.acknowledged < request_id && state.connected {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| LadonError::ProcessFailure)?;
+        }
+        if state.acknowledged >= request_id {
+            Ok(())
+        } else {
+            Err(LadonError::EndpointUnavailable)
+        }
+    }
+
+    fn pending_request(&self) -> Result<Option<u64>, LadonError> {
+        let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        Ok(
+            (state.ready == Some(state.requested) && state.requested > state.acknowledged)
+                .then_some(state.requested),
+        )
+    }
+
+    fn request_in_progress(&self) -> Result<bool, LadonError> {
+        let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        Ok(state.requested > state.acknowledged)
+    }
+
+    fn acknowledge(&self, request_id: u64) -> Result<(), LadonError> {
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        if request_id != state.requested
+            || state.ready != Some(request_id)
+            || request_id <= state.acknowledged
+        {
+            return Err(LadonError::InvalidRequest);
+        }
+        state.acknowledged = request_id;
+        state.ready = None;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn disconnect(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.connected = false;
+            self.changed.notify_all();
+        }
+    }
+}
+
+impl Drop for UiLocalOperation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.coordinator.state.lock() {
+            state.local_operation = false;
+            self.coordinator.changed.notify_all();
+        }
+    }
 }
 
 impl RunCoordinator {
@@ -122,14 +257,96 @@ impl Drop for RunBlock {
     }
 }
 
+fn lock_controller_and_runs(
+    coordinator: &Arc<RunCoordinator>,
+    approval: &ApprovalCoordinator,
+    controller: &Arc<Mutex<VaultController>>,
+    ui_locks: Option<&Arc<UiLockCoordinator>>,
+) -> Result<(), LadonError> {
+    let mut first_error = None;
+    let ui_request = match ui_locks.map(|ui_locks| ui_locks.begin_request()) {
+        Some(Ok(request_id)) => Some(request_id),
+        Some(Err(error)) => {
+            first_error = Some(error);
+            None
+        }
+        None => None,
+    };
+    if let Err(error) = approval.cancel_pending() {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    if let Err(error) = approval.revoke_all()
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    let _block = match coordinator.block_new_runs() {
+        Ok(block) => Some(block),
+        Err(error) => {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            None
+        }
+    };
+    match controller.lock() {
+        Ok(mut controller) => controller.lock(),
+        Err(_) if first_error.is_none() => {
+            first_error = Some(LadonError::ProcessFailure);
+        }
+        Err(_) => {}
+    }
+    if let (Some(ui_locks), Some(request_id)) = (ui_locks, ui_request)
+        && let Err(error) = ui_locks.finish_request(request_id)
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 impl LocalBrokerHandle {
     pub fn start(controller: Arc<Mutex<VaultController>>) -> Result<Self, LadonError> {
         Self::start_at(controller, default_endpoint_path())
     }
 
+    pub(crate) fn start_for_desktop(
+        controller: Arc<Mutex<VaultController>>,
+        wake_ui: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, LadonError> {
+        Self::start_inner(
+            controller,
+            default_endpoint_path(),
+            Some(Arc::new(UiLockCoordinator::new(wake_ui))),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_at_for_desktop(
+        controller: Arc<Mutex<VaultController>>,
+        endpoint: impl AsRef<Path>,
+        wake_ui: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, LadonError> {
+        Self::start_inner(
+            controller,
+            endpoint,
+            Some(Arc::new(UiLockCoordinator::new(wake_ui))),
+        )
+    }
+
     pub fn start_at(
         controller: Arc<Mutex<VaultController>>,
         endpoint: impl AsRef<Path>,
+    ) -> Result<Self, LadonError> {
+        Self::start_inner(controller, endpoint, None)
+    }
+
+    fn start_inner(
+        controller: Arc<Mutex<VaultController>>,
+        endpoint: impl AsRef<Path>,
+        ui_locks: Option<Arc<UiLockCoordinator>>,
     ) -> Result<Self, LadonError> {
         let server = LocalServer::bind(endpoint)?;
         server.set_nonblocking(true)?;
@@ -139,12 +356,14 @@ impl LocalBrokerHandle {
         let worker_stop = Arc::clone(&stop);
         let worker_coordinator = Arc::clone(&coordinator);
         let worker_approval = Arc::clone(&approval);
+        let worker_ui_locks = ui_locks.clone();
         let thread = thread::spawn(move || {
             let broker = Arc::new(AgentBroker::new(
                 controller,
                 worker_coordinator,
                 worker_approval,
                 Arc::clone(&worker_stop),
+                worker_ui_locks,
             ));
             let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !worker_stop.load(Ordering::Acquire) {
@@ -178,8 +397,28 @@ impl LocalBrokerHandle {
             stop,
             coordinator,
             approval,
+            ui_locks,
             thread: Some(thread),
         })
+    }
+
+    pub(crate) fn pending_external_lock(&self) -> Result<Option<u64>, LadonError> {
+        self.ui_locks
+            .as_ref()
+            .map_or(Ok(None), |ui_locks| ui_locks.pending_request())
+    }
+
+    pub(crate) fn acknowledge_external_lock(&self, request_id: u64) -> Result<(), LadonError> {
+        self.ui_locks
+            .as_ref()
+            .ok_or(LadonError::InvalidRequest)?
+            .acknowledge(request_id)
+    }
+
+    pub(crate) fn external_lock_in_progress(&self) -> Result<bool, LadonError> {
+        self.ui_locks
+            .as_ref()
+            .map_or(Ok(false), |ui_locks| ui_locks.request_in_progress())
     }
 
     pub fn cancel_active_run(&self) {
@@ -196,32 +435,17 @@ impl LocalBrokerHandle {
         &self,
         controller: &Arc<Mutex<VaultController>>,
     ) -> Result<(), LadonError> {
-        let mut first_error = None;
-        if let Err(error) = self.approval.cancel_pending() {
-            first_error = Some(error);
-        }
-        if let Err(error) = self.approval.revoke_all()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-        let _block = match self.coordinator.block_new_runs() {
-            Ok(block) => Some(block),
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                None
-            }
+        let _local_operation = if let Some(ui_locks) = &self.ui_locks {
+            let Some(operation) = ui_locks.try_begin_local_operation()? else {
+                // The external request already owns the lock transition. Returning lets the GUI
+                // wipe its state and acknowledge that request instead of waiting on its run block.
+                return Ok(());
+            };
+            Some(operation)
+        } else {
+            None
         };
-        match controller.lock() {
-            Ok(mut controller) => controller.lock(),
-            Err(_) if first_error.is_none() => {
-                first_error = Some(LadonError::ProcessFailure);
-            }
-            Err(_) => {}
-        }
-        first_error.map_or(Ok(()), Err)
+        lock_controller_and_runs(&self.coordinator, &self.approval, controller, None)
     }
 
     pub fn auto_lock_controller_if_idle(
@@ -255,6 +479,15 @@ impl LocalBrokerHandle {
     }
 
     pub fn revoke_grants(&self) -> Result<(), LadonError> {
+        let _local_operation = if let Some(ui_locks) = &self.ui_locks {
+            let Some(operation) = ui_locks.try_begin_local_operation()? else {
+                // An external lock cancels pending approval and revokes all grants itself.
+                return Ok(());
+            };
+            Some(operation)
+        } else {
+            None
+        };
         self.approval.cancel_pending()?;
         let _block = self.coordinator.block_new_runs()?;
         self.approval.revoke_all()
@@ -307,6 +540,9 @@ impl LocalBrokerHandle {
 
 impl Drop for LocalBrokerHandle {
     fn drop(&mut self) {
+        if let Some(ui_locks) = &self.ui_locks {
+            ui_locks.disconnect();
+        }
         self.stop.store(true, Ordering::Release);
         let _ = self.approval.cancel_pending();
         let _ = self.approval.revoke_all();
@@ -323,6 +559,7 @@ struct AgentBroker {
     coordinator: Arc<RunCoordinator>,
     approval: Arc<ApprovalCoordinator>,
     shutting_down: Arc<AtomicBool>,
+    ui_locks: Option<Arc<UiLockCoordinator>>,
 }
 
 impl AgentBroker {
@@ -331,6 +568,7 @@ impl AgentBroker {
         coordinator: Arc<RunCoordinator>,
         approval: Arc<ApprovalCoordinator>,
         shutting_down: Arc<AtomicBool>,
+        ui_locks: Option<Arc<UiLockCoordinator>>,
     ) -> Self {
         Self {
             controller,
@@ -338,6 +576,7 @@ impl AgentBroker {
             coordinator,
             approval,
             shutting_down,
+            ui_locks,
         }
     }
 
@@ -394,10 +633,12 @@ impl AgentBroker {
                 Ok(RpcResult::List { secrets })
             }
             RpcMethod::Lock => {
-                self.approval.cancel_pending()?;
-                self.approval.revoke_all()?;
-                let _block = self.coordinator.block_new_runs()?;
-                self.controller()?.lock();
+                lock_controller_and_runs(
+                    &self.coordinator,
+                    &self.approval,
+                    &self.controller,
+                    self.ui_locks.as_ref(),
+                )?;
                 Ok(RpcResult::Locked)
             }
             RpcMethod::Run {
@@ -515,6 +756,151 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_broker_lock_waits_for_gui_ack_after_controller_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.ladon");
+        let passphrase = crate::SensitiveText::from("correct horse");
+        let controller = Arc::new(Mutex::new(VaultController::new(path)));
+        controller
+            .lock()
+            .unwrap()
+            .create(&passphrase, &passphrase)
+            .unwrap();
+        let ui_locks = Arc::new(UiLockCoordinator::new(Arc::new(|| {})));
+        let broker = Arc::new(AgentBroker::new(
+            Arc::clone(&controller),
+            Arc::new(RunCoordinator::default()),
+            Arc::new(ApprovalCoordinator::session_defaults()),
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::clone(&ui_locks)),
+        ));
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let locking = thread::spawn(move || {
+            let result = broker.handle_method(
+                Uuid::new_v4(),
+                "test client".to_owned(),
+                RpcMethod::Lock,
+                RunCancellation::new(),
+            );
+            finished_tx.send(result).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let request_id = loop {
+            if let Some(request_id) = ui_locks.pending_request().unwrap() {
+                break request_id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GUI lock request never arrived"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert!(finished_rx.recv_timeout(Duration::from_millis(30)).is_err());
+
+        ui_locks.acknowledge(request_id).unwrap();
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(RpcResult::Locked)
+        );
+        locking.join().unwrap();
+    }
+
+    #[test]
+    fn gui_lock_does_not_wait_on_an_external_lock_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.ladon");
+        let passphrase = crate::SensitiveText::from("correct horse");
+        let controller = Arc::new(Mutex::new(VaultController::new(path)));
+        controller
+            .lock()
+            .unwrap()
+            .create(&passphrase, &passphrase)
+            .unwrap();
+        let coordinator = Arc::new(RunCoordinator::default());
+        let active_run = coordinator
+            .try_start(RunCancellation::new())
+            .expect("test run should start");
+        let approval = Arc::new(ApprovalCoordinator::session_defaults());
+        let ui_locks = Arc::new(UiLockCoordinator::new(Arc::new(|| {})));
+        let broker = Arc::new(AgentBroker::new(
+            Arc::clone(&controller),
+            Arc::clone(&coordinator),
+            Arc::clone(&approval),
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::clone(&ui_locks)),
+        ));
+        let handle = Arc::new(LocalBrokerHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            coordinator,
+            approval,
+            ui_locks: Some(Arc::clone(&ui_locks)),
+            thread: None,
+        });
+
+        let (external_tx, external_rx) = std::sync::mpsc::channel();
+        let locking = thread::spawn(move || {
+            let result = broker.handle_method(
+                Uuid::new_v4(),
+                "test client".to_owned(),
+                RpcMethod::Lock,
+                RunCancellation::new(),
+            );
+            external_tx.send(result).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !ui_locks.request_in_progress().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "external lock intent never arrived"
+            );
+            thread::yield_now();
+        }
+        assert!(ui_locks.pending_request().unwrap().is_none());
+
+        let (gui_tx, gui_rx) = std::sync::mpsc::channel();
+        let gui_handle = Arc::clone(&handle);
+        let gui_controller = Arc::clone(&controller);
+        let gui_locking = thread::spawn(move || {
+            gui_tx
+                .send(gui_handle.cancel_active_run_and_lock(&gui_controller))
+                .unwrap();
+        });
+        let immediate_gui_result = gui_rx.recv_timeout(Duration::from_millis(30)).ok();
+        let gui_waited = immediate_gui_result.is_none();
+
+        drop(active_run);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let request_id = loop {
+            if let Some(request_id) = ui_locks.pending_request().unwrap() {
+                break request_id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "external lock request never became ready"
+            );
+            thread::yield_now();
+        };
+        ui_locks.acknowledge(request_id).unwrap();
+        assert_eq!(
+            external_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(RpcResult::Locked)
+        );
+        let gui_result = immediate_gui_result
+            .unwrap_or_else(|| gui_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert_eq!(gui_result, Ok(()));
+        locking.join().unwrap();
+        gui_locking.join().unwrap();
+        drop(handle);
+
+        assert!(
+            !gui_waited,
+            "GUI lock waited on the run barrier after an external lock intent"
+        );
+    }
+
+    #[test]
     fn coordination_failure_does_not_skip_the_vault_lock_attempt() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vault.ladon");
@@ -539,6 +925,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             coordinator,
             approval: Arc::new(ApprovalCoordinator::session_defaults()),
+            ui_locks: None,
             thread: None,
         };
 

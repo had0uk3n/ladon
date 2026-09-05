@@ -1168,7 +1168,10 @@ Run outside restricted sandboxes when local socket creation is denied: `cargo te
 
 Expected: every non-ignored test passes and there are zero failures.
 
-- [x] **Step 5: Build and launch the release GUI**
+- [ ] **Step 5: Build and launch the release GUI**
+
+**Pending:** the controller/human macOS smoke run below has not been performed.
+A successful automated release build does not complete this step.
 
 Run: `cargo build --release -p ladon-app --features gui`
 

@@ -821,12 +821,20 @@ impl SecretDetailState {
         true
     }
 
-    pub fn begin_reveal(&mut self, draft: EditSecretDraft) -> Result<(), DetailStateError> {
-        self.begin_with_draft(draft, false)
+    pub fn begin_reveal(
+        &mut self,
+        vault_session_id: Uuid,
+        draft: EditSecretDraft,
+    ) -> Result<(), DetailStateError> {
+        self.begin_with_draft(vault_session_id, draft, false)
     }
 
-    pub fn begin_edit(&mut self, draft: EditSecretDraft) -> Result<(), DetailStateError> {
-        self.begin_with_draft(draft, true)
+    pub fn begin_edit(
+        &mut self,
+        vault_session_id: Uuid,
+        draft: EditSecretDraft,
+    ) -> Result<(), DetailStateError> {
+        self.begin_with_draft(vault_session_id, draft, true)
     }
 
     pub fn mark_dirty(&mut self) {
@@ -894,6 +902,7 @@ impl SecretDetailState {
 
     fn begin_with_draft(
         &mut self,
+        vault_session_id: Uuid,
         draft: EditSecretDraft,
         editing: bool,
     ) -> Result<(), DetailStateError> {
@@ -903,7 +912,10 @@ impl SecretDetailState {
         if draft.id() != selected {
             return Err(DetailStateError::DraftDoesNotMatchSelection);
         }
-        if self.authorized.is_none() {
+        if self
+            .authorization_for_current_selection(vault_session_id)
+            .is_none()
+        {
             return Err(DetailStateError::NotAuthorized);
         }
         self.drop_sensitive_mode();

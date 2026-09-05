@@ -332,6 +332,144 @@ fn edit_revokes_the_old_grant_before_future_use() {
     assert!(!debug.contains("fake-replacement-secret"));
 }
 
+#[test]
+fn delete_cancels_mixed_pending_and_replacement_requires_reapproval_without_leakage() {
+    let directory = tempfile::tempdir().unwrap();
+    let passphrase = SensitiveText::from("correct horse");
+    let mut initial = VaultController::new(directory.path().join("vault.ladon"));
+    initial.create(&passphrase, &passphrase).unwrap();
+    let mut deleted = AddSecretDraft::new();
+    deleted.set_name("delete-target");
+    deleted.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-deleted-secret");
+    let deleted_id = initial.add_secret(&mut deleted).unwrap();
+    let mut other = AddSecretDraft::new();
+    other.set_name("other-target");
+    other.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-other-secret");
+    initial.add_secret(&mut other).unwrap();
+    let controller = Arc::new(Mutex::new(initial));
+    let endpoint = directory.path().join("broker.sock");
+    let server = LocalBrokerHandle::start_at(Arc::clone(&controller), &endpoint).unwrap();
+    let client = LocalClient::new(&endpoint);
+    let client_session_id = Uuid::new_v4();
+    let working_directory = directory.path().to_string_lossy().into_owned();
+    let target_binding = || SecretBindingRequest {
+        secret_ref: "delete-target".to_owned(),
+        field: "value".to_owned(),
+        target: BindingTarget::Environment {
+            name: "TARGET".to_owned(),
+        },
+    };
+    let other_binding = || SecretBindingRequest {
+        secret_ref: "other-target".to_owned(),
+        field: "value".to_owned(),
+        target: BindingTarget::Environment {
+            name: "OTHER".to_owned(),
+        },
+    };
+
+    let first_client = client.clone();
+    let first_directory = working_directory.clone();
+    let first = thread::spawn(move || {
+        first_client.call(&request_for(
+            client_session_id,
+            RpcMethod::Run {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), "printf %s \"$TARGET\"".to_owned()],
+                working_directory: first_directory,
+                bindings: vec![target_binding()],
+                timeout_ms: 5_000,
+                output_limit_bytes: 64 * 1024,
+            },
+        ))
+    });
+    let pending = wait_for_pending(&server);
+    server.approve(pending.id()).unwrap();
+    let first_response = first.join().unwrap().unwrap();
+    assert!(matches!(
+        first_response.result(),
+        Some(RpcResult::Run { .. })
+    ));
+    assert!(!format!("{first_response:?}").contains("fake-deleted-secret"));
+
+    let mixed_client = client.clone();
+    let mixed_directory = working_directory.clone();
+    let mixed = thread::spawn(move || {
+        mixed_client.call(&request_for(
+            client_session_id,
+            RpcMethod::Run {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "printf %s%s \"$TARGET\" \"$OTHER\"".to_owned(),
+                ],
+                working_directory: mixed_directory,
+                bindings: vec![target_binding(), other_binding()],
+                timeout_ms: 5_000,
+                output_limit_bytes: 64 * 1024,
+            },
+        ))
+    });
+    let pending = wait_for_pending(&server);
+    assert_eq!(pending.secrets().len(), 1);
+    assert_eq!(pending.secrets()[0].name(), "other-target");
+
+    server.delete_secret(&controller, deleted_id).unwrap();
+
+    let approval_remained_pending = server.pending_approval().unwrap().is_some();
+    if approval_remained_pending {
+        server.deny(pending.id()).unwrap();
+    }
+    let cancelled = mixed.join().unwrap().unwrap();
+    assert!(
+        !approval_remained_pending,
+        "delete did not cancel a mixed request that included the deleted ID"
+    );
+    assert_eq!(
+        cancelled.error_details(),
+        Some(("approval_cancelled", "approval request was cancelled"))
+    );
+    let mut replacement = AddSecretDraft::new();
+    replacement.set_name("delete-target");
+    replacement.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-replacement-after-delete");
+    controller
+        .lock()
+        .unwrap()
+        .add_secret(&mut replacement)
+        .unwrap();
+
+    let retry_client = client.clone();
+    let retry = thread::spawn(move || {
+        retry_client.call(&request_for(
+            client_session_id,
+            RpcMethod::Run {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), "printf %s \"$TARGET\"".to_owned()],
+                working_directory,
+                bindings: vec![target_binding()],
+                timeout_ms: 5_000,
+                output_limit_bytes: 64 * 1024,
+            },
+        ))
+    });
+    let pending = wait_for_pending(&server);
+    server.deny(pending.id()).unwrap();
+    let denied = retry.join().unwrap().unwrap();
+    assert_eq!(
+        denied.error_details(),
+        Some(("approval_denied", "agent request was denied"))
+    );
+    let debug = format!("{cancelled:?}{denied:?}");
+    assert!(!debug.contains("fake-deleted-secret"));
+    assert!(!debug.contains("fake-other-secret"));
+    assert!(!debug.contains("fake-replacement-after-delete"));
+}
+
 fn request_for(client_session_id: Uuid, method: RpcMethod) -> RpcRequest {
     RpcRequest {
         version: 2,

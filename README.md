@@ -48,14 +48,16 @@ cargo build --release
 ./target/release/ladon-app
 ```
 
-On first launch, create a passphrase of at least 12 Unicode characters. You may
-also configure an optional 4–12 digit PIN for this app session. On a supported
-Mac, Touch ID remains available alongside that PIN, so either method can confirm
-a protected action. Five consecutive wrong PIN submissions lock the vault; a
-successful PIN or Touch ID confirmation resets the counter. The PIN verifier
-and all agent permissions stay only in memory and are forgotten when Ladon
-locks or exits. The resulting release binaries do not require Rust to be
-installed on the computer where they run.
+On first launch, create a passphrase of at least 12 Unicode characters. When
+strict Touch ID is available on a supported Mac, you may continue with Touch ID
+alone or add an optional 4–12 digit PIN for the app session; either configured
+method can confirm a protected action. Whenever strict Touch ID is unavailable,
+configuring a 4–12 digit session PIN is required before secret use. Five
+consecutive wrong PIN submissions lock the vault; a successful PIN or Touch ID
+confirmation resets the counter. The PIN verifier and all agent permissions
+stay only in memory and are forgotten when Ladon locks or exits. The resulting
+release binaries do not require Rust to be installed on the computer where they
+run.
 
 ## Viewing and editing a secret
 

@@ -231,10 +231,13 @@ The workspace has three primary packages:
 
 `ladon-core` must not depend on `egui`, MCP, or platform GUI code. Secret values
 are represented by dedicated non-cloneable zeroizing byte containers rather
-than ordinary application strings. Passphrase, PIN, and value-entry widgets use
-a Ladon-owned `egui::TextBuffer` implementation backed by the same kind of
-container; password masking alone is not treated as memory protection. Undo,
-copy, drag, and accessibility value export are disabled for these widgets.
+than ordinary long-lived application strings. Passphrase, PIN, and value-entry
+widgets use a Ladon-owned `egui::TextBuffer` implementation backed by the same
+kind of container; password masking alone is not treated as memory protection.
+Copy and accessibility value export are disabled, and Ladon clears egui's undo
+state immediately after every sensitive-widget update. The GUI/OS input stack
+may still create transient ordinary-string copies, which remains part of the
+documented same-user memory-inspection limitation.
 
 ### 6.2 Process lifecycle
 
@@ -630,7 +633,11 @@ cover byte-wise RFC 3986 encoding with upper- and lowercase hex. Duplicate
 derived patterns are removed before matching. These are deliberately common
 accidental representations, not an open-ended transformation engine.
 
-Matches become `[REDACTED:secret-id.field]`. Empty values have no pattern. If any
+Matches normally become `[REDACTED]`; the redaction count carries the event
+metadata without putting secret names or field names into process output. If
+that marker or a truncation annotation would itself contain any managed raw or
+derived pattern, the affected output is suppressed. A final scan of the rendered
+string fails closed in the same way. Empty values have no pattern. If any
 non-empty injected value or generated representation is shorter than four
 bytes, Ladon suppresses stdout and stderr entirely for that run rather than risk
 unbounded marker expansion. Redaction operates on bytes. After redaction,

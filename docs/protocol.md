@@ -18,7 +18,7 @@ Protocol version 1 supports four methods:
 
 There is no get/export/plaintext method. A run response contains exit status,
 termination reason, bounded redacted stdout/stderr, duration, redaction count,
-and truncation state.
+truncation state, and a non-sensitive temporary-file cleanup warning.
 
 The broker accepts at most eight concurrent same-user connection workers and
 one active run. Socket reads/writes have five-second timeouts. Run bindings are

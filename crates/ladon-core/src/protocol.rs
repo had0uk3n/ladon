@@ -101,6 +101,8 @@ pub enum RpcResult {
         duration_ms: u64,
         redaction_count: u64,
         output_truncated: bool,
+        #[serde(default)]
+        temp_cleanup_warning: bool,
     },
 }
 

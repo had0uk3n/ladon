@@ -1,17 +1,14 @@
 use std::{
     ffi::OsString,
     fmt, fs,
-    fs::OpenOptions,
-    io::Write,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
-#[cfg(unix)]
-use std::fs::File;
-
 use uuid::Uuid;
 
-use crate::{LadonError, SensitiveBytes, UnlockedVault, unlock_vault};
+use crate::{LadonError, MAX_VAULT_FILE_BYTES, SensitiveBytes, UnlockedVault, unlock_vault};
 
 pub struct VaultStore {
     primary: PathBuf,
@@ -90,12 +87,8 @@ impl VaultStore {
     }
 
     pub fn open(&self, passphrase: &SensitiveBytes) -> Result<VaultOpen, LadonError> {
-        let primary = fs::read(&self.primary)
-            .ok()
-            .and_then(|bytes| unlock_vault(&bytes, passphrase).ok());
-        let backup = fs::read(&self.backup)
-            .ok()
-            .and_then(|bytes| unlock_vault(&bytes, passphrase).ok());
+        let primary = open_copy(&self.primary, passphrase);
+        let backup = open_copy(&self.backup, passphrase);
 
         match (primary, backup) {
             (Some(vault), Some(backup)) => {
@@ -126,6 +119,22 @@ impl VaultStore {
             Uuid::new_v4().as_simple()
         ))
     }
+}
+
+fn open_copy(path: &Path, passphrase: &SensitiveBytes) -> Option<UnlockedVault> {
+    let file = File::open(path).ok()?;
+    let length = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if length > MAX_VAULT_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(length);
+    file.take((MAX_VAULT_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_VAULT_FILE_BYTES {
+        return None;
+    }
+    unlock_vault(&bytes, passphrase).ok()
 }
 
 fn write_candidate(path: &Path, encrypted: &[u8]) -> Result<(), LadonError> {

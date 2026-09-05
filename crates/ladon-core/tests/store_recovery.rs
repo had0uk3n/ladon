@@ -1,7 +1,8 @@
-use std::{fs, path::Path};
+use std::{fs, fs::OpenOptions, path::Path};
 
 use ladon_core::{
-    LadonError, SecretId, SensitiveBytes, VaultOpen, VaultPayload, VaultStore, create_vault,
+    LadonError, MAX_VAULT_FILE_BYTES, SecretId, SensitiveBytes, VaultOpen, VaultPayload,
+    VaultStore, create_vault,
 };
 use tempfile::tempdir;
 
@@ -109,6 +110,27 @@ fn ignores_stale_candidates_and_uses_owner_only_permissions() {
             0
         );
     }
+}
+
+#[test]
+fn rejects_oversized_sparse_copies_before_reading_their_contents() {
+    let directory = tempdir().unwrap();
+    let primary = directory.path().join("vault.ladon");
+    let store = VaultStore::new(primary.clone());
+    for path in [&primary, store.backup_path()] {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap()
+            .set_len((MAX_VAULT_FILE_BYTES + 1) as u64)
+            .unwrap();
+    }
+
+    assert_eq!(
+        store.open(&password()).unwrap_err(),
+        LadonError::VaultUnavailable
+    );
 }
 
 fn assert_no_temporary_candidates(directory: &Path) {

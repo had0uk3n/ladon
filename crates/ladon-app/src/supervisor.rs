@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -22,8 +22,12 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RUN_DIRECTORY_PREFIX: &str = "run-";
+const RUN_DIRECTORY_MARKER: &str = ".ladon-owner";
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
+#[cfg(unix)]
+const TERMINATION_CONFIRMATION: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
 pub struct RunCancellation(Arc<AtomicBool>);
@@ -75,6 +79,10 @@ impl Supervisor {
         Self {
             running: AtomicBool::new(false),
         }
+    }
+
+    pub fn cleanup_stale_temp_directories() -> Result<(), LadonError> {
+        cleanup_stale_temp_directories_in(&temporary_root())
     }
 
     pub fn run<F>(
@@ -265,9 +273,11 @@ fn make_redactor(
 
 fn ensure_temp_directory(directory: &mut Option<TempDir>) -> Result<&TempDir, LadonError> {
     if directory.is_none() {
+        let root = temporary_root();
+        prepare_temporary_root(&root)?;
         let created = TempBuilder::new()
-            .prefix("ladon-run-")
-            .tempdir()
+            .prefix(RUN_DIRECTORY_PREFIX)
+            .tempdir_in(root)
             .map_err(|_| LadonError::ProcessFailure)?;
         #[cfg(unix)]
         {
@@ -275,9 +285,117 @@ fn ensure_temp_directory(directory: &mut Option<TempDir>) -> Result<&TempDir, La
             std::fs::set_permissions(created.path(), std::fs::Permissions::from_mode(0o700))
                 .map_err(|_| LadonError::ProcessFailure)?;
         }
+        write_run_marker(created.path())?;
         *directory = Some(created);
     }
     directory.as_ref().ok_or(LadonError::ProcessFailure)
+}
+
+fn temporary_root() -> PathBuf {
+    #[cfg(unix)]
+    let suffix = {
+        // SAFETY: geteuid has no preconditions and no side effects.
+        unsafe { libc::geteuid() }.to_string()
+    };
+    #[cfg(not(unix))]
+    let suffix = "user".to_owned();
+    env::temp_dir().join(format!("ladon-runs-{suffix}"))
+}
+
+fn prepare_temporary_root(root: &Path) -> Result<(), LadonError> {
+    fs::create_dir_all(root).map_err(|_| LadonError::ProcessFailure)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+            .map_err(|_| LadonError::ProcessFailure)?;
+        let metadata = fs::symlink_metadata(root).map_err(|_| LadonError::ProcessFailure)?;
+        // SAFETY: geteuid has no preconditions and no side effects.
+        let owner = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(LadonError::ProcessFailure);
+        }
+    }
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(root)
+        .map_err(|_| LadonError::ProcessFailure)?
+        .file_type()
+        .is_dir()
+    {
+        return Err(LadonError::ProcessFailure);
+    }
+    Ok(())
+}
+
+fn write_run_marker(directory: &Path) -> Result<(), LadonError> {
+    let path = directory.join(RUN_DIRECTORY_MARKER);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut marker = options.open(path).map_err(|_| LadonError::ProcessFailure)?;
+    marker
+        .write_all(Uuid::new_v4().to_string().as_bytes())
+        .and_then(|()| marker.sync_all())
+        .map_err(|_| LadonError::ProcessFailure)
+}
+
+fn cleanup_stale_temp_directories_in(root: &Path) -> Result<(), LadonError> {
+    prepare_temporary_root(root)?;
+    for entry in fs::read_dir(root).map_err(|_| LadonError::ProcessFailure)? {
+        let entry = entry.map_err(|_| LadonError::ProcessFailure)?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(RUN_DIRECTORY_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| LadonError::ProcessFailure)?;
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and no side effects.
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        let marker_path = path.join(RUN_DIRECTORY_MARKER);
+        let Ok(marker_metadata) = fs::symlink_metadata(&marker_path) else {
+            continue;
+        };
+        if !marker_metadata.file_type().is_file() || marker_metadata.len() != 36 {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: geteuid has no preconditions and no side effects.
+            if marker_metadata.uid() != unsafe { libc::geteuid() }
+                || marker_metadata.permissions().mode() & 0o077 != 0
+            {
+                continue;
+            }
+        }
+        let Ok(marker) = fs::read_to_string(&marker_path) else {
+            continue;
+        };
+        if Uuid::parse_str(&marker).is_err() {
+            continue;
+        }
+        fs::remove_dir_all(path).map_err(|_| LadonError::ProcessFailure)?;
+    }
+    Ok(())
 }
 
 fn write_temporary_secret(
@@ -356,39 +474,100 @@ fn configure_process_group(_command: &mut Command) {}
 
 trait ProcessTreeControl: Sized {
     fn attach(child: &mut Child) -> Result<Self, LadonError>;
+    fn finish(
+        &self,
+        child: &mut Child,
+        status: std::process::ExitStatus,
+    ) -> Result<std::process::ExitStatus, LadonError>;
     fn terminate(&self, child: &mut Child) -> Result<std::process::ExitStatus, LadonError>;
 }
 
 #[cfg(unix)]
-struct UnixProcessGroup;
+struct UnixProcessGroup {
+    id: i32,
+}
 
 #[cfg(unix)]
 type PlatformProcessTree = UnixProcessGroup;
 
 #[cfg(unix)]
 impl ProcessTreeControl for UnixProcessGroup {
-    fn attach(_child: &mut Child) -> Result<Self, LadonError> {
-        Ok(Self)
+    fn attach(child: &mut Child) -> Result<Self, LadonError> {
+        Ok(Self {
+            id: i32::try_from(child.id()).map_err(|_| LadonError::ProcessFailure)?,
+        })
+    }
+
+    fn finish(
+        &self,
+        child: &mut Child,
+        status: std::process::ExitStatus,
+    ) -> Result<std::process::ExitStatus, LadonError> {
+        if self.exists()? {
+            self.terminate_with_status(child, Some(status))
+        } else {
+            Ok(status)
+        }
     }
 
     fn terminate(&self, child: &mut Child) -> Result<std::process::ExitStatus, LadonError> {
-        let group = i32::try_from(child.id()).map_err(|_| LadonError::ProcessFailure)?;
-        // SAFETY: negative PID targets the process group created for this child.
-        unsafe {
-            libc::kill(-group, libc::SIGTERM);
-        }
+        self.terminate_with_status(child, None)
+    }
+}
+
+#[cfg(unix)]
+impl UnixProcessGroup {
+    fn terminate_with_status(
+        &self,
+        child: &mut Child,
+        mut status: Option<std::process::ExitStatus>,
+    ) -> Result<std::process::ExitStatus, LadonError> {
+        self.signal(libc::SIGTERM)?;
         let grace_started = Instant::now();
         while grace_started.elapsed() < TERMINATION_GRACE {
-            if let Some(status) = child.try_wait().map_err(|_| LadonError::ProcessFailure)? {
-                return Ok(status);
+            if status.is_none() {
+                status = child.try_wait().map_err(|_| LadonError::ProcessFailure)?;
+            }
+            if status.is_some() && !self.exists()? {
+                return status.ok_or(LadonError::ProcessFailure);
             }
             thread::sleep(POLL_INTERVAL);
         }
-        // SAFETY: negative PID targets the same private process group.
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
+        self.signal(libc::SIGKILL)?;
+        if status.is_none() {
+            status = Some(child.wait().map_err(|_| LadonError::ProcessFailure)?);
         }
-        child.wait().map_err(|_| LadonError::ProcessFailure)
+        let confirmation_started = Instant::now();
+        while self.exists()? {
+            if confirmation_started.elapsed() >= TERMINATION_CONFIRMATION {
+                return Err(LadonError::ProcessFailure);
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        status.ok_or(LadonError::ProcessFailure)
+    }
+
+    fn signal(&self, signal: i32) -> Result<(), LadonError> {
+        // SAFETY: a negative PID targets only the private process group created for this child.
+        if unsafe { libc::kill(-self.id, signal) } == 0 {
+            return Ok(());
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(()),
+            _ => Err(LadonError::ProcessFailure),
+        }
+    }
+
+    fn exists(&self) -> Result<bool, LadonError> {
+        // SAFETY: signal 0 performs an existence/permission check without sending a signal.
+        if unsafe { libc::kill(-self.id, 0) } == 0 {
+            return Ok(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => Err(LadonError::ProcessFailure),
+        }
     }
 }
 
@@ -437,13 +616,31 @@ impl ProcessTreeControl for WindowsJob {
         Ok(job)
     }
 
+    fn finish(
+        &self,
+        _child: &mut Child,
+        status: std::process::ExitStatus,
+    ) -> Result<std::process::ExitStatus, LadonError> {
+        self.terminate_job()?;
+        Ok(status)
+    }
+
     fn terminate(&self, child: &mut Child) -> Result<std::process::ExitStatus, LadonError> {
+        self.terminate_job()?;
+        child.wait().map_err(|_| LadonError::ProcessFailure)
+    }
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn terminate_job(&self) -> Result<(), LadonError> {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         // SAFETY: self owns a valid job handle until Drop and the exit code is application-defined.
         if unsafe { TerminateJobObject(self.0, 1) } == 0 {
-            return Err(LadonError::ProcessFailure);
+            Err(LadonError::ProcessFailure)
+        } else {
+            Ok(())
         }
-        child.wait().map_err(|_| LadonError::ProcessFailure)
     }
 }
 
@@ -467,6 +664,7 @@ fn wait_for_child<T: ProcessTreeControl>(
 ) -> Result<(std::process::ExitStatus, RunTermination), LadonError> {
     loop {
         if let Some(status) = child.try_wait().map_err(|_| LadonError::ProcessFailure)? {
+            let status = process_tree.finish(child, status)?;
             return Ok((status, RunTermination::Exited));
         }
         if cancellation.is_cancelled() {
@@ -544,4 +742,33 @@ fn truncate_utf8(value: &mut String, limit: usize) {
         end -= 1;
     }
     value.truncate(end);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_temp_cleanup_requires_a_valid_private_marker() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("runtime");
+        prepare_temporary_root(&root).unwrap();
+        let valid = root.join("run-valid");
+        fs::create_dir(&valid).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&valid, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write_run_marker(&valid).unwrap();
+        fs::write(valid.join("secret"), b"fake-value").unwrap();
+        let unmarked = root.join("run-unmarked");
+        fs::create_dir(&unmarked).unwrap();
+        fs::write(unmarked.join("keep"), b"not-owned-by-ladon").unwrap();
+
+        cleanup_stale_temp_directories_in(&root).unwrap();
+
+        assert!(!valid.exists());
+        assert!(unmarked.join("keep").exists());
+    }
 }

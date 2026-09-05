@@ -7,6 +7,11 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
@@ -14,6 +19,8 @@ use ladon_core::{
     LadonError, MAX_FRAME_BYTES, RpcRequest, RpcResponse, decode_request_frame,
     decode_response_frame, encode_request_frame, encode_response_frame,
 };
+
+use crate::RunCancellation;
 
 #[derive(Debug)]
 pub struct LocalServer {
@@ -107,15 +114,52 @@ impl LocalServer {
 impl LocalConnection {
     pub(crate) fn serve(
         mut self,
-        handler: impl FnOnce(RpcRequest) -> RpcResponse,
+        handler: impl FnOnce(RpcRequest, RunCancellation) -> RpcResponse,
     ) -> Result<(), LadonError> {
         let frame = read_frame(&mut self.stream)?;
         let request = decode_request_frame(&frame)?;
-        let response = handler(request);
+        let cancellation = RunCancellation::new();
+        let monitor_cancellation = cancellation.clone();
+        let monitor_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&monitor_stop);
+        let mut monitor_stream = self
+            .stream
+            .try_clone()
+            .map_err(|_| LadonError::EndpointUnavailable)?;
+        monitor_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|_| LadonError::EndpointUnavailable)?;
+        let monitor = thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            while !worker_stop.load(Ordering::Acquire) {
+                match monitor_stream.read(&mut byte) {
+                    Ok(0) | Ok(_) => {
+                        monitor_cancellation.cancel();
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        monitor_cancellation.cancel();
+                        break;
+                    }
+                }
+            }
+        });
+        let response = handler(request, cancellation);
         let frame = encode_response_frame(&response)?;
-        self.stream
+        let write_result = self
+            .stream
             .write_all(&frame)
-            .map_err(|_| LadonError::EndpointUnavailable)
+            .map_err(|_| LadonError::EndpointUnavailable);
+        monitor_stop.store(true, Ordering::Release);
+        let _ = monitor.join();
+        write_result
     }
 }
 

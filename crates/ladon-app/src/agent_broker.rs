@@ -25,6 +25,7 @@ const MAX_CONNECTION_WORKERS: usize = 8;
 pub struct LocalBrokerHandle {
     stop: Arc<AtomicBool>,
     cancellation: Arc<Mutex<Option<RunCancellation>>>,
+    run_gate: Arc<Mutex<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -38,13 +39,21 @@ impl LocalBrokerHandle {
         endpoint: impl AsRef<Path>,
     ) -> Result<Self, LadonError> {
         let server = LocalServer::bind(endpoint)?;
+        Supervisor::cleanup_stale_temp_directories()?;
         server.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::new(Mutex::new(None));
+        let run_gate = Arc::new(Mutex::new(()));
         let worker_stop = Arc::clone(&stop);
         let worker_cancellation = Arc::clone(&cancellation);
+        let worker_run_gate = Arc::clone(&run_gate);
         let thread = thread::spawn(move || {
-            let broker = Arc::new(AgentBroker::new(controller, worker_cancellation));
+            let broker = Arc::new(AgentBroker::new(
+                controller,
+                worker_cancellation,
+                worker_run_gate,
+                Arc::clone(&worker_stop),
+            ));
             let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !worker_stop.load(Ordering::Acquire) {
                 let mut index = 0;
@@ -60,7 +69,9 @@ impl LocalBrokerHandle {
                     Ok(Some(connection)) if workers.len() < MAX_CONNECTION_WORKERS => {
                         let broker = Arc::clone(&broker);
                         workers.push(thread::spawn(move || {
-                            let _ = connection.serve(|request| broker.handle(request));
+                            let _ = connection.serve(|request, cancellation| {
+                                broker.handle(request, cancellation)
+                            });
                         }));
                     }
                     Ok(Some(_)) | Ok(None) | Err(_) => thread::sleep(ACCEPT_POLL_INTERVAL),
@@ -74,6 +85,7 @@ impl LocalBrokerHandle {
         Ok(Self {
             stop,
             cancellation,
+            run_gate,
             thread: Some(thread),
         })
     }
@@ -85,12 +97,55 @@ impl LocalBrokerHandle {
             }
         }
     }
+
+    pub fn cancel_active_run_and_wait(&self) -> Result<(), LadonError> {
+        self.cancel_active_run();
+        drop(
+            self.run_gate
+                .lock()
+                .map_err(|_| LadonError::ProcessFailure)?,
+        );
+        Ok(())
+    }
+
+    pub fn cancel_active_run_and_lock(
+        &self,
+        controller: &Arc<Mutex<VaultController>>,
+    ) -> Result<(), LadonError> {
+        self.cancel_active_run();
+        let _run_guard = self
+            .run_gate
+            .lock()
+            .map_err(|_| LadonError::ProcessFailure)?;
+        controller
+            .lock()
+            .map_err(|_| LadonError::ProcessFailure)?
+            .lock();
+        Ok(())
+    }
+
+    pub fn auto_lock_controller_if_idle(
+        &self,
+        controller: &Arc<Mutex<VaultController>>,
+    ) -> Result<bool, LadonError> {
+        let _run_guard = match self.run_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(LadonError::ProcessFailure);
+            }
+        };
+        Ok(controller
+            .lock()
+            .map_err(|_| LadonError::ProcessFailure)?
+            .auto_lock_if_idle())
+    }
 }
 
 impl Drop for LocalBrokerHandle {
     fn drop(&mut self) {
-        self.cancel_active_run();
         self.stop.store(true, Ordering::Release);
+        let _ = self.cancel_active_run_and_wait();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -101,31 +156,39 @@ struct AgentBroker {
     controller: Arc<Mutex<VaultController>>,
     supervisor: Supervisor,
     cancellation: Arc<Mutex<Option<RunCancellation>>>,
-    run_gate: Mutex<()>,
+    run_gate: Arc<Mutex<()>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl AgentBroker {
     fn new(
         controller: Arc<Mutex<VaultController>>,
         cancellation: Arc<Mutex<Option<RunCancellation>>>,
+        run_gate: Arc<Mutex<()>>,
+        shutting_down: Arc<AtomicBool>,
     ) -> Self {
         Self {
             controller,
             supervisor: Supervisor::new(),
             cancellation,
-            run_gate: Mutex::new(()),
+            run_gate,
+            shutting_down,
         }
     }
 
-    fn handle(&self, request: RpcRequest) -> RpcResponse {
+    fn handle(&self, request: RpcRequest, cancellation: RunCancellation) -> RpcResponse {
         let request_id = request.request_id;
-        match self.handle_method(request.method) {
+        match self.handle_method(request.method, cancellation) {
             Ok(result) => RpcResponse::success(request_id, result),
             Err(error) => RpcResponse::error(request_id, error),
         }
     }
 
-    fn handle_method(&self, method: RpcMethod) -> Result<RpcResult, LadonError> {
+    fn handle_method(
+        &self,
+        method: RpcMethod,
+        connection_cancellation: RunCancellation,
+    ) -> Result<RpcResult, LadonError> {
         match method {
             RpcMethod::Status => {
                 let controller = self.controller()?;
@@ -160,6 +223,10 @@ impl AgentBroker {
             }
             RpcMethod::Lock => {
                 self.cancel_active_run();
+                let _run_guard = self
+                    .run_gate
+                    .lock()
+                    .map_err(|_| LadonError::ProcessFailure)?;
                 self.controller()?.lock();
                 Ok(RpcResult::Locked)
             }
@@ -171,6 +238,9 @@ impl AgentBroker {
                 timeout_ms,
                 output_limit_bytes,
             } => {
+                if self.shutting_down.load(Ordering::Acquire) {
+                    return Err(LadonError::EndpointUnavailable);
+                }
                 let _run_guard = self.run_gate.try_lock().map_err(|error| match error {
                     std::sync::TryLockError::WouldBlock => LadonError::Busy,
                     std::sync::TryLockError::Poisoned(_) => LadonError::ProcessFailure,
@@ -186,11 +256,14 @@ impl AgentBroker {
                     },
                     RunCaller::Cli,
                 )?;
-                let cancellation = RunCancellation::new();
+                let cancellation = connection_cancellation;
                 self.set_cancellation(Some(cancellation.clone()))?;
                 let result = self.supervisor.run(validated, cancellation, |bindings| {
                     self.controller()?.resolve_bindings(bindings)
                 });
+                if let Ok(mut controller) = self.controller.lock() {
+                    controller.record_secret_activity();
+                }
                 self.set_cancellation(None)?;
                 let result = result?;
                 Ok(RpcResult::Run {
@@ -201,6 +274,7 @@ impl AgentBroker {
                     duration_ms: duration_millis(result.duration),
                     redaction_count: result.redaction_count,
                     output_truncated: result.output_truncated || result.output_suppressed,
+                    temp_cleanup_warning: result.temp_cleanup_warning,
                 })
             }
         }

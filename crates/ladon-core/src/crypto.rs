@@ -22,6 +22,11 @@ const TAG_BYTES: usize = 16;
 const WRAPPED_DEK_BYTES: usize = KEY_BYTES + TAG_BYTES;
 const WRAPPER_BYTES: usize = NONCE_BYTES + WRAPPED_DEK_BYTES;
 const PAYLOAD_FIXED_BYTES: usize = 8 + NONCE_BYTES + TAG_BYTES;
+pub const MAX_VAULT_FILE_BYTES: usize = FIXED_PREFIX_BYTES
+    + MAX_HEADER_BYTES
+    + WRAPPER_BYTES
+    + PAYLOAD_FIXED_BYTES
+    + MAX_VAULT_PAYLOAD_BYTES;
 const DEK_DOMAIN: &[u8] = b"ladon/dek/v1";
 const PAYLOAD_DOMAIN: &[u8] = b"ladon/payload/v1";
 

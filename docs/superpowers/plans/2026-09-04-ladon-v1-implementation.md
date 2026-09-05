@@ -241,7 +241,7 @@ and drop, quick PIN, and screen-lock integration remain open release work.
 - Modify: files identified by review
 - Create: `docs/security-review.md`
 
-- [ ] Have an independent reviewer inspect cryptography, serialization, IPC authorization, runner cleanup, secret lifetime, and every agent-facing output against the spec.
+- [x] Have an independent reviewer inspect cryptography, serialization, IPC authorization, runner cleanup, secret lifetime, and every agent-facing output against the spec.
 - [ ] Convert each confirmed issue into a failing regression test before fixing it.
 - [ ] Re-run the complete verification matrix on the exact release tree; expect pass on macOS, Windows, and Linux.
 - [ ] Confirm every acceptance criterion in section 15 with a link to a test or documented manual check; do not promote while any criterion is unverified.

@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     io::{self, Read, Write},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -142,8 +143,8 @@ fn redacts_all_child_output_before_returning_it() {
 
     assert!(!result.stdout.contains("environment-secret"));
     assert!(!result.stderr.contains("environment-secret"));
-    assert!(result.stdout.contains("[REDACTED:"));
-    assert!(result.stderr.contains("[REDACTED:"));
+    assert!(result.stdout.contains("[REDACTED]"));
+    assert!(result.stderr.contains("[REDACTED]"));
     assert!(result.redaction_count >= 2);
 }
 
@@ -176,6 +177,52 @@ fn explicit_cancellation_terminates_the_process_group() {
 
     let result = worker.join().unwrap();
     assert_eq!(result.termination, RunTermination::Cancelled);
+}
+
+#[test]
+#[cfg(unix)]
+fn normal_parent_exit_terminates_background_descendants() {
+    let (run, resolved) = validated(
+        "fixture_background_descendant",
+        vec![binding(
+            "descendant-secret",
+            "value",
+            BindingTarget::Environment {
+                name: "LADON_TEST_ENV".to_owned(),
+            },
+        )],
+        vec![("", "value", ENV_VALUE)],
+        10_000,
+    );
+
+    let result = Supervisor::new()
+        .run(run, RunCancellation::new(), |_| Ok(resolved))
+        .unwrap();
+
+    assert_eq!(result.termination, RunTermination::Exited);
+    assert!(result.duration < Duration::from_secs(3));
+    assert!(result.stdout.contains("descendant-started"));
+}
+
+#[test]
+#[cfg(unix)]
+fn cancellation_escalates_until_term_ignoring_descendants_are_dead() {
+    let supervisor = Arc::new(Supervisor::new());
+    let cancellation = RunCancellation::new();
+    let worker_control = cancellation.clone();
+    let worker_supervisor = Arc::clone(&supervisor);
+    let worker = thread::spawn(move || {
+        let (run, resolved) = validated("fixture_term_ignoring_tree", vec![], vec![], 10_000);
+        worker_supervisor
+            .run(run, worker_control, |_| Ok(resolved))
+            .unwrap()
+    });
+    thread::sleep(Duration::from_millis(500));
+    cancellation.cancel();
+
+    let result = worker.join().unwrap();
+    assert_eq!(result.termination, RunTermination::Cancelled);
+    assert!(result.duration < Duration::from_secs(3));
 }
 
 #[test]
@@ -290,4 +337,44 @@ fn fixture_duplex_io() {
     let mut stdin = Vec::new();
     io::stdin().read_to_end(&mut stdin).unwrap();
     println!("\nstdin-len={}", stdin.len());
+}
+
+#[test]
+#[ignore]
+#[allow(clippy::zombie_processes)] // The supervisor-under-test must adopt containment duties.
+fn fixture_background_descendant() {
+    Command::new(env::current_exe().unwrap())
+        .args(fixture_arguments("fixture_descendant_sleep"))
+        .spawn()
+        .unwrap();
+    println!("descendant-started");
+}
+
+#[test]
+#[ignore]
+fn fixture_descendant_sleep() {
+    assert_eq!(env::var("LADON_TEST_ENV").unwrap().as_bytes(), ENV_VALUE);
+    thread::sleep(Duration::from_secs(5));
+}
+
+#[test]
+#[ignore]
+#[allow(clippy::zombie_processes)] // The supervisor-under-test must kill the orphaned fixture.
+fn fixture_term_ignoring_tree() {
+    Command::new(env::current_exe().unwrap())
+        .args(fixture_arguments("fixture_term_ignoring_descendant"))
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(5));
+}
+
+#[test]
+#[ignore]
+#[cfg(unix)]
+fn fixture_term_ignoring_descendant() {
+    // SAFETY: SIG_IGN is a valid signal disposition and this fixture has one test-only thread.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    thread::sleep(Duration::from_secs(5));
 }

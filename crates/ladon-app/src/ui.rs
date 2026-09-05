@@ -304,13 +304,20 @@ impl VaultController {
             return Err(LadonError::InvalidRequest);
         }
         match self.store.open(&passphrase.to_sensitive_bytes())? {
-            VaultOpen::Primary { vault, .. } => {
-                self.state = ManagedVault::Unlocked(VaultSession::new(
-                    vault,
-                    SessionActivity {
-                        last: Instant::now(),
-                    },
-                ));
+            VaultOpen::Primary {
+                vault,
+                newer_backup,
+            } => {
+                if let Some(backup) = newer_backup {
+                    self.state = ManagedVault::RecoveryRequired(backup);
+                } else {
+                    self.state = ManagedVault::Unlocked(VaultSession::new(
+                        vault,
+                        SessionActivity {
+                            last: Instant::now(),
+                        },
+                    ));
+                }
             }
             VaultOpen::RestoreRequired { backup } => {
                 self.state = ManagedVault::RecoveryRequired(backup);
@@ -379,7 +386,7 @@ impl VaultController {
         bindings: &[ValidatedSecretBinding],
     ) -> Result<Vec<ResolvedSecretBinding>, LadonError> {
         let ManagedVault::Unlocked(session) = &mut self.state else {
-            return Err(LadonError::VaultUnavailable);
+            return Err(LadonError::VaultLocked);
         };
         let metadata = session.list();
         bindings
@@ -399,6 +406,12 @@ impl VaultController {
                 ResolvedSecretBinding::new(&id.to_string(), binding.field().as_str(), value)
             })
             .collect()
+    }
+
+    pub fn record_secret_activity(&mut self) {
+        if let ManagedVault::Unlocked(session) = &mut self.state {
+            session.record_activity();
+        }
     }
 
     #[must_use]

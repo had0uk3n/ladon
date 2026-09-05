@@ -214,7 +214,9 @@ impl LadonError {
             Self::UnsafeEndpoint => "local endpoint failed security checks",
             Self::EndpointUnavailable => "local Ladon endpoint is unavailable",
             Self::InvalidPeer => "local IPC peer is not the current user",
-            Self::InvalidPassphrase => "passphrase must match and contain 12 to 1024 characters",
+            Self::InvalidPassphrase => {
+                "passphrase must match, contain at least 12 Unicode characters, and use at most 1024 UTF-8 bytes"
+            }
             Self::IntegrationFailure => "coding-agent integration configuration failed",
         }
     }

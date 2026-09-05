@@ -35,6 +35,10 @@ impl<A: ActivitySink> VaultSession<A> {
         &self.activity
     }
 
+    pub fn record_activity(&mut self) {
+        self.activity.secret_activity();
+    }
+
     #[must_use]
     pub fn list(&self) -> Vec<SecretMetadata> {
         self.vault

@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{fs, time::Duration};
 
 use ladon_app::{
     AddSecretDraft, ClipboardLease, PendingRequestView, RevealLease, SensitiveText,
     VaultController, VaultUiPhase, validate_new_passphrase,
 };
-use ladon_core::SensitiveBytes;
+use ladon_core::{SecretId, SensitiveBytes, VaultPayload, VaultStore, create_vault};
 
 #[test]
 fn first_run_requires_matching_passphrases_with_twelve_unicode_scalars() {
@@ -95,4 +95,29 @@ fn vault_controller_persists_a_new_secret_and_locks_cleanly() {
     let id = reopened.secrets()[0].id;
     reopened.delete_secret(id).unwrap();
     assert!(reopened.secrets().is_empty());
+}
+
+#[test]
+fn vault_controller_requires_recovery_when_backup_is_newer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vault.ladon");
+    let store = VaultStore::new(path.clone());
+    let password = SensitiveBytes::new(b"correct horse".to_vec());
+    let vault_id = SecretId::new();
+    let old = create_vault(VaultPayload::new(vault_id, 1, vec![]).unwrap(), &password)
+        .unwrap()
+        .1;
+    let newer = create_vault(VaultPayload::new(vault_id, 2, vec![]).unwrap(), &password)
+        .unwrap()
+        .1;
+    fs::write(&path, old).unwrap();
+    fs::write(store.backup_path(), newer).unwrap();
+
+    let passphrase = SensitiveText::from("correct horse");
+    let mut controller = VaultController::new(path);
+    controller.unlock(&passphrase).unwrap();
+
+    assert_eq!(controller.phase(), VaultUiPhase::RecoveryRequired);
+    controller.restore_backup().unwrap();
+    assert_eq!(controller.phase(), VaultUiPhase::Unlocked);
 }

@@ -1,5 +1,6 @@
 use std::{
     env,
+    fs::{self, File, OpenOptions},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -36,12 +37,17 @@ pub fn run_desktop() -> Result<(), &'static str> {
     eframe::run_native(
         "Ladon",
         options,
-        Box::new(move |context| Ok(Box::new(LadonDesktop::new(context, path)))),
+        Box::new(move |context| {
+            let app = LadonDesktop::new(context, path)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|_| "Ladon could not open its native window")
 }
 
 struct LadonDesktop {
+    _instance_lock: InstanceLock,
     controller: Arc<Mutex<VaultController>>,
     #[cfg(unix)]
     broker: Option<LocalBrokerHandle>,
@@ -59,33 +65,24 @@ struct Notice {
 }
 
 impl LadonDesktop {
-    fn new(context: &eframe::CreationContext<'_>, path: PathBuf) -> Self {
+    fn new(context: &eframe::CreationContext<'_>, path: PathBuf) -> Result<Self, LadonError> {
         configure_style(&context.egui_ctx);
+        let instance_lock = InstanceLock::acquire(&path)?;
         let controller = Arc::new(Mutex::new(VaultController::new(path)));
         #[cfg(unix)]
-        let (broker, notice) = match LocalBrokerHandle::start(Arc::clone(&controller)) {
-            Ok(broker) => (Some(broker), None),
-            Err(error) => (
-                None,
-                Some(Notice {
-                    text: error.safe_message(),
-                    danger: true,
-                }),
-            ),
-        };
-        #[cfg(not(unix))]
-        let notice = None;
-        Self {
+        let broker = Some(LocalBrokerHandle::start(Arc::clone(&controller))?);
+        Ok(Self {
+            _instance_lock: instance_lock,
             controller,
             #[cfg(unix)]
             broker,
             passphrase: SensitiveText::default(),
             confirmation: SensitiveText::default(),
             draft: AddSecretDraft::new(),
-            notice,
+            notice: None,
             selected: None,
             pending_delete: None,
-        }
+        })
     }
 
     fn show_first_run(&mut self, ui: &mut egui::Ui) {
@@ -143,7 +140,7 @@ impl LadonDesktop {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "The primary file could not be opened. Ladon found an authenticated backup.",
+                    "Ladon found an authenticated backup that is newer or safer to restore.",
                 )
                 .color(MUTED),
             );
@@ -174,16 +171,25 @@ impl LadonDesktop {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if quiet_button(ui, "Lock now").clicked() {
                             #[cfg(unix)]
-                            if let Some(broker) = &self.broker {
-                                broker.cancel_active_run();
-                            }
-                            let _ = with_controller(&self.controller, |controller| {
+                            let result = if let Some(broker) = &self.broker {
+                                broker.cancel_active_run_and_lock(&self.controller)
+                            } else {
+                                with_controller(&self.controller, |controller| {
+                                    controller.lock();
+                                    Ok(())
+                                })
+                            };
+                            #[cfg(not(unix))]
+                            let result = with_controller(&self.controller, |controller| {
                                 controller.lock();
                                 Ok(())
                             });
-                            self.selected = None;
-                            self.pending_delete = None;
-                            self.notice = None;
+                            if result.is_ok() {
+                                self.clear_sensitive_state();
+                                self.notice = None;
+                            } else {
+                                self.notice_from(result, "Vault locked");
+                            }
                         }
                     });
                 });
@@ -222,11 +228,11 @@ impl LadonDesktop {
                                 ui.add_space(10.0);
                                 ui.vertical(|ui| {
                                     field_label(ui, "Secret value");
-                                    ui.add(
-                                        TextEdit::singleline(field.value_mut())
-                                            .password(true)
-                                            .hint_text("kept out of chat and command arguments")
-                                            .desired_width(350.0),
+                                    sensitive_text_field(
+                                        ui,
+                                        field.value_mut(),
+                                        "kept out of chat and command arguments",
+                                        350.0,
                                     );
                                 });
                             });
@@ -366,6 +372,13 @@ impl LadonDesktop {
         self.confirmation.clear();
     }
 
+    fn clear_sensitive_state(&mut self) {
+        self.clear_unlock_fields();
+        self.draft = AddSecretDraft::new();
+        self.selected = None;
+        self.pending_delete = None;
+    }
+
     fn notice_from(&mut self, result: Result<(), LadonError>, success: &'static str) {
         self.notice = Some(match result {
             Ok(()) => Notice {
@@ -387,19 +400,122 @@ impl LadonDesktop {
     }
 }
 
+struct InstanceLock {
+    file: File,
+}
+
+impl InstanceLock {
+    fn acquire(vault_path: &std::path::Path) -> Result<Self, LadonError> {
+        let parent = vault_path.parent().ok_or(LadonError::StorageFailure)?;
+        fs::create_dir_all(parent).map_err(|_| LadonError::StorageFailure)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|_| LadonError::StorageFailure)?;
+        }
+        let path = parent.join(".instance.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path).map_err(|_| LadonError::StorageFailure)?;
+        lock_instance_file(&file)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        unlock_instance_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn lock_instance_file(file: &File) -> Result<(), LadonError> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: file owns a valid descriptor for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Err(LadonError::AlreadyRunning),
+        _ => Err(LadonError::StorageFailure),
+    }
+}
+
+#[cfg(unix)]
+fn unlock_instance_file(file: &File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: file owns a valid descriptor for the duration of the call.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[cfg(windows)]
+fn lock_instance_file(file: &File) -> Result<(), LadonError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::ERROR_LOCK_VIOLATION,
+        Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
+        System::IO::OVERLAPPED,
+    };
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: file owns a valid handle and overlapped remains alive for the synchronous call.
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == ERROR_LOCK_VIOLATION as i32 => Err(LadonError::AlreadyRunning),
+        _ => Err(LadonError::StorageFailure),
+    }
+}
+
+#[cfg(windows)]
+fn unlock_instance_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Storage::FileSystem::UnlockFileEx, System::IO::OVERLAPPED};
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: file owns a valid handle and overlapped remains alive for the synchronous call.
+    unsafe {
+        UnlockFileEx(file.as_raw_handle().cast(), 0, 1, 0, &mut overlapped);
+    }
+}
+
 impl eframe::App for LadonDesktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(unix)]
+        let auto_locked = if let Some(broker) = &self.broker {
+            broker
+                .auto_lock_controller_if_idle(&self.controller)
+                .unwrap_or(false)
+        } else {
+            with_controller(&self.controller, |controller| {
+                Ok(controller.auto_lock_if_idle())
+            })
+            .unwrap_or(false)
+        };
+        #[cfg(not(unix))]
         let auto_locked = with_controller(&self.controller, |controller| {
             Ok(controller.auto_lock_if_idle())
         })
         .unwrap_or(false);
         if auto_locked {
-            #[cfg(unix)]
-            if let Some(broker) = &self.broker {
-                broker.cancel_active_run();
-            }
-            self.selected = None;
-            self.pending_delete = None;
+            self.clear_sensitive_state();
             self.notice = Some(Notice {
                 text: "Vault locked after 30 minutes without secret activity",
                 danger: false,
@@ -419,14 +535,20 @@ impl eframe::App for LadonDesktop {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         #[cfg(unix)]
-        if let Some(broker) = &self.broker {
-            broker.cancel_active_run();
-        }
+        let _ = if let Some(broker) = &self.broker {
+            broker.cancel_active_run_and_lock(&self.controller)
+        } else {
+            with_controller(&self.controller, |controller| {
+                controller.lock();
+                Ok(())
+            })
+        };
+        #[cfg(not(unix))]
         let _ = with_controller(&self.controller, |controller| {
             controller.lock();
             Ok(())
         });
-        self.clear_unlock_fields();
+        self.clear_sensitive_state();
     }
 }
 
@@ -473,12 +595,25 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 }
 
 fn password_field(ui: &mut egui::Ui, value: &mut SensitiveText, hint: &str) -> egui::Response {
-    ui.add(
-        TextEdit::singleline(value)
-            .password(true)
-            .hint_text(hint)
-            .desired_width(430.0),
-    )
+    sensitive_text_field(ui, value, hint, 430.0)
+}
+
+fn sensitive_text_field(
+    ui: &mut egui::Ui,
+    value: &mut SensitiveText,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    let mut output = TextEdit::singleline(value)
+        .password(true)
+        .hint_text(hint)
+        .desired_width(width)
+        .show(ui);
+    // egui stores ordinary Strings for undo. Password mode blocks copy/accessibility output,
+    // and clearing the undoer immediately prevents those copies surviving in widget state.
+    output.state.clear_undoer();
+    output.state.store(ui.ctx(), output.response.id);
+    output.response
 }
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -521,4 +656,43 @@ fn default_vault_path() -> Option<PathBuf> {
     });
 
     base.map(|base| base.join("Ladon").join("vault.ladon"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_instance_lock_is_exclusive_and_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.ladon");
+        let first = InstanceLock::acquire(&path).unwrap();
+        assert!(matches!(
+            InstanceLock::acquire(&path),
+            Err(LadonError::AlreadyRunning)
+        ));
+        drop(first);
+        assert!(InstanceLock::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn sensitive_widget_does_not_retain_undo_history() {
+        let context = egui::Context::default();
+        let mut value = SensitiveText::from("fake-passphrase-value");
+        let mut widget_id = None;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                widget_id = Some(sensitive_text_field(ui, &mut value, "Passphrase", 300.0).id);
+            });
+        });
+        let state = TextEdit::load_state(&context, widget_id.unwrap()).unwrap();
+        let current = (
+            state.cursor.char_range().unwrap_or_default(),
+            value.as_str().to_owned(),
+        );
+        let undoer = state.undoer();
+
+        assert!(!undoer.has_undo(&current));
+        assert!(!undoer.is_in_flux());
+    }
 }

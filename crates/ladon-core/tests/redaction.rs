@@ -45,11 +45,7 @@ fn redacts_raw_json_percent_hex_and_base64_representations() {
     assert!(!output.text.contains("ab\" /z"));
     assert!(!output.text.contains("616222202f7a"));
     assert!(!output.text.contains(&base64));
-    assert!(
-        output
-            .text
-            .contains("[REDACTED:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.value]")
-    );
+    assert!(output.text.contains("[REDACTED]"));
     assert!(output.redaction_count >= 7);
 }
 
@@ -65,10 +61,7 @@ fn finds_secrets_split_across_every_chunk_boundary() {
                 value,
             )],
         );
-        assert_eq!(
-            output.text, "[REDACTED:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.token]",
-            "split {split}"
-        );
+        assert_eq!(output.text, "[REDACTED]", "split {split}");
     }
 }
 
@@ -82,10 +75,7 @@ fn chooses_longest_overlapping_secret_at_the_same_position() {
         ],
     );
 
-    assert_eq!(
-        output.text,
-        "[REDACTED:dddddddd-dddd-4ddd-8ddd-dddddddddddd.long]"
-    );
+    assert_eq!(output.text, "[REDACTED]");
     assert_eq!(output.redaction_count, 1);
 }
 
@@ -115,10 +105,42 @@ fn escapes_invalid_utf8_only_after_redaction() {
         )],
     );
 
-    assert_eq!(
-        output.text,
-        "ok:\\xff secret=[REDACTED:ffffffff-ffff-4fff-8fff-ffffffffffff.value]"
-    );
+    assert_eq!(output.text, "ok:\\xff secret=[REDACTED]");
+}
+
+#[test]
+fn generated_text_never_reintroduces_a_managed_value() {
+    for (field, value) in [
+        ("value", b"value".as_slice()),
+        ("token", b"aaaaaaaa".as_slice()),
+        ("token", b"REDACTED".as_slice()),
+    ] {
+        let output = redact(
+            &[value],
+            vec![secret("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", field, value)],
+        );
+        assert!(
+            !output
+                .text
+                .as_bytes()
+                .windows(value.len())
+                .any(|part| part == value)
+        );
+    }
+
+    let mut redactor = StreamingRedactor::new(
+        vec![secret(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "token",
+            b"omitted",
+        )],
+        128,
+    )
+    .unwrap();
+    redactor.push(&vec![b'x'; 300]);
+    let output = redactor.finish();
+    assert!(output.suppressed);
+    assert!(output.text.is_empty());
 }
 
 #[test]

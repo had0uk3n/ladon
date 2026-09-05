@@ -9,23 +9,21 @@ use crate::{FieldName, LadonError, SecretId, SensitiveBytes};
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 pub const MAX_OUTPUT_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 pub const MIN_OUTPUT_LIMIT_BYTES: usize = 128;
+const REDACTION_MARKER: &str = "[REDACTED]";
 
 pub struct RedactionSecret {
-    id: SecretId,
-    field: FieldName,
     value: SensitiveBytes,
 }
 
 impl RedactionSecret {
     #[must_use]
-    pub const fn new(id: SecretId, field: FieldName, value: SensitiveBytes) -> Self {
-        Self { id, field, value }
+    pub fn new(_id: SecretId, _field: FieldName, value: SensitiveBytes) -> Self {
+        Self { value }
     }
 }
 
 struct Pattern {
     needle: SensitiveBytes,
-    marker: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -41,6 +39,7 @@ pub struct StreamingRedactor {
     patterns: Vec<Pattern>,
     maximum_pattern_bytes: usize,
     pending: Zeroizing<Vec<u8>>,
+    marker: &'static str,
     utf8: Utf8Escaper,
     capture: BoundedCapture,
     redaction_count: u64,
@@ -59,7 +58,6 @@ impl StreamingRedactor {
         let mut patterns = Vec::new();
         let mut suppressed = false;
         for secret in secrets {
-            let marker = format!("[REDACTED:{}.{}]", secret.id, secret.field.as_str());
             secret.value.expose(|value| {
                 if value.is_empty() {
                     return;
@@ -67,40 +65,32 @@ impl StreamingRedactor {
                 if value.len() < 4 {
                     suppressed = true;
                 }
-                add_pattern(&mut patterns, value.to_vec(), &marker);
-                add_pattern(&mut patterns, encode_hex(value, false), &marker);
-                add_pattern(&mut patterns, encode_hex(value, true), &marker);
+                add_pattern(&mut patterns, value.to_vec());
+                add_pattern(&mut patterns, encode_hex(value, false));
+                add_pattern(&mut patterns, encode_hex(value, true));
                 add_pattern(
                     &mut patterns,
                     general_purpose::STANDARD.encode(value).into_bytes(),
-                    &marker,
                 );
                 add_pattern(
                     &mut patterns,
                     general_purpose::STANDARD_NO_PAD.encode(value).into_bytes(),
-                    &marker,
                 );
                 add_pattern(
                     &mut patterns,
                     general_purpose::URL_SAFE.encode(value).into_bytes(),
-                    &marker,
                 );
                 add_pattern(
                     &mut patterns,
                     general_purpose::URL_SAFE_NO_PAD.encode(value).into_bytes(),
-                    &marker,
                 );
                 if let Ok(text) = std::str::from_utf8(value) {
                     if let Ok(json) = serde_json::to_string(text) {
                         let json = Zeroizing::new(json);
-                        add_pattern(
-                            &mut patterns,
-                            json.as_bytes()[1..json.len() - 1].to_vec(),
-                            &marker,
-                        );
+                        add_pattern(&mut patterns, json.as_bytes()[1..json.len() - 1].to_vec());
                     }
-                    add_pattern(&mut patterns, percent_encode(value, false), &marker);
-                    add_pattern(&mut patterns, percent_encode(value, true), &marker);
+                    add_pattern(&mut patterns, percent_encode(value, false));
+                    add_pattern(&mut patterns, percent_encode(value, true));
                 }
             });
         }
@@ -110,11 +100,17 @@ impl StreamingRedactor {
             .map(|pattern| pattern.needle.len())
             .max()
             .unwrap_or(1);
+        let marker = if contains_pattern(REDACTION_MARKER.as_bytes(), &patterns) {
+            ""
+        } else {
+            REDACTION_MARKER
+        };
 
         Ok(Self {
             patterns,
             maximum_pattern_bytes,
             pending: Zeroizing::new(Vec::new()),
+            marker,
             utf8: Utf8Escaper::default(),
             capture: BoundedCapture::new(output_limit_bytes),
             redaction_count: 0,
@@ -144,6 +140,15 @@ impl StreamingRedactor {
         self.process(true);
         self.utf8.finish(&mut self.capture);
         let (text, truncated, omitted_bytes) = self.capture.finish();
+        if contains_pattern(text.as_bytes(), &self.patterns) {
+            return RedactedOutput {
+                text: String::new(),
+                redaction_count: self.redaction_count,
+                truncated,
+                omitted_bytes,
+                suppressed: true,
+            };
+        }
         RedactedOutput {
             text,
             redaction_count: self.redaction_count,
@@ -174,13 +179,21 @@ impl StreamingRedactor {
             };
             self.utf8.push(&buffer[position..start], &mut self.capture);
             let pattern = &self.patterns[pattern_index];
-            self.utf8.push(pattern.marker.as_bytes(), &mut self.capture);
+            self.utf8.push(self.marker.as_bytes(), &mut self.capture);
             position = start + pattern.needle.len();
             self.redaction_count = self.redaction_count.saturating_add(1);
         }
 
         self.pending.extend_from_slice(&buffer[position..]);
     }
+}
+
+fn contains_pattern(haystack: &[u8], patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|pattern| {
+        pattern
+            .needle
+            .expose(|needle| memmem::find(haystack, needle).is_some())
+    })
 }
 
 fn find_next(
@@ -216,7 +229,7 @@ fn find_next(
     best
 }
 
-fn add_pattern(patterns: &mut Vec<Pattern>, bytes: Vec<u8>, marker: &str) {
+fn add_pattern(patterns: &mut Vec<Pattern>, bytes: Vec<u8>) {
     let needle = SensitiveBytes::new(bytes);
     if needle.is_empty()
         || patterns.iter().any(|pattern| {
@@ -227,10 +240,7 @@ fn add_pattern(patterns: &mut Vec<Pattern>, bytes: Vec<u8>, marker: &str) {
     {
         return;
     }
-    patterns.push(Pattern {
-        needle,
-        marker: marker.to_owned(),
-    });
+    patterns.push(Pattern { needle });
 }
 
 fn encode_hex(value: &[u8], uppercase: bool) -> Vec<u8> {

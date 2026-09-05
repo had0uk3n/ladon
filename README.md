@@ -97,6 +97,9 @@ Secret names, field names, executable paths, arguments, and working directories
 are metadata visible to the agent. Do not put secret material in those names or
 arguments.
 
+The current preview does not open an approval dialog for a locked agent request.
+It returns `vault_locked`; unlock Ladon in the local GUI and retry the request.
+
 ## Security boundary
 
 Ladon primarily prevents accidental disclosure into chat, shell history,

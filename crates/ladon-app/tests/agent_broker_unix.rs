@@ -1,13 +1,17 @@
 #![cfg(unix)]
 
 use std::{
+    io::Write,
+    os::unix::net::UnixStream,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ladon_app::{AddSecretDraft, LocalBrokerHandle, LocalClient, SensitiveText, VaultController};
-use ladon_core::{BindingTarget, RpcMethod, RpcRequest, RpcResult, SecretBindingRequest};
+use ladon_core::{
+    BindingTarget, RpcMethod, RpcRequest, RpcResult, SecretBindingRequest, encode_request_frame,
+};
 use uuid::Uuid;
 
 #[test]
@@ -58,14 +62,17 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
         panic!("expected run response: {:?}", run.error_details());
     };
     assert!(!stdout.contains("fake-broker-secret"));
-    assert!(stdout.contains("[REDACTED:"));
+    assert!(stdout.contains("[REDACTED]"));
     assert!(*redaction_count >= 1);
 
     let run_client = client.clone();
     let running = thread::spawn(move || {
         run_client.call(&request(RpcMethod::Run {
             executable: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "sleep 5".to_owned()],
+            arguments: vec![
+                "-c".to_owned(),
+                "trap '' TERM; while :; do sleep 1; done".to_owned(),
+            ],
             working_directory: "/tmp".to_owned(),
             bindings: vec![SecretBindingRequest {
                 secret_ref: "test-token".to_owned(),
@@ -79,8 +86,10 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
         }))
     });
     thread::sleep(Duration::from_millis(100));
+    let lock_started = Instant::now();
     let lock = client.call(&request(RpcMethod::Lock)).unwrap();
     assert!(matches!(lock.result(), Some(RpcResult::Locked)));
+    assert!(lock_started.elapsed() >= Duration::from_millis(400));
     let run = running.join().unwrap().unwrap();
     let Some(RpcResult::Run { termination, .. }) = run.result() else {
         panic!("expected cancelled run response");
@@ -92,6 +101,63 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
         locked_use.error_details(),
         Some(("vault_locked", "vault is locked"))
     );
+}
+
+#[test]
+fn disconnecting_the_client_cancels_its_secret_bearing_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let passphrase = SensitiveText::from("correct horse");
+    let mut controller = VaultController::new(directory.path().join("vault.ladon"));
+    controller.create(&passphrase, &passphrase).unwrap();
+    let mut draft = AddSecretDraft::new();
+    draft.set_name("test-token");
+    draft.fields_mut()[0].value_mut().push_str("fake-secret");
+    controller.add_secret(&mut draft).unwrap();
+
+    let endpoint = directory.path().join("broker.sock");
+    let _server = LocalBrokerHandle::start_at(Arc::new(Mutex::new(controller)), &endpoint).unwrap();
+    let runaway = request(RpcMethod::Run {
+        executable: "/bin/sh".to_owned(),
+        arguments: vec![
+            "-c".to_owned(),
+            "trap '' TERM; while :; do sleep 1; done".to_owned(),
+        ],
+        working_directory: "/tmp".to_owned(),
+        bindings: vec![SecretBindingRequest {
+            secret_ref: "test-token".to_owned(),
+            field: "value".to_owned(),
+            target: BindingTarget::Environment {
+                name: "TOKEN".to_owned(),
+            },
+        }],
+        timeout_ms: 5_000,
+        output_limit_bytes: 64 * 1024,
+    });
+    let mut abandoned = UnixStream::connect(&endpoint).unwrap();
+    abandoned
+        .write_all(&encode_request_frame(&runaway).unwrap())
+        .unwrap();
+    drop(abandoned);
+    thread::sleep(Duration::from_secs(1));
+
+    let client = LocalClient::new(&endpoint);
+    let replacement = client
+        .call(&request(RpcMethod::Run {
+            executable: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "printf replacement-finished".to_owned()],
+            working_directory: "/tmp".to_owned(),
+            bindings: vec![SecretBindingRequest {
+                secret_ref: "test-token".to_owned(),
+                field: "value".to_owned(),
+                target: BindingTarget::Environment {
+                    name: "TOKEN".to_owned(),
+                },
+            }],
+            timeout_ms: 5_000,
+            output_limit_bytes: 64 * 1024,
+        }))
+        .unwrap();
+    assert!(matches!(replacement.result(), Some(RpcResult::Run { .. })));
 }
 
 fn request(method: RpcMethod) -> RpcRequest {

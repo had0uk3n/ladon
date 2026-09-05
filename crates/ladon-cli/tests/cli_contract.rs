@@ -23,11 +23,12 @@ impl RpcTransport for FakeTransport {
             RpcResult::Run {
                 exit_code: Some(0),
                 termination: "exited".to_owned(),
-                stdout: "ok [REDACTED:test.value]".to_owned(),
+                stdout: "ok [REDACTED]".to_owned(),
                 stderr: String::new(),
                 duration_ms: 10,
                 redaction_count: 1,
                 output_truncated: false,
+                temp_cleanup_warning: false,
             },
         ))
     }

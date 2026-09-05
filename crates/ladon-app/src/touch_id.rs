@@ -11,6 +11,19 @@ impl TouchIdAuthenticator {
     pub fn authenticate(reason: &str) -> Result<(), LadonError> {
         platform::authenticate(reason)
     }
+
+    pub fn authenticate_secret(secret_name: &str) -> Result<(), LadonError> {
+        let escaped_name = crate::ui::sanitize_untrusted(secret_name);
+        Self::authenticate(&format!(
+            "Unlock Ladon secret “{escaped_name}” for viewing and editing"
+        ))
+    }
+
+    pub fn authenticate_agent_session() -> Result<(), LadonError> {
+        Self::authenticate(
+            "Allow this agent session to use the displayed Ladon secrets for 30 minutes",
+        )
+    }
 }
 
 #[cfg(target_os = "macos")]

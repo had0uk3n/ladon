@@ -10,14 +10,16 @@ use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
     Vec2,
 };
-use ladon_core::{LadonError, SecretId};
+use ladon_core::{LadonError, SecretId, SecretMetadata};
 
 #[cfg(unix)]
 use crate::LocalBrokerHandle;
 use crate::{
-    AddSecretDraft, PendingRequestView, SensitiveText, SessionPin, Supervisor,
+    AddSecretDraft, DetailMode, NavigationResult, NavigationTarget, PendingRequestView,
+    PinVerification, SecretDetailState, SensitiveText, SessionConfirmation, SessionPin, Supervisor,
     TouchIdAuthenticator, VaultController, VaultUiPhase,
 };
+use crate::{EditableValue, ui::ReadOnlySensitiveText};
 
 const CANVAS: Color32 = Color32::from_rgb(244, 247, 251);
 const INK: Color32 = Color32::from_rgb(23, 35, 60);
@@ -58,29 +60,55 @@ struct LadonDesktop {
     confirmation: SensitiveText,
     session_pin: SensitiveText,
     session_pin_confirmation: SensitiveText,
-    approval_pin: SensitiveText,
-    session_authentication: Option<SessionAuthentication>,
-    touch_id_available: bool,
+    local_pin: SensitiveText,
+    session_confirmation: Option<SessionConfirmation>,
     focused_approval: Option<uuid::Uuid>,
     draft: AddSecretDraft,
     notice: Option<Notice>,
-    selected: Option<SecretId>,
+    detail: SecretDetailState,
+    unlock_confirmation: bool,
+    discard_confirmation: bool,
     pending_delete: Option<SecretId>,
     last_phase: VaultUiPhase,
 }
 
-enum SessionAuthentication {
-    Pin(SessionPin),
-    TouchId,
-}
-
 enum ApprovalAction {
-    Approve,
+    Approve(ConfirmationAction),
     Deny,
 }
 
+#[derive(Clone, Copy)]
+enum DetailAction {
+    Show,
+    Hide,
+    Edit,
+    Save,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmationAction {
+    TouchId,
+    Pin,
+}
+
+fn can_finish_session_setup(touch_id_available: bool, pin_configured: bool) -> bool {
+    touch_id_available || pin_configured
+}
+
+fn confirmation_actions(touch_id_available: bool, pin_configured: bool) -> Vec<ConfirmationAction> {
+    let mut actions = Vec::with_capacity(2);
+    if touch_id_available {
+        actions.push(ConfirmationAction::TouchId);
+    }
+    if pin_configured {
+        actions.push(ConfirmationAction::Pin);
+    }
+    actions
+}
+
 struct Notice {
-    text: &'static str,
+    text: String,
     danger: bool,
 }
 
@@ -104,13 +132,14 @@ impl LadonDesktop {
             confirmation: SensitiveText::default(),
             session_pin: SensitiveText::default(),
             session_pin_confirmation: SensitiveText::default(),
-            approval_pin: SensitiveText::default(),
-            session_authentication: None,
-            touch_id_available: TouchIdAuthenticator::is_available(),
+            local_pin: SensitiveText::default(),
+            session_confirmation: None,
             focused_approval: None,
             draft: AddSecretDraft::new(),
             notice: None,
-            selected: None,
+            detail: SecretDetailState::default(),
+            unlock_confirmation: false,
+            discard_confirmation: false,
             pending_delete: None,
             last_phase,
         })
@@ -196,47 +225,55 @@ impl LadonDesktop {
 
     fn show_session_auth_setup(&mut self, ui: &mut egui::Ui) {
         centered_column(ui, |ui| {
-            ui.label(RichText::new("Confirm agent access").size(28.0).color(INK));
+            ui.label(
+                RichText::new("Confirm protected actions")
+                    .size(28.0)
+                    .color(INK),
+            );
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "Choose how to approve a secret for one agent session. Nothing is saved to the system keychain.",
+                    "Use Touch ID when available, and optionally add a session PIN. Nothing is saved to the system keychain.",
                 )
                 .color(MUTED),
             );
             ui.add_space(22.0);
 
-            if self.touch_id_available && primary_button(ui, "Use Touch ID").clicked() {
+            let touch_id_available = TouchIdAuthenticator::is_available();
+            let can_continue_with_touch_id = can_finish_session_setup(touch_id_available, false);
+            if can_continue_with_touch_id && primary_button(ui, "Continue with Touch ID").clicked()
+            {
                 self.session_pin.clear();
                 self.session_pin_confirmation.clear();
-                self.session_authentication = Some(SessionAuthentication::TouchId);
+                self.session_confirmation = Some(SessionConfirmation::touch_id_only());
                 self.notice = Some(Notice {
-                    text: "Touch ID will confirm new 30-minute access",
+                    text: "Touch ID will confirm protected actions".to_owned(),
                     danger: false,
                 });
             }
 
-            if self.touch_id_available {
+            if touch_id_available {
                 ui.add_space(18.0);
-                ui.label(RichText::new("or use a session PIN").color(MUTED));
+                ui.label(RichText::new("Optional session PIN").color(MUTED));
                 ui.add_space(12.0);
             }
-            password_field(ui, &mut self.session_pin, "PIN (6–12 digits)");
+            password_field(ui, &mut self.session_pin, "PIN (4–12 digits)");
             ui.add_space(10.0);
             password_field(ui, &mut self.session_pin_confirmation, "Repeat PIN");
             ui.add_space(18.0);
-            if primary_button(ui, "Set session PIN").clicked() {
+            if primary_button(ui, "Set PIN and continue").clicked() {
                 match SessionPin::new(&self.session_pin, &self.session_pin_confirmation) {
                     Ok(pin) => {
-                        self.session_authentication = Some(SessionAuthentication::Pin(pin));
+                        self.session_confirmation = Some(SessionConfirmation::with_pin(pin));
                         self.notice = Some(Notice {
-                            text: "Session PIN set; it will be forgotten when the vault locks",
+                            text: "Session PIN set; it will be forgotten when the vault locks"
+                                .to_owned(),
                             danger: false,
                         });
                     }
                     Err(error) => {
                         self.notice = Some(Notice {
-                            text: error.safe_message(),
+                            text: error.safe_message().to_owned(),
                             danger: true,
                         });
                     }
@@ -250,105 +287,255 @@ impl LadonDesktop {
 
     fn show_unlocked(&mut self, context: &egui::Context) {
         self.show_secret_rail(context);
+        let selected_metadata = self.selected_metadata();
         egui::CentralPanel::default()
             .frame(Frame::new().fill(CANVAS).inner_margin(Margin::same(38)))
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Add a secret").size(28.0).color(INK));
-                        ui.label(
-                            RichText::new(
-                                "One name, one value — add more fields only when needed.",
-                            )
-                            .color(MUTED),
-                        );
+                        if let Some(secret) = &selected_metadata {
+                            ui.label(RichText::new(&secret.name).size(28.0).color(INK));
+                            ui.label(
+                                RichText::new(format!("Immutable ID: {}", secret.id)).color(MUTED),
+                            );
+                        } else {
+                            ui.label(RichText::new("Add a secret").size(28.0).color(INK));
+                            ui.label(
+                                RichText::new(
+                                    "One name, one value — add more fields only when needed.",
+                                )
+                                .color(MUTED),
+                            );
+                        }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if quiet_button(ui, "Lock now").clicked() {
-                            #[cfg(unix)]
-                            let result = if let Some(broker) = &self.broker {
-                                broker.cancel_active_run_and_lock(&self.controller)
-                            } else {
-                                with_controller(&self.controller, |controller| {
-                                    controller.lock();
-                                    Ok(())
-                                })
-                            };
-                            #[cfg(not(unix))]
-                            let result = with_controller(&self.controller, |controller| {
-                                controller.lock();
-                                Ok(())
-                            });
-                            if result.is_ok() {
-                                self.clear_sensitive_state();
-                                self.notice = None;
-                            } else {
-                                self.notice_from(result, "Vault locked");
-                            }
+                            self.lock_immediately();
                         }
                     });
                 });
                 ui.add_space(28.0);
-                Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .corner_radius(10)
-                    .inner_margin(Margin::same(24))
-                    .show(ui, |ui| {
-                        ui.set_max_width(570.0);
-                        field_label(ui, "Name");
-                        ui.add(
-                            TextEdit::singleline(self.draft.name_mut())
-                                .hint_text("e.g. production-api")
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.add_space(18.0);
-                        for (index, field) in self.draft.fields_mut().iter_mut().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    field_label(
-                                        ui,
-                                        if index == 0 {
-                                            "Field"
-                                        } else {
-                                            "Additional field"
-                                        },
-                                    );
-                                    ui.add(
-                                        TextEdit::singleline(field.name_mut())
-                                            .hint_text("field_name")
-                                            .desired_width(180.0),
-                                    );
-                                });
-                                ui.add_space(10.0);
-                                ui.vertical(|ui| {
-                                    field_label(ui, "Secret value");
-                                    sensitive_text_field(
-                                        ui,
-                                        field.value_mut(),
-                                        "kept out of chat and command arguments",
-                                        350.0,
-                                    );
-                                });
+                if let Some(secret) = &selected_metadata {
+                    self.show_selected_workspace(ui, secret);
+                } else {
+                    self.show_add_workspace(ui);
+                }
+                self.show_notice(ui);
+            });
+
+        if self.unlock_confirmation {
+            if let Some(secret) = self.selected_metadata() {
+                self.show_secret_confirmation(context, &secret);
+            } else {
+                self.unlock_confirmation = false;
+                self.local_pin.clear();
+            }
+        }
+        if self.discard_confirmation {
+            self.show_discard_confirmation(context);
+        }
+    }
+
+    fn show_add_workspace(&mut self, ui: &mut egui::Ui) {
+        Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(10)
+            .inner_margin(Margin::same(24))
+            .show(ui, |ui| {
+                ui.set_max_width(570.0);
+                field_label(ui, "Name");
+                ui.add(
+                    TextEdit::singleline(self.draft.name_mut())
+                        .hint_text("e.g. production-api")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(18.0);
+                for (index, field) in self.draft.fields_mut().iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            field_label(
+                                ui,
+                                if index == 0 {
+                                    "Field"
+                                } else {
+                                    "Additional field"
+                                },
+                            );
+                            ui.add(
+                                TextEdit::singleline(field.name_mut())
+                                    .hint_text("field_name")
+                                    .desired_width(180.0),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        ui.vertical(|ui| {
+                            field_label(ui, "Secret value");
+                            sensitive_text_field(
+                                ui,
+                                field.value_mut(),
+                                "kept out of chat and command arguments",
+                                350.0,
+                            );
+                        });
+                    });
+                    ui.add_space(12.0);
+                }
+                ui.horizontal(|ui| {
+                    if quiet_button(ui, "+ Add field").clicked() {
+                        self.draft.add_field();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_button(ui, "Save secret").clicked() {
+                            let result = with_controller(&self.controller, |controller| {
+                                controller.add_secret(&mut self.draft)
                             });
-                            ui.add_space(12.0);
+                            self.handle_add_result(result);
+                        }
+                    });
+                });
+            });
+    }
+
+    fn show_selected_workspace(&mut self, ui: &mut egui::Ui, secret: &SecretMetadata) {
+        let session_id = self.vault_session_id().ok();
+        let authorized = session_id.is_some_and(|id| self.detail.is_authorized(id));
+        let mut action = None;
+        Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(10)
+            .inner_margin(Margin::same(24))
+            .show(ui, |ui| {
+                ui.set_max_width(570.0);
+                if !authorized {
+                    for field_name in &secret.field_names {
+                        field_label(ui, field_name);
+                        ui.label(RichText::new("••••••••").color(MUTED));
+                        ui.add_space(14.0);
+                    }
+                    if primary_button(ui, "Unlock this secret").clicked() {
+                        self.unlock_confirmation = true;
+                        self.local_pin.clear();
+                    }
+                    return;
+                }
+
+                match self.detail.mode_mut() {
+                    DetailMode::Hidden => {
+                        for field_name in &secret.field_names {
+                            field_label(ui, field_name);
+                            ui.label(RichText::new("••••••••").color(MUTED));
+                            ui.add_space(14.0);
                         }
                         ui.horizontal(|ui| {
-                            if quiet_button(ui, "+ Add field").clicked() {
-                                self.draft.add_field();
+                            if primary_button(ui, "Show").clicked() {
+                                action = Some(DetailAction::Show);
+                            }
+                            if quiet_button(ui, "Edit").clicked() {
+                                action = Some(DetailAction::Edit);
+                            }
+                        });
+                    }
+                    DetailMode::Revealed(draft) => {
+                        for field in draft.fields() {
+                            field_label(ui, field.name());
+                            match field.value() {
+                                EditableValue::Text(value) => {
+                                    let mut buffer = ReadOnlySensitiveText::new(value);
+                                    ui.add(
+                                        TextEdit::singleline(&mut buffer)
+                                            .interactive(false)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                }
+                                EditableValue::Binary { bytes, .. } => {
+                                    ui.label(
+                                        RichText::new(format!("Binary · {} bytes", bytes.len()))
+                                            .color(MUTED),
+                                    );
+                                }
+                            }
+                            ui.add_space(14.0);
+                        }
+                        if quiet_button(ui, "Hide").clicked() {
+                            action = Some(DetailAction::Hide);
+                        }
+                    }
+                    DetailMode::Editing { draft, dirty } => {
+                        field_label(ui, "Name");
+                        if ui
+                            .add(
+                                TextEdit::singleline(draft.name_mut()).desired_width(f32::INFINITY),
+                            )
+                            .changed()
+                        {
+                            *dirty = true;
+                        }
+                        ui.add_space(16.0);
+                        let mut remove_index = None;
+                        for (index, field) in draft.fields_mut().iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        TextEdit::singleline(field.name_mut())
+                                            .hint_text("field_name")
+                                            .desired_width(170.0),
+                                    )
+                                    .changed()
+                                {
+                                    *dirty = true;
+                                }
+                                match field.value_mut() {
+                                    EditableValue::Text(value) => {
+                                        if sensitive_text_field(ui, value, "secret value", 270.0)
+                                            .changed()
+                                        {
+                                            *dirty = true;
+                                        }
+                                    }
+                                    EditableValue::Binary { bytes, .. } => {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Binary · {} bytes",
+                                                bytes.len()
+                                            ))
+                                            .color(MUTED),
+                                        );
+                                    }
+                                }
+                                if ui.button("Remove").clicked() {
+                                    remove_index = Some(index);
+                                }
+                            });
+                            ui.add_space(10.0);
+                        }
+                        if let Some(index) = remove_index
+                            && draft.remove_field(index)
+                        {
+                            *dirty = true;
+                        }
+                        ui.horizontal(|ui| {
+                            if quiet_button(ui, "Add field").clicked() {
+                                draft.add_text_field();
+                                *dirty = true;
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if primary_button(ui, "Save secret").clicked() {
-                                    let result = with_controller(&self.controller, |controller| {
-                                        controller.add_secret(&mut self.draft)
-                                    });
-                                    self.notice_from(result.map(|_| ()), "Secret saved locally");
+                                if primary_button(ui, "Save changes").clicked() {
+                                    action = Some(DetailAction::Save);
+                                }
+                                if quiet_button(ui, "Cancel").clicked() {
+                                    action = Some(DetailAction::Cancel);
                                 }
                             });
                         });
-                    });
-                self.show_notice(ui);
+                    }
+                }
             });
+
+        if let Some(action) = action {
+            self.handle_detail_action(action);
+        }
     }
 
     fn show_secret_rail(&mut self, context: &egui::Context) {
@@ -399,6 +586,17 @@ impl LadonDesktop {
                 );
                 ui.add_space(8.0);
 
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("+ New secret").color(Color32::WHITE))
+                            .frame(false),
+                    )
+                    .clicked()
+                {
+                    self.request_navigation(NavigationTarget::Add);
+                }
+                ui.add_space(10.0);
+
                 let secrets =
                     with_controller(&self.controller, |controller| Ok(controller.secrets()))
                         .unwrap_or_default();
@@ -408,7 +606,7 @@ impl LadonDesktop {
                     );
                 }
                 for secret in &secrets {
-                    let selected = self.selected == Some(secret.id);
+                    let selected = self.detail.selected() == Some(secret.id);
                     if ui
                         .selectable_label(
                             selected,
@@ -416,8 +614,7 @@ impl LadonDesktop {
                         )
                         .clicked()
                     {
-                        self.selected = Some(secret.id);
-                        self.pending_delete = None;
+                        self.request_navigation(NavigationTarget::Secret(secret.id));
                     }
                     ui.label(
                         RichText::new(secret.field_names.join(", "))
@@ -427,7 +624,9 @@ impl LadonDesktop {
                     ui.add_space(8.0);
                 }
 
-                if let Some(selected) = self.selected {
+                if let Some(selected) = self.detail.selected()
+                    && !self.detail.is_editing()
+                {
                     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                         if self.pending_delete == Some(selected) {
                             ui.horizontal(|ui| {
@@ -440,14 +639,9 @@ impl LadonDesktop {
                                     )
                                     .clicked()
                                 {
-                                    let result = with_controller(&self.controller, |controller| {
-                                        controller.delete_secret(selected)
-                                    });
-                                    if result.is_ok() {
-                                        self.selected = None;
-                                    }
+                                    let result = self.delete_secret(selected);
                                     self.pending_delete = None;
-                                    self.notice_from(result, "Secret deleted");
+                                    self.handle_delete_result(result);
                                 }
                                 if ui.button("Cancel").clicked() {
                                     self.pending_delete = None;
@@ -462,13 +656,366 @@ impl LadonDesktop {
                         {
                             self.pending_delete = Some(selected);
                             self.notice = Some(Notice {
-                                text: "Delete this secret permanently?",
+                                text: "Delete this secret permanently?".to_owned(),
                                 danger: true,
                             });
                         }
                     });
                 }
             });
+    }
+
+    fn selected_metadata(&self) -> Option<SecretMetadata> {
+        let selected = self.detail.selected()?;
+        with_controller(&self.controller, |controller| Ok(controller.secrets()))
+            .ok()?
+            .into_iter()
+            .find(|secret| secret.id == selected)
+    }
+
+    fn vault_session_id(&self) -> Result<uuid::Uuid, LadonError> {
+        with_controller(&self.controller, |controller| {
+            controller.session_id().ok_or(LadonError::VaultLocked)
+        })
+    }
+
+    fn request_navigation(&mut self, target: NavigationTarget) {
+        match self.detail.request_navigation(target) {
+            NavigationResult::Applied => {
+                self.unlock_confirmation = false;
+                self.discard_confirmation = false;
+                self.local_pin.clear();
+                self.pending_delete = None;
+            }
+            NavigationResult::ConfirmDiscard => {
+                self.discard_confirmation = true;
+            }
+        }
+    }
+
+    fn show_secret_confirmation(&mut self, context: &egui::Context, secret: &SecretMetadata) {
+        let touch_id_available = TouchIdAuthenticator::is_available();
+        let pin_configured = self
+            .session_confirmation
+            .as_ref()
+            .is_some_and(SessionConfirmation::has_pin);
+        let actions = confirmation_actions(touch_id_available, pin_configured);
+        let mut action = None;
+        let mut cancel = false;
+        egui::Modal::new("secret-confirmation".into())
+            .frame(
+                Frame::window(&context.style())
+                    .fill(PANEL)
+                    .inner_margin(Margin::same(24)),
+            )
+            .show(context, |ui| {
+                ui.set_width(430.0);
+                ui.label(RichText::new("Unlock this secret").size(24.0).color(INK));
+                ui.label(RichText::new("Confirm once for this selected secret.").color(MUTED));
+                ui.add_space(18.0);
+                if actions.contains(&ConfirmationAction::TouchId)
+                    && primary_button(ui, "Confirm with Touch ID").clicked()
+                {
+                    action = Some(ConfirmationAction::TouchId);
+                }
+                if actions.contains(&ConfirmationAction::Pin) {
+                    ui.add_space(14.0);
+                    password_field(ui, &mut self.local_pin, "Session PIN");
+                    if quiet_button(ui, "Confirm with PIN").clicked() {
+                        action = Some(ConfirmationAction::Pin);
+                    }
+                }
+                if actions.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Touch ID is unavailable and this session has no configured PIN.",
+                        )
+                        .color(AMBER),
+                    );
+                }
+                ui.add_space(10.0);
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                self.show_notice(ui);
+            });
+
+        if cancel {
+            self.unlock_confirmation = false;
+            self.local_pin.clear();
+        } else if let Some(action) = action {
+            self.authenticate_selected_secret(action, &secret.name);
+        }
+    }
+
+    fn authenticate_selected_secret(&mut self, action: ConfirmationAction, secret_name: &str) {
+        let Ok(captured_session_id) = self.vault_session_id() else {
+            self.synchronize_phase(VaultUiPhase::Locked);
+            return;
+        };
+        let Some(attempt) = self.detail.authentication_attempt(captured_session_id) else {
+            self.unlock_confirmation = false;
+            self.local_pin.clear();
+            return;
+        };
+
+        match action {
+            ConfirmationAction::TouchId => {
+                let result = TouchIdAuthenticator::authenticate_secret(secret_name);
+                if let Err(error) = result {
+                    self.notice_from(Err(error), "");
+                    return;
+                }
+                let current_session_id = self.vault_session_id().ok();
+                if current_session_id == Some(captured_session_id)
+                    && self
+                        .detail
+                        .accept_authentication(attempt, captured_session_id)
+                {
+                    if let Some(confirmation) = &mut self.session_confirmation {
+                        confirmation.record_touch_id_success();
+                    }
+                    self.unlock_confirmation = false;
+                    self.local_pin.clear();
+                    self.notice = Some(Notice {
+                        text: "Secret unlocked for this selection".to_owned(),
+                        danger: false,
+                    });
+                } else {
+                    self.reject_stale_authentication();
+                }
+            }
+            ConfirmationAction::Pin => {
+                let verification = self
+                    .session_confirmation
+                    .as_mut()
+                    .ok_or(LadonError::ApprovalAuthenticationFailed)
+                    .and_then(|confirmation| confirmation.verify_pin(&self.local_pin));
+                self.local_pin.clear();
+                match verification {
+                    Ok(PinVerification::Accepted) => {
+                        let current_session_id = self.vault_session_id().ok();
+                        if current_session_id == Some(captured_session_id)
+                            && self
+                                .detail
+                                .accept_authentication(attempt, captured_session_id)
+                        {
+                            self.unlock_confirmation = false;
+                            self.notice = Some(Notice {
+                                text: "Secret unlocked for this selection".to_owned(),
+                                danger: false,
+                            });
+                        } else {
+                            self.reject_stale_authentication();
+                        }
+                    }
+                    Ok(PinVerification::Rejected { remaining_attempts }) => {
+                        self.notice = Some(Notice {
+                            text: format!("PIN rejected; {remaining_attempts} attempts remain"),
+                            danger: true,
+                        });
+                    }
+                    Ok(PinVerification::LockVault) => self.lock_immediately(),
+                    Err(error) => self.notice_from(Err(error), ""),
+                }
+            }
+        }
+    }
+
+    fn reject_stale_authentication(&mut self) {
+        let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
+            .unwrap_or(VaultUiPhase::Locked);
+        self.synchronize_phase(phase);
+        self.unlock_confirmation = false;
+        self.local_pin.clear();
+        self.notice = Some(Notice {
+            text: "Authentication expired because the selected context changed".to_owned(),
+            danger: true,
+        });
+    }
+
+    fn handle_detail_action(&mut self, action: DetailAction) {
+        match action {
+            DetailAction::Show | DetailAction::Edit => {
+                let Some(selected) = self.detail.selected() else {
+                    return;
+                };
+                let result = with_controller(&self.controller, |controller| {
+                    controller.load_secret(selected)
+                });
+                match result {
+                    Ok(draft) => {
+                        let state_result = if matches!(action, DetailAction::Show) {
+                            self.detail.begin_reveal(draft)
+                        } else {
+                            self.detail.begin_edit(draft)
+                        };
+                        if state_result.is_err() {
+                            self.notice = Some(Notice {
+                                text: "The selected secret changed before it could be opened"
+                                    .to_owned(),
+                                danger: true,
+                            });
+                        }
+                    }
+                    Err(error) => self.handle_sensitive_operation_error(error),
+                }
+            }
+            DetailAction::Hide | DetailAction::Cancel => self.detail.hide_values(),
+            DetailAction::Save => {
+                let result = match self.detail.mode() {
+                    DetailMode::Editing { draft, .. } => self.update_secret(draft),
+                    DetailMode::Hidden | DetailMode::Revealed(_) => Err(LadonError::InvalidRequest),
+                };
+                match result {
+                    Ok(()) => {
+                        self.detail.finish_save();
+                        self.notice = Some(Notice {
+                            text: "Secret changes saved locally".to_owned(),
+                            danger: false,
+                        });
+                    }
+                    Err(error) => self.handle_sensitive_operation_error(error),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn update_secret(&self, draft: &crate::EditSecretDraft) -> Result<(), LadonError> {
+        self.broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)?
+            .update_secret(&self.controller, draft)
+    }
+
+    #[cfg(not(unix))]
+    fn update_secret(&self, draft: &crate::EditSecretDraft) -> Result<(), LadonError> {
+        with_controller(&self.controller, |controller| {
+            let update = controller.prepare_secret_update(draft)?;
+            controller.apply_secret_update(update)
+        })
+    }
+
+    #[cfg(unix)]
+    fn delete_secret(&self, id: SecretId) -> Result<(), LadonError> {
+        self.broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)?
+            .delete_secret(&self.controller, id)
+    }
+
+    #[cfg(not(unix))]
+    fn delete_secret(&self, id: SecretId) -> Result<(), LadonError> {
+        with_controller(&self.controller, |controller| controller.delete_secret(id))
+    }
+
+    fn handle_add_result(&mut self, result: Result<SecretId, LadonError>) {
+        match result {
+            Ok(_) => {
+                self.notice = Some(Notice {
+                    text: "Secret saved locally".to_owned(),
+                    danger: false,
+                });
+            }
+            Err(error) => self.handle_sensitive_operation_error(error),
+        }
+    }
+
+    fn handle_delete_result(&mut self, result: Result<(), LadonError>) {
+        match result {
+            Ok(()) => {
+                self.detail.navigate_now(NavigationTarget::Add);
+                self.unlock_confirmation = false;
+                self.local_pin.clear();
+                self.notice = Some(Notice {
+                    text: "Secret deleted".to_owned(),
+                    danger: false,
+                });
+            }
+            Err(error) => self.handle_sensitive_operation_error(error),
+        }
+    }
+
+    fn handle_sensitive_operation_error(&mut self, error: LadonError) {
+        let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
+            .unwrap_or(VaultUiPhase::Locked);
+        self.synchronize_phase(phase);
+        self.notice_from(Err(error), "");
+    }
+
+    fn show_discard_confirmation(&mut self, context: &egui::Context) {
+        let mut continue_editing = false;
+        let mut discard = false;
+        egui::Modal::new("discard-confirmation".into())
+            .frame(
+                Frame::window(&context.style())
+                    .fill(PANEL)
+                    .inner_margin(Margin::same(24)),
+            )
+            .show(context, |ui| {
+                ui.set_width(390.0);
+                ui.label(
+                    RichText::new("Discard unsaved changes?")
+                        .size(22.0)
+                        .color(INK),
+                );
+                ui.label(RichText::new("Your current edits have not been saved.").color(MUTED));
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    if quiet_button(ui, "Continue editing").clicked() {
+                        continue_editing = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Discard changes").color(Color32::WHITE),
+                            )
+                            .fill(DANGER),
+                        )
+                        .clicked()
+                    {
+                        discard = true;
+                    }
+                });
+            });
+        if continue_editing {
+            self.detail.cancel_pending_navigation();
+            self.discard_confirmation = false;
+        } else if discard {
+            let closing = self.detail.pending_navigation() == Some(NavigationTarget::Close);
+            self.detail.discard_pending_navigation();
+            self.discard_confirmation = false;
+            self.unlock_confirmation = false;
+            self.local_pin.clear();
+            self.pending_delete = None;
+            if closing {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn lock_immediately(&mut self) {
+        #[cfg(unix)]
+        let result = if let Some(broker) = &self.broker {
+            broker.cancel_active_run_and_lock(&self.controller)
+        } else {
+            with_controller(&self.controller, |controller| {
+                controller.lock();
+                Ok(())
+            })
+        };
+        #[cfg(not(unix))]
+        let result = with_controller(&self.controller, |controller| {
+            controller.lock();
+            Ok(())
+        });
+        if result.is_ok() {
+            self.clear_sensitive_state();
+            self.notice = None;
+        } else {
+            self.notice_from(result, "Vault locked");
+        }
     }
 
     fn clear_unlock_fields(&mut self) {
@@ -480,11 +1027,13 @@ impl LadonDesktop {
         self.clear_unlock_fields();
         self.session_pin.clear();
         self.session_pin_confirmation.clear();
-        self.approval_pin.clear();
-        self.session_authentication = None;
+        self.local_pin.clear();
+        self.session_confirmation = None;
         self.focused_approval = None;
         self.draft = AddSecretDraft::new();
-        self.selected = None;
+        self.detail.clear_for_vault_lock();
+        self.unlock_confirmation = false;
+        self.discard_confirmation = false;
         self.pending_delete = None;
     }
 
@@ -502,11 +1051,11 @@ impl LadonDesktop {
     fn notice_from(&mut self, result: Result<(), LadonError>, success: &'static str) {
         self.notice = Some(match result {
             Ok(()) => Notice {
-                text: success,
+                text: success.to_owned(),
                 danger: false,
             },
             Err(error) => Notice {
-                text: error.safe_message(),
+                text: error.safe_message().to_owned(),
                 danger: true,
             },
         });
@@ -515,7 +1064,11 @@ impl LadonDesktop {
     fn show_notice(&self, ui: &mut egui::Ui) {
         if let Some(notice) = &self.notice {
             ui.add_space(16.0);
-            ui.label(RichText::new(notice.text).color(if notice.danger { DANGER } else { COBALT }));
+            ui.label(RichText::new(&notice.text).color(if notice.danger {
+                DANGER
+            } else {
+                COBALT
+            }));
         }
     }
 
@@ -529,29 +1082,32 @@ impl LadonDesktop {
         {
             Ok(Some(pending)) => pending,
             Ok(None) => {
-                update_focused_approval(&mut self.focused_approval, &mut self.approval_pin, None);
+                update_focused_approval(&mut self.focused_approval, &mut self.local_pin, None);
                 return;
             }
             Err(error) => {
-                update_focused_approval(&mut self.focused_approval, &mut self.approval_pin, None);
+                update_focused_approval(&mut self.focused_approval, &mut self.local_pin, None);
                 self.notice_from(Err(error), "");
                 return;
             }
         };
         if update_focused_approval(
             &mut self.focused_approval,
-            &mut self.approval_pin,
+            &mut self.local_pin,
             Some(pending.id()),
         ) {
             context.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
         let view = PendingRequestView::from_approval(&pending, Duration::from_secs(2 * 60));
+        let touch_id_available = TouchIdAuthenticator::is_available();
+        let pin_configured = self
+            .session_confirmation
+            .as_ref()
+            .is_some_and(SessionConfirmation::has_pin);
+        let actions = confirmation_actions(touch_id_available, pin_configured);
         let mut action = None;
-        egui::Window::new("Agent requests a secret")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        egui::Modal::new("agent-approval".into())
             .frame(
                 Frame::window(&context.style())
                     .fill(PANEL)
@@ -591,29 +1147,28 @@ impl LadonDesktop {
                     .color(AMBER),
                 );
                 ui.add_space(16.0);
-                if matches!(
-                    self.session_authentication,
-                    Some(SessionAuthentication::Pin(_))
-                ) {
-                    password_field(ui, &mut self.approval_pin, "Session PIN");
-                    ui.add_space(10.0);
+                if actions.contains(&ConfirmationAction::TouchId)
+                    && primary_button(ui, "Confirm with Touch ID").clicked()
+                {
+                    action = Some(ApprovalAction::Approve(ConfirmationAction::TouchId));
                 }
-                ui.horizontal(|ui| {
-                    if primary_button(
-                        ui,
-                        if matches!(
-                            self.session_authentication,
-                            Some(SessionAuthentication::TouchId)
-                        ) {
-                            "Confirm with Touch ID"
-                        } else {
-                            "Allow for 30 minutes"
-                        },
-                    )
-                    .clicked()
-                    {
-                        action = Some(ApprovalAction::Approve);
+                if actions.contains(&ConfirmationAction::Pin) {
+                    ui.add_space(12.0);
+                    password_field(ui, &mut self.local_pin, "Session PIN");
+                    if quiet_button(ui, "Confirm with PIN").clicked() {
+                        action = Some(ApprovalAction::Approve(ConfirmationAction::Pin));
                     }
+                }
+                if actions.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Touch ID is unavailable and this session has no configured PIN.",
+                        )
+                        .color(AMBER),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::new(RichText::new("Deny").color(DANGER)).frame(false))
                         .clicked()
@@ -625,25 +1180,11 @@ impl LadonDesktop {
             });
 
         match action {
-            Some(ApprovalAction::Approve) => {
-                let authentication = match &self.session_authentication {
-                    Some(SessionAuthentication::Pin(pin)) => pin.verify(&self.approval_pin),
-                    Some(SessionAuthentication::TouchId) => TouchIdAuthenticator::authenticate(
-                        "Allow this agent session to use the displayed Ladon secrets for 30 minutes",
-                    ),
-                    None => Err(LadonError::ApprovalAuthenticationFailed),
-                };
-                self.approval_pin.clear();
-                let result = authentication.and_then(|()| {
-                    self.broker
-                        .as_ref()
-                        .ok_or(LadonError::EndpointUnavailable)?
-                        .approve(pending.id())
-                });
-                self.notice_from(result, "Agent access allowed for 30 minutes");
+            Some(ApprovalAction::Approve(method)) => {
+                self.authenticate_pending_approval(method, &pending);
             }
             Some(ApprovalAction::Deny) => {
-                self.approval_pin.clear();
+                self.local_pin.clear();
                 let result = self
                     .broker
                     .as_ref()
@@ -653,6 +1194,90 @@ impl LadonDesktop {
             }
             None => {}
         }
+    }
+
+    #[cfg(unix)]
+    fn authenticate_pending_approval(
+        &mut self,
+        method: ConfirmationAction,
+        pending: &crate::PendingApproval,
+    ) {
+        let captured_id = pending.id();
+        let captured_session_id = pending.vault_session_id();
+        if self.vault_session_id().ok() != Some(captured_session_id) {
+            self.reject_stale_authentication();
+            return;
+        }
+
+        let authenticated = match method {
+            ConfirmationAction::TouchId => {
+                TouchIdAuthenticator::authenticate_agent_session().map(|()| true)
+            }
+            ConfirmationAction::Pin => {
+                let verification = self
+                    .session_confirmation
+                    .as_mut()
+                    .ok_or(LadonError::ApprovalAuthenticationFailed)
+                    .and_then(|confirmation| confirmation.verify_pin(&self.local_pin));
+                self.local_pin.clear();
+                match verification {
+                    Ok(PinVerification::Accepted) => Ok(true),
+                    Ok(PinVerification::Rejected { remaining_attempts }) => {
+                        self.notice = Some(Notice {
+                            text: format!("PIN rejected; {remaining_attempts} attempts remain"),
+                            danger: true,
+                        });
+                        Ok(false)
+                    }
+                    Ok(PinVerification::LockVault) => {
+                        self.lock_immediately();
+                        Ok(false)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        let authenticated = match authenticated {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                self.notice_from(Err(error), "");
+                return;
+            }
+        };
+        if !authenticated {
+            return;
+        }
+
+        let current_session_id = self.vault_session_id().ok();
+        let current_pending = self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(LocalBrokerHandle::pending_approval);
+        let exact_request_is_pending = matches!(
+            current_pending,
+            Ok(Some(ref current))
+                if current.id() == captured_id
+                    && current.vault_session_id() == captured_session_id
+        );
+        if current_session_id != Some(captured_session_id) || !exact_request_is_pending {
+            self.reject_stale_authentication();
+            return;
+        }
+
+        let result = self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(|broker| broker.approve(captured_id));
+        if result.is_ok()
+            && method == ConfirmationAction::TouchId
+            && let Some(confirmation) = &mut self.session_confirmation
+        {
+            confirmation.record_touch_id_success();
+        }
+        self.local_pin.clear();
+        self.notice_from(result, "Agent access allowed for 30 minutes");
     }
 }
 
@@ -782,7 +1407,7 @@ impl eframe::App for LadonDesktop {
         if auto_locked {
             self.clear_sensitive_state();
             self.notice = Some(Notice {
-                text: "Vault locked after 30 minutes without secret activity",
+                text: "Vault locked after 30 minutes without secret activity".to_owned(),
                 danger: false,
             });
         }
@@ -791,11 +1416,19 @@ impl eframe::App for LadonDesktop {
         let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
             .unwrap_or(VaultUiPhase::Locked);
         self.synchronize_phase(phase);
+        if phase == VaultUiPhase::Unlocked
+            && context.input(|input| input.viewport().close_requested())
+            && self.detail.request_navigation(NavigationTarget::Close)
+                == NavigationResult::ConfirmDiscard
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.discard_confirmation = true;
+        }
         match phase {
             VaultUiPhase::FirstRun => shell(context, |ui| self.show_first_run(ui)),
             VaultUiPhase::Locked => shell(context, |ui| self.show_locked(ui)),
             VaultUiPhase::RecoveryRequired => shell(context, |ui| self.show_recovery(ui)),
-            VaultUiPhase::Unlocked if self.session_authentication.is_none() => {
+            VaultUiPhase::Unlocked if self.session_confirmation.is_none() => {
                 shell(context, |ui| self.show_session_auth_setup(ui));
             }
             VaultUiPhase::Unlocked => {
@@ -950,6 +1583,31 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn session_setup_requires_pin_only_when_touch_id_is_unavailable() {
+        assert!(can_finish_session_setup(true, false));
+        assert!(can_finish_session_setup(true, true));
+        assert!(can_finish_session_setup(false, true));
+        assert!(!can_finish_session_setup(false, false));
+    }
+
+    #[test]
+    fn protected_actions_offer_every_current_confirmation_capability() {
+        assert_eq!(
+            confirmation_actions(true, true),
+            vec![ConfirmationAction::TouchId, ConfirmationAction::Pin]
+        );
+        assert_eq!(
+            confirmation_actions(true, false),
+            vec![ConfirmationAction::TouchId]
+        );
+        assert_eq!(
+            confirmation_actions(false, true),
+            vec![ConfirmationAction::Pin]
+        );
+        assert!(confirmation_actions(false, false).is_empty());
+    }
+
+    #[test]
     fn vault_instance_lock_is_exclusive_and_recoverable() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vault.ladon");
@@ -996,6 +1654,22 @@ mod tests {
         let mut draft = AddSecretDraft::new();
         draft.set_name("unsaved");
         draft.fields_mut()[0].value_mut().push_str("fake-secret");
+        let selected = SecretId::new();
+        let session_id = controller.lock().unwrap().session_id().unwrap();
+        let mut detail = SecretDetailState::default();
+        detail.navigate_now(NavigationTarget::Secret(selected));
+        let attempt = detail.authentication_attempt(session_id).unwrap();
+        assert!(detail.accept_authentication(attempt, session_id));
+        detail
+            .begin_edit(crate::EditSecretDraft::from_parts(
+                selected,
+                "selected",
+                vec![crate::EditableField::text(
+                    "value",
+                    SensitiveText::from("fake-selected-secret"),
+                )],
+            ))
+            .unwrap();
         let mut app = LadonDesktop {
             _instance_lock: InstanceLock::acquire(&path).unwrap(),
             controller: Arc::clone(&controller),
@@ -1005,19 +1679,20 @@ mod tests {
             confirmation: SensitiveText::default(),
             session_pin: SensitiveText::from("123456"),
             session_pin_confirmation: SensitiveText::from("123456"),
-            approval_pin: SensitiveText::from("123456"),
-            session_authentication: Some(SessionAuthentication::Pin(
+            local_pin: SensitiveText::from("123456"),
+            session_confirmation: Some(SessionConfirmation::with_pin(
                 SessionPin::new(
                     &SensitiveText::from("123456"),
                     &SensitiveText::from("123456"),
                 )
                 .unwrap(),
             )),
-            touch_id_available: false,
             focused_approval: Some(Uuid::new_v4()),
             draft,
             notice: None,
-            selected: None,
+            detail,
+            unlock_confirmation: true,
+            discard_confirmation: true,
             pending_delete: None,
             last_phase: VaultUiPhase::Unlocked,
         };
@@ -1029,8 +1704,12 @@ mod tests {
         assert!(app.draft.fields()[0].value().as_str().is_empty());
         assert!(app.session_pin.as_str().is_empty());
         assert!(app.session_pin_confirmation.as_str().is_empty());
-        assert!(app.approval_pin.as_str().is_empty());
-        assert!(app.session_authentication.is_none());
+        assert!(app.local_pin.as_str().is_empty());
+        assert!(app.session_confirmation.is_none());
+        assert!(app.detail.selected().is_none());
+        assert!(!app.detail.has_sensitive_buffer());
+        assert!(!app.unlock_confirmation);
+        assert!(!app.discard_confirmation);
         assert!(app.focused_approval.is_none());
     }
 

@@ -90,6 +90,38 @@ impl eframe::egui::TextBuffer for SensitiveText {
     }
 }
 
+#[cfg(feature = "gui")]
+pub(crate) struct ReadOnlySensitiveText<'a>(&'a SensitiveText);
+
+#[cfg(feature = "gui")]
+impl<'a> ReadOnlySensitiveText<'a> {
+    #[must_use]
+    pub(crate) const fn new(value: &'a SensitiveText) -> Self {
+        Self(value)
+    }
+}
+
+#[cfg(feature = "gui")]
+impl eframe::egui::TextBuffer for ReadOnlySensitiveText<'_> {
+    fn is_mutable(&self) -> bool {
+        false
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn insert_text(&mut self, _text: &str, _char_index: usize) -> usize {
+        0
+    }
+
+    fn delete_char_range(&mut self, _char_range: std::ops::Range<usize>) {}
+
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<ReadOnlySensitiveText<'static>>()
+    }
+}
+
 impl From<&str> for SensitiveText {
     fn from(value: &str) -> Self {
         Self(Zeroizing::new(value.to_owned()))
@@ -679,16 +711,15 @@ fn ensure_private_parent(path: &Path) -> Result<(), LadonError> {
     Ok(())
 }
 
+#[derive(Default)]
 pub enum DetailMode {
+    #[default]
     Hidden,
     Revealed(EditSecretDraft),
-    Editing { draft: EditSecretDraft, dirty: bool },
-}
-
-impl Default for DetailMode {
-    fn default() -> Self {
-        Self::Hidden
-    }
+    Editing {
+        draft: EditSecretDraft,
+        dirty: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -746,6 +777,11 @@ impl SecretDetailState {
     #[must_use]
     pub const fn mode(&self) -> &DetailMode {
         &self.mode
+    }
+
+    #[must_use]
+    pub fn mode_mut(&mut self) -> &mut DetailMode {
+        &mut self.mode
     }
 
     #[must_use]
@@ -1019,7 +1055,7 @@ impl PendingRequestView {
     }
 }
 
-fn sanitize_untrusted(input: &str) -> String {
+pub(crate) fn sanitize_untrusted(input: &str) -> String {
     input
         .chars()
         .map(|character| {

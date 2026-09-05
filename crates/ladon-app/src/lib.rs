@@ -17,7 +17,7 @@ pub use approval::{ApprovalCoordinator, ApprovalSecret, GrantTicket, PendingAppr
 pub use desktop::run_desktop;
 #[cfg(unix)]
 pub use ipc::{LocalClient, LocalServer, default_endpoint_path};
-pub use session_auth::SessionPin;
+pub use session_auth::{PinVerification, SessionConfirmation, SessionPin};
 pub use supervisor::{RunCancellation, RunResult, RunTermination, Supervisor};
 pub use touch_id::TouchIdAuthenticator;
 pub use ui::{

@@ -11,6 +11,7 @@ const PIN_SALT_BYTES: usize = 16;
 const PIN_HASH_BYTES: usize = 32;
 const PIN_MEMORY_KIB: u32 = 64 * 1024;
 const PIN_PASSES: u32 = 3;
+pub const MAX_FAILED_PIN_ATTEMPTS: u8 = 5;
 
 pub struct SessionPin {
     salt: Zeroizing<[u8; PIN_SALT_BYTES]>,
@@ -39,6 +40,66 @@ impl SessionPin {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinVerification {
+    Accepted,
+    Rejected { remaining_attempts: u8 },
+    LockVault,
+}
+
+pub struct SessionConfirmation {
+    pin: Option<SessionPin>,
+    failed_pin_attempts: u8,
+}
+
+impl SessionConfirmation {
+    pub const fn touch_id_only() -> Self {
+        Self {
+            pin: None,
+            failed_pin_attempts: 0,
+        }
+    }
+
+    pub const fn with_pin(pin: SessionPin) -> Self {
+        Self {
+            pin: Some(pin),
+            failed_pin_attempts: 0,
+        }
+    }
+
+    pub const fn has_pin(&self) -> bool {
+        self.pin.is_some()
+    }
+
+    pub fn verify_pin(&mut self, candidate: &SensitiveText) -> Result<PinVerification, LadonError> {
+        let Some(pin) = &self.pin else {
+            return Ok(PinVerification::Rejected {
+                remaining_attempts: 0,
+            });
+        };
+        match pin.verify(candidate) {
+            Ok(()) => {
+                self.failed_pin_attempts = 0;
+                return Ok(PinVerification::Accepted);
+            }
+            Err(LadonError::ApprovalAuthenticationFailed) => {}
+            Err(error) => return Err(error),
+        }
+        self.failed_pin_attempts = self.failed_pin_attempts.saturating_add(1);
+        if self.failed_pin_attempts >= MAX_FAILED_PIN_ATTEMPTS {
+            Ok(PinVerification::LockVault)
+        } else {
+            Ok(PinVerification::Rejected {
+                remaining_attempts: MAX_FAILED_PIN_ATTEMPTS - self.failed_pin_attempts,
+            })
+        }
+    }
+
+    pub fn record_touch_id_success(&mut self) {
+        self.failed_pin_attempts = 0;
+    }
+}
+
 impl fmt::Debug for SessionPin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionPin([REDACTED])")
@@ -46,7 +107,7 @@ impl fmt::Debug for SessionPin {
 }
 
 fn valid_pin(pin: &str) -> bool {
-    (6..=12).contains(&pin.len()) && pin.bytes().all(|byte| byte.is_ascii_digit())
+    (4..=12).contains(&pin.len()) && pin.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn derive(pin: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; PIN_HASH_BYTES]>, LadonError> {

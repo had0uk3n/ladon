@@ -1,13 +1,13 @@
-use ladon_app::{SensitiveText, SessionPin};
+use ladon_app::{PinVerification, SensitiveText, SessionConfirmation, SessionPin};
 use ladon_core::LadonError;
 
 #[test]
-fn accepts_only_matching_six_to_twelve_ascii_digits() {
-    for valid in ["123456", "123456789012"] {
+fn accepts_only_matching_four_to_twelve_ascii_digits() {
+    for valid in ["1234", "123456789012"] {
         assert!(SessionPin::new(&SensitiveText::from(valid), &SensitiveText::from(valid)).is_ok());
     }
 
-    for invalid in ["12345", "1234567890123", "１２３４５６", "12345a"] {
+    for invalid in ["123", "1234567890123", "１２３４", "123a"] {
         assert_eq!(
             SessionPin::new(&SensitiveText::from(invalid), &SensitiveText::from(invalid))
                 .unwrap_err(),
@@ -15,11 +15,7 @@ fn accepts_only_matching_six_to_twelve_ascii_digits() {
         );
     }
     assert_eq!(
-        SessionPin::new(
-            &SensitiveText::from("123456"),
-            &SensitiveText::from("654321")
-        )
-        .unwrap_err(),
+        SessionPin::new(&SensitiveText::from("1234"), &SensitiveText::from("4321")).unwrap_err(),
         LadonError::InvalidPin
     );
 }
@@ -51,4 +47,51 @@ fn debug_output_never_contains_pin_material() {
 
     assert!(!debug.contains("870421"));
     assert!(debug.contains("REDACTED"));
+}
+
+#[test]
+fn pin_is_optional_and_five_consecutive_failures_request_vault_lock() {
+    let pin = SessionPin::new(&SensitiveText::from("1234"), &SensitiveText::from("1234")).unwrap();
+    let mut confirmation = SessionConfirmation::with_pin(pin);
+    assert!(confirmation.has_pin());
+    for remaining in [4, 3, 2, 1] {
+        assert_eq!(
+            confirmation
+                .verify_pin(&SensitiveText::from("9999"))
+                .unwrap(),
+            PinVerification::Rejected {
+                remaining_attempts: remaining
+            }
+        );
+    }
+    assert_eq!(
+        confirmation
+            .verify_pin(&SensitiveText::from("9999"))
+            .unwrap(),
+        PinVerification::LockVault
+    );
+    assert!(!SessionConfirmation::touch_id_only().has_pin());
+}
+
+#[test]
+fn success_resets_the_shared_pin_failure_counter() {
+    let pin = SessionPin::new(&SensitiveText::from("1234"), &SensitiveText::from("1234")).unwrap();
+    let mut confirmation = SessionConfirmation::with_pin(pin);
+    assert!(matches!(
+        confirmation
+            .verify_pin(&SensitiveText::from("9999"))
+            .unwrap(),
+        PinVerification::Rejected {
+            remaining_attempts: 4
+        }
+    ));
+    confirmation.record_touch_id_success();
+    assert!(matches!(
+        confirmation
+            .verify_pin(&SensitiveText::from("9999"))
+            .unwrap(),
+        PinVerification::Rejected {
+            remaining_attempts: 4
+        }
+    ));
 }

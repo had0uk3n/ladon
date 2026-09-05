@@ -137,7 +137,7 @@ impl AgentBroker {
             RpcMethod::List => {
                 let controller = self.controller()?;
                 if controller.phase() != VaultUiPhase::Unlocked {
-                    return Err(LadonError::VaultUnavailable);
+                    return Err(LadonError::VaultLocked);
                 }
                 let secrets = controller
                     .secrets()

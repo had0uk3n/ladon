@@ -86,6 +86,12 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
         panic!("expected cancelled run response");
     };
     assert_eq!(termination, "cancelled");
+
+    let locked_use = client.call(&request(RpcMethod::List)).unwrap();
+    assert_eq!(
+        locked_use.error_details(),
+        Some(("vault_locked", "vault is locked"))
+    );
 }
 
 fn request(method: RpcMethod) -> RpcRequest {

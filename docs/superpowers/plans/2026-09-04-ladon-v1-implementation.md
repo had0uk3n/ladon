@@ -227,11 +227,11 @@ and drop, quick PIN, and screen-lock integration remain open release work.
 - Create: `scripts/smoke-test.sh`
 - Modify: `.gitignore`
 
-- [ ] Write smoke tests that initialize a temporary vault, add a fake value through the application test harness, run a fixture through CLI and MCP, assert redaction, lock, and verify subsequent use requires unlock.
-- [ ] Document the threat boundaries prominently, including same-user compromise, malicious authorized children, transformed exfiltration, clipboard/temp-file residue, crash dumps, backups, and rollback.
-- [ ] Add macOS/Windows/Linux CI for format, clippy, tests, dependency/license policy, and release builds; do not place secrets in CI.
+- [x] Write smoke tests that initialize a temporary vault, add a fake value through the application test harness, run a fixture through CLI and MCP, assert redaction, lock, and verify subsequent use requires unlock.
+- [x] Document the threat boundaries prominently, including same-user compromise, malicious authorized children, transformed exfiltration, clipboard/temp-file residue, crash dumps, backups, and rollback.
+- [x] Add macOS/Windows/Linux CI for format, clippy, tests, dependency/license policy, and release builds; do not place secrets in CI.
 - [ ] Run `cargo fmt --check`, strict clippy, all workspace tests/features, `cargo deny check`, and `scripts/smoke-test.sh`; expect pass.
-- [ ] Perform a source scan for `println!`, `dbg!`, `Debug` derives on secret-bearing types, secret values in errors, unbounded allocations, and shell invocation.
+- [x] Perform a source scan for `println!`, `dbg!`, `Debug` derives on secret-bearing types, secret values in errors, unbounded allocations, and shell invocation.
 - [ ] Build release artifacts on all three CI platforms, exercise first run/add/run/lock/unlock, and record remaining platform caveats in the release notes.
 - [ ] Commit: `docs: prepare Ladon security preview`.
 

@@ -1,3 +1,6 @@
 .superpowers/
 .worktrees/
 target/
+*.ladon
+*.ladon.bak
+*.ladon-backup-*

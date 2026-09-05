@@ -3,6 +3,7 @@
 use std::{
     fs,
     io::Write,
+    net::Shutdown,
     os::unix::{fs::PermissionsExt, net::UnixStream},
     thread,
 };
@@ -114,11 +115,12 @@ fn rejects_partial_and_oversized_frames_before_allocating_payloads() {
     let worker = thread::spawn(move || server.serve_once(|_| unreachable!()));
     let mut stream = UnixStream::connect(&socket).unwrap();
     stream.write_all(&[0, 0]).unwrap();
-    drop(stream);
+    stream.shutdown(Shutdown::Write).unwrap();
     assert_eq!(
         worker.join().unwrap().unwrap_err(),
         LadonError::InvalidFrame
     );
+    drop(stream);
 
     let server = LocalServer::bind(&socket).unwrap();
     let worker = thread::spawn(move || server.serve_once(|_| unreachable!()));
@@ -126,9 +128,9 @@ fn rejects_partial_and_oversized_frames_before_allocating_payloads() {
     stream
         .write_all(&((MAX_FRAME_BYTES as u32) + 1).to_be_bytes())
         .unwrap();
-    drop(stream);
     assert_eq!(
         worker.join().unwrap().unwrap_err(),
         LadonError::FrameTooLarge
     );
+    drop(stream);
 }

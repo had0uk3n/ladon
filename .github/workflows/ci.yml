@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources
+
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+      - name: Install Rust 1.85
+        shell: bash
+        run: rustup toolchain install 1.85.0 --profile minimal --component rustfmt,clippy
+      - name: Select Rust 1.85
+        shell: bash
+        run: rustup default 1.85.0
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-features
+      - name: Release build
+        run: cargo build --workspace --all-features --release

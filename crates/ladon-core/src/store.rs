@@ -1,10 +1,13 @@
 use std::{
     ffi::OsString,
     fmt, fs,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::fs::File;
 
 use uuid::Uuid;
 
@@ -148,13 +151,48 @@ fn verify_candidate(path: &Path, expected: &[u8]) -> Result<(), LadonError> {
     }
 }
 
+#[cfg(not(windows))]
 fn atomic_replace(candidate: &Path, destination: &Path) -> Result<(), LadonError> {
     fs::rename(candidate, destination).map_err(|_| LadonError::StorageFailure)
 }
 
+#[cfg(windows)]
+fn atomic_replace(candidate: &Path, destination: &Path) -> Result<(), LadonError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let candidate: Vec<u16> = candidate.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both vectors are NUL-terminated UTF-16 paths and remain alive for the call.
+    if unsafe {
+        MoveFileExW(
+            candidate.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(LadonError::StorageFailure)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), LadonError> {
     let parent = path.parent().ok_or(LadonError::StorageFailure)?;
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| LadonError::StorageFailure)
+}
+
+#[cfg(not(unix))]
+fn sync_parent(path: &Path) -> Result<(), LadonError> {
+    path.parent().map(|_| ()).ok_or(LadonError::StorageFailure)
 }

@@ -38,6 +38,8 @@ pub enum LadonError {
     StorageFailure,
     #[error("neither managed vault copy can be opened")]
     VaultUnavailable,
+    #[error("vault is locked")]
+    VaultLocked,
     #[error("IPC frame is invalid")]
     InvalidFrame,
     #[error("IPC frame exceeds the size limit")]
@@ -102,6 +104,7 @@ impl LadonError {
             "revision_overflow" => Self::RevisionOverflow,
             "storage_failure" => Self::StorageFailure,
             "vault_unavailable" => Self::VaultUnavailable,
+            "vault_locked" => Self::VaultLocked,
             "invalid_frame" => Self::InvalidFrame,
             "frame_too_large" => Self::FrameTooLarge,
             "invalid_request" => Self::InvalidRequest,
@@ -147,6 +150,7 @@ impl LadonError {
             Self::RevisionOverflow => "revision_overflow",
             Self::StorageFailure => "storage_failure",
             Self::VaultUnavailable => "vault_unavailable",
+            Self::VaultLocked => "vault_locked",
             Self::InvalidFrame => "invalid_frame",
             Self::FrameTooLarge => "frame_too_large",
             Self::InvalidRequest => "invalid_request",
@@ -191,6 +195,7 @@ impl LadonError {
             Self::RevisionOverflow => "vault revision cannot be incremented",
             Self::StorageFailure => "vault storage operation failed",
             Self::VaultUnavailable => "neither managed vault copy can be opened",
+            Self::VaultLocked => "vault is locked",
             Self::InvalidFrame => "IPC frame is invalid",
             Self::FrameTooLarge => "IPC frame exceeds the size limit",
             Self::InvalidRequest => "IPC request is invalid",

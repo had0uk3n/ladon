@@ -65,6 +65,11 @@ impl<C: MonotonicClock> GrantStore<C> {
         self.deadlines.clear();
     }
 
+    pub fn revoke_secret(&mut self, secret_id: SecretId) {
+        self.deadlines
+            .retain(|(_, granted_secret_id), _| *granted_secret_id != secret_id);
+    }
+
     #[must_use]
     pub fn len(&mut self) -> usize {
         self.purge_expired();

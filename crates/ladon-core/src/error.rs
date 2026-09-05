@@ -243,7 +243,7 @@ impl LadonError {
             }
             Self::InvalidPin => "PIN must match and contain 6 to 12 ASCII digits",
             Self::ApprovalAuthenticationFailed => "approval authentication failed",
-            Self::ApprovalDenied => "request was denied",
+            Self::ApprovalDenied => "agent request was denied",
             Self::ApprovalTimeout => "approval request timed out",
             Self::ApprovalCancelled => "approval request was cancelled",
             Self::TouchIdUnavailable => "Touch ID is unavailable; use a session PIN",

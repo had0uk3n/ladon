@@ -292,6 +292,30 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         Ok(())
     }
 
+    pub fn coordinate_secret_mutation<P, T>(
+        &self,
+        secret_id: SecretId,
+        prepare: impl FnOnce() -> Result<P, LadonError>,
+        commit: impl FnOnce(P) -> Result<T, LadonError>,
+    ) -> Result<T, LadonError> {
+        let mut state = self.lock_state()?;
+        let prepared = prepare()?;
+        if let Some(pending) = state.pending.as_mut()
+            && pending
+                .request
+                .secrets()
+                .iter()
+                .any(|secret| secret.id() == secret_id)
+        {
+            pending.decision = Some(ApprovalDecision::Cancel);
+            self.changed.notify_all();
+        }
+        state.grants.revoke_secret(secret_id);
+        let result = commit(prepared);
+        self.changed.notify_all();
+        result
+    }
+
     pub fn with_valid_grant<T>(
         &self,
         ticket: &GrantTicket,

@@ -360,3 +360,94 @@ fn a_new_vault_unlock_session_invalidates_old_grants() {
     coordinator.deny(pending.id()).unwrap();
     assert_eq!(waiting.join().unwrap(), Err(LadonError::ApprovalDenied));
 }
+
+#[test]
+fn secret_mutation_validation_failure_preserves_the_grant() {
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "changed")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator.approve(pending.id()).unwrap();
+    let ticket = waiting.join().unwrap().unwrap();
+
+    assert_eq!(
+        coordinator.coordinate_secret_mutation(
+            secret,
+            || Err::<(), _>(LadonError::DuplicateSecretName),
+            |()| -> Result<(), LadonError> { panic!("commit must not run") },
+        ),
+        Err(LadonError::DuplicateSecretName)
+    );
+    assert_eq!(coordinator.with_valid_grant(&ticket, || Ok(7)), Ok(7));
+}
+
+#[test]
+fn secret_mutation_cancels_pending_and_revokes_only_the_changed_secret() {
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let approved_client = Uuid::new_v4();
+    let waiting_client = Uuid::new_v4();
+    let changed = SecretId::new();
+    let untouched = SecretId::new();
+    let initial = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(
+                    approved_client,
+                    &[(changed, "changed"), (untouched, "untouched")],
+                ),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator.approve(pending.id()).unwrap();
+    let changed_ticket = initial.join().unwrap().unwrap();
+    let untouched_ticket = coordinator
+        .authorize(
+            request(approved_client, &[(untouched, "untouched")]),
+            &RunCancellation::new(),
+        )
+        .unwrap();
+    let blocked = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(waiting_client, &[(changed, "changed")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    wait_for_pending(&coordinator);
+
+    assert_eq!(
+        coordinator.coordinate_secret_mutation(changed, || Ok("prepared"), |value| Ok(value)),
+        Ok("prepared")
+    );
+    assert_eq!(blocked.join().unwrap(), Err(LadonError::ApprovalCancelled));
+    assert_eq!(
+        coordinator.with_valid_grant(&changed_ticket, || Ok(())),
+        Err(LadonError::ApprovalCancelled)
+    );
+    assert_eq!(
+        coordinator.with_valid_grant(&untouched_ticket, || Ok(9)),
+        Ok(9)
+    );
+}

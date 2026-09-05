@@ -15,8 +15,8 @@ use ladon_core::{
 use uuid::Uuid;
 
 use crate::{
-    ApprovalCoordinator, LocalServer, PendingApproval, RunCancellation, RunTermination, Supervisor,
-    VaultController, VaultUiPhase, default_endpoint_path,
+    ApprovalCoordinator, EditSecretDraft, LocalServer, PendingApproval, RunCancellation,
+    RunTermination, Supervisor, VaultController, VaultUiPhase, default_endpoint_path,
 };
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -240,6 +240,50 @@ impl LocalBrokerHandle {
         self.approval.cancel_pending()?;
         let _block = self.coordinator.block_new_runs()?;
         self.approval.revoke_all()
+    }
+
+    pub fn update_secret(
+        &self,
+        controller: &Arc<Mutex<VaultController>>,
+        draft: &EditSecretDraft,
+    ) -> Result<(), LadonError> {
+        self.approval.coordinate_secret_mutation(
+            draft.id(),
+            || {
+                controller
+                    .lock()
+                    .map_err(|_| LadonError::ProcessFailure)?
+                    .prepare_secret_update(draft)
+            },
+            |update| {
+                controller
+                    .lock()
+                    .map_err(|_| LadonError::ProcessFailure)?
+                    .apply_secret_update(update)
+            },
+        )
+    }
+
+    pub fn delete_secret(
+        &self,
+        controller: &Arc<Mutex<VaultController>>,
+        id: ladon_core::SecretId,
+    ) -> Result<(), LadonError> {
+        self.approval.coordinate_secret_mutation(
+            id,
+            || {
+                controller
+                    .lock()
+                    .map_err(|_| LadonError::ProcessFailure)?
+                    .ensure_secret_exists(id)
+            },
+            |()| {
+                controller
+                    .lock()
+                    .map_err(|_| LadonError::ProcessFailure)?
+                    .delete_secret(id)
+            },
+        )
     }
 }
 

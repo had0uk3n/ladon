@@ -8,7 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ladon_app::{AddSecretDraft, LocalBrokerHandle, LocalClient, SensitiveText, VaultController};
+use ladon_app::{
+    AddSecretDraft, EditableValue, LocalBrokerHandle, LocalClient, SensitiveText, VaultController,
+};
 use ladon_core::{
     BindingTarget, RpcMethod, RpcRequest, RpcResult, SecretBindingRequest, encode_request_frame,
 };
@@ -261,6 +263,73 @@ fn approved_name_cannot_switch_to_a_replacement_secret_before_launch() {
         !marker.exists(),
         "replacement secret reached a child process"
     );
+}
+
+#[test]
+fn edit_revokes_the_old_grant_before_future_use() {
+    let directory = tempfile::tempdir().unwrap();
+    let passphrase = SensitiveText::from("correct horse");
+    let mut initial = VaultController::new(directory.path().join("vault.ladon"));
+    initial.create(&passphrase, &passphrase).unwrap();
+    let mut added = AddSecretDraft::new();
+    added.set_name("test-token");
+    added.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-broker-secret");
+    let secret_id = initial.add_secret(&mut added).unwrap();
+    let controller = Arc::new(Mutex::new(initial));
+    let endpoint = directory.path().join("broker.sock");
+    let server = LocalBrokerHandle::start_at(Arc::clone(&controller), &endpoint).unwrap();
+    let client = LocalClient::new(&endpoint);
+    let client_session_id = Uuid::new_v4();
+    let run = || RpcMethod::Run {
+        executable: "/bin/sh".to_owned(),
+        arguments: vec!["-c".to_owned(), "printf %s \"$TOKEN\"".to_owned()],
+        working_directory: directory.path().to_string_lossy().into_owned(),
+        bindings: vec![SecretBindingRequest {
+            secret_ref: "test-token".to_owned(),
+            field: "value".to_owned(),
+            target: BindingTarget::Environment {
+                name: "TOKEN".to_owned(),
+            },
+        }],
+        timeout_ms: 5_000,
+        output_limit_bytes: 64 * 1024,
+    };
+
+    let first_client = client.clone();
+    let first_method = run();
+    let first =
+        thread::spawn(move || first_client.call(&request_for(client_session_id, first_method)));
+    let pending = wait_for_pending(&server);
+    server.approve(pending.id()).unwrap();
+    assert!(matches!(
+        first.join().unwrap().unwrap().result(),
+        Some(RpcResult::Run { .. })
+    ));
+
+    let mut edit = controller.lock().unwrap().load_secret(secret_id).unwrap();
+    let EditableValue::Text(value) = edit.fields_mut()[0].value_mut() else {
+        panic!("expected text field");
+    };
+    value.clear();
+    value.push_str("fake-replacement-secret");
+    server.update_secret(&controller, &edit).unwrap();
+
+    let retry_client = client.clone();
+    let retry_method = run();
+    let retry =
+        thread::spawn(move || retry_client.call(&request_for(client_session_id, retry_method)));
+    let pending = wait_for_pending(&server);
+    server.deny(pending.id()).unwrap();
+    let response = retry.join().unwrap().unwrap();
+    assert_eq!(
+        response.error_details(),
+        Some(("approval_denied", "agent request was denied"))
+    );
+    let debug = format!("{response:?}");
+    assert!(!debug.contains("fake-broker-secret"));
+    assert!(!debug.contains("fake-replacement-secret"));
 }
 
 fn request_for(client_session_id: Uuid, method: RpcMethod) -> RpcRequest {

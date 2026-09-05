@@ -93,3 +93,21 @@ fn revoke_all_removes_every_active_grant() {
     assert_eq!(grants.missing(second_client, [first]), vec![first]);
     assert_eq!(grants.len(), 0);
 }
+
+#[test]
+fn revoke_secret_removes_only_that_secret_across_clients() {
+    let clock = FakeClock::new();
+    let mut grants = GrantStore::new(clock, Duration::from_secs(60));
+    let first_client = Uuid::new_v4();
+    let second_client = Uuid::new_v4();
+    let changed = SecretId::new();
+    let untouched = SecretId::new();
+    grants.grant(first_client, [changed, untouched]);
+    grants.grant(second_client, [changed]);
+
+    grants.revoke_secret(changed);
+
+    assert_eq!(grants.missing(first_client, [changed]), [changed]);
+    assert!(grants.missing(first_client, [untouched]).is_empty());
+    assert_eq!(grants.missing(second_client, [changed]), [changed]);
+}

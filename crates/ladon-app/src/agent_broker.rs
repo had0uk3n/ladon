@@ -196,14 +196,32 @@ impl LocalBrokerHandle {
         &self,
         controller: &Arc<Mutex<VaultController>>,
     ) -> Result<(), LadonError> {
-        self.approval.cancel_pending()?;
-        self.approval.revoke_all()?;
-        let _block = self.coordinator.block_new_runs()?;
-        controller
-            .lock()
-            .map_err(|_| LadonError::ProcessFailure)?
-            .lock();
-        Ok(())
+        let mut first_error = None;
+        if let Err(error) = self.approval.cancel_pending() {
+            first_error = Some(error);
+        }
+        if let Err(error) = self.approval.revoke_all()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        let _block = match self.coordinator.block_new_runs() {
+            Ok(block) => Some(block),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                None
+            }
+        };
+        match controller.lock() {
+            Ok(mut controller) => controller.lock(),
+            Err(_) if first_error.is_none() => {
+                first_error = Some(LadonError::ProcessFailure);
+            }
+            Err(_) => {}
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn auto_lock_controller_if_idle(
@@ -495,6 +513,41 @@ fn run_result(result: Result<crate::RunResult, LadonError>) -> Result<RpcResult,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordination_failure_does_not_skip_the_vault_lock_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.ladon");
+        let passphrase = crate::SensitiveText::from("correct horse");
+        let controller = Arc::new(Mutex::new(VaultController::new(path)));
+        controller
+            .lock()
+            .unwrap()
+            .create(&passphrase, &passphrase)
+            .unwrap();
+        let coordinator = Arc::new(RunCoordinator::default());
+        let poisoned = Arc::clone(&coordinator);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poisoned.state.lock().unwrap();
+                panic!("poison coordinator");
+            })
+            .join()
+            .is_err()
+        );
+        let broker = LocalBrokerHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            coordinator,
+            approval: Arc::new(ApprovalCoordinator::session_defaults()),
+            thread: None,
+        };
+
+        assert_eq!(
+            broker.cancel_active_run_and_lock(&controller),
+            Err(LadonError::ProcessFailure)
+        );
+        assert_eq!(controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+    }
 
     #[test]
     fn blocking_new_runs_atomically_cancels_and_waits_for_the_active_run() {

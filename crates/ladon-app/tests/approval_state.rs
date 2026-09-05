@@ -438,7 +438,7 @@ fn secret_mutation_cancels_pending_and_revokes_only_the_changed_secret() {
     wait_for_pending(&coordinator);
 
     assert_eq!(
-        coordinator.coordinate_secret_mutation(changed, || Ok("prepared"), |value| Ok(value)),
+        coordinator.coordinate_secret_mutation(changed, || Ok("prepared"), Ok),
         Ok("prepared")
     );
     assert_eq!(blocked.join().unwrap(), Err(LadonError::ApprovalCancelled));

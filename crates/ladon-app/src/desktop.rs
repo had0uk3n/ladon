@@ -1010,11 +1010,14 @@ impl LadonDesktop {
             controller.lock();
             Ok(())
         });
-        if result.is_ok() {
-            self.clear_sensitive_state();
-            self.notice = None;
-        } else {
-            self.notice_from(result, "Vault locked");
+        self.finish_immediate_lock(result);
+    }
+
+    fn finish_immediate_lock(&mut self, result: Result<(), LadonError>) {
+        self.clear_sensitive_state();
+        match result {
+            Ok(()) => self.notice = None,
+            Err(error) => self.notice_from(Err(error), ""),
         }
     }
 
@@ -1710,6 +1713,53 @@ mod tests {
         assert!(!app.detail.has_sensitive_buffer());
         assert!(!app.unlock_confirmation);
         assert!(!app.discard_confirmation);
+        assert!(app.focused_approval.is_none());
+    }
+
+    #[test]
+    fn failed_immediate_lock_still_wipes_gui_authentication_and_detail_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.ladon");
+        let controller = Arc::new(Mutex::new(VaultController::new(path.clone())));
+        let mut draft = AddSecretDraft::new();
+        draft.set_name("unsaved");
+        draft.fields_mut()[0].value_mut().push_str("fake-secret");
+        let mut app = LadonDesktop {
+            _instance_lock: InstanceLock::acquire(&path).unwrap(),
+            controller,
+            #[cfg(unix)]
+            broker: None,
+            passphrase: SensitiveText::from("fake-passphrase"),
+            confirmation: SensitiveText::from("fake-passphrase"),
+            session_pin: SensitiveText::from("123456"),
+            session_pin_confirmation: SensitiveText::from("123456"),
+            local_pin: SensitiveText::from("123456"),
+            session_confirmation: Some(SessionConfirmation::with_pin(
+                SessionPin::new(
+                    &SensitiveText::from("123456"),
+                    &SensitiveText::from("123456"),
+                )
+                .unwrap(),
+            )),
+            focused_approval: Some(Uuid::new_v4()),
+            draft,
+            notice: None,
+            detail: SecretDetailState::default(),
+            unlock_confirmation: true,
+            discard_confirmation: true,
+            pending_delete: Some(SecretId::new()),
+            last_phase: VaultUiPhase::Unlocked,
+        };
+
+        app.finish_immediate_lock(Err(LadonError::ProcessFailure));
+
+        assert!(app.passphrase.as_str().is_empty());
+        assert!(app.draft.name().is_empty());
+        assert!(app.local_pin.as_str().is_empty());
+        assert!(app.session_confirmation.is_none());
+        assert!(!app.unlock_confirmation);
+        assert!(!app.discard_confirmation);
+        assert!(app.pending_delete.is_none());
         assert!(app.focused_approval.is_none());
     }
 

@@ -90,3 +90,31 @@ fn cli_rejects_timeouts_above_two_hours_before_ipc() {
     assert_ne!(exit, 0);
     assert!(transport.seen.borrow().is_empty());
 }
+
+struct LockedTransport;
+
+impl RpcTransport for LockedTransport {
+    fn call(&self, request: &RpcRequest) -> Result<RpcResponse, ladon_core::LadonError> {
+        Ok(RpcResponse::error(
+            request.request_id,
+            ladon_core::LadonError::VaultUnavailable,
+        ))
+    }
+}
+
+#[test]
+fn cli_preserves_safe_remote_error_codes() {
+    let mut stderr = Vec::new();
+    let exit = execute_cli(
+        ["ladon".to_owned(), "list".to_owned()],
+        &LockedTransport,
+        &mut Vec::new(),
+        &mut stderr,
+    );
+
+    assert_ne!(exit, 0);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "vault_unavailable: neither managed vault copy can be opened\n"
+    );
+}

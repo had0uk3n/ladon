@@ -80,6 +80,50 @@ pub enum LadonError {
 
 impl LadonError {
     #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "invalid_secret_ref" => Self::InvalidSecretRef,
+            "invalid_field_name" => Self::InvalidFieldName,
+            "field_too_large" => Self::FieldTooLarge,
+            "duplicate_field" => Self::DuplicateField,
+            "empty_record" => Self::EmptyRecord,
+            "too_many_fields" => Self::TooManyFields,
+            "vault_payload_too_large" => Self::VaultPayloadTooLarge,
+            "invalid_vault_payload" => Self::InvalidVaultPayload,
+            "invalid_vault_file" => Self::InvalidVaultFile,
+            "unsupported_vault_version" => Self::UnsupportedVaultVersion,
+            "vault_authentication_failed" => Self::VaultAuthenticationFailed,
+            "crypto_unavailable" => Self::CryptoUnavailable,
+            "duplicate_secret_name" => Self::DuplicateSecretName,
+            "secret_not_found" => Self::SecretNotFound,
+            "field_not_found" => Self::FieldNotFound,
+            "revision_overflow" => Self::RevisionOverflow,
+            "storage_failure" => Self::StorageFailure,
+            "vault_unavailable" => Self::VaultUnavailable,
+            "invalid_frame" => Self::InvalidFrame,
+            "frame_too_large" => Self::FrameTooLarge,
+            "invalid_request" => Self::InvalidRequest,
+            "unsupported_protocol_version" => Self::UnsupportedProtocolVersion,
+            "invalid_output_limit" => Self::InvalidOutputLimit,
+            "invalid_executable_path" => Self::InvalidExecutablePath,
+            "invalid_working_directory" => Self::InvalidWorkingDirectory,
+            "invalid_binding" => Self::InvalidBinding,
+            "too_many_bindings" => Self::TooManyBindings,
+            "invalid_timeout" => Self::InvalidTimeout,
+            "injected_data_too_large" => Self::InjectedDataTooLarge,
+            "secret_in_command" => Self::SecretInCommand,
+            "busy" => Self::Busy,
+            "process_failure" => Self::ProcessFailure,
+            "already_running" => Self::AlreadyRunning,
+            "unsafe_endpoint" => Self::UnsafeEndpoint,
+            "endpoint_unavailable" => Self::EndpointUnavailable,
+            "invalid_peer" => Self::InvalidPeer,
+            "invalid_passphrase" => Self::InvalidPassphrase,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Self::InvalidSecretRef => "invalid_secret_ref",

@@ -62,8 +62,8 @@ fn call_and_render(
 }
 
 fn render_response(response: &RpcResponse, stdout: &mut impl Write) -> Result<(), LadonError> {
-    if response.error_details().is_some() {
-        return Err(LadonError::InvalidRequest);
+    if let Some((code, _)) = response.error_details() {
+        return Err(LadonError::from_code(code).unwrap_or(LadonError::InvalidRequest));
     }
     let result = response.result().ok_or(LadonError::InvalidRequest)?;
     serde_json::to_writer_pretty(&mut *stdout, result).map_err(|_| LadonError::InvalidRequest)?;

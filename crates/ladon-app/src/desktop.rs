@@ -30,13 +30,19 @@ const AMBER: Color32 = Color32::from_rgb(216, 144, 0);
 const DANGER: Color32 = Color32::from_rgb(197, 59, 59);
 const PANEL: Color32 = Color32::from_rgb(255, 255, 255);
 const BORDER: Color32 = Color32::from_rgb(218, 225, 236);
+const AUTH_WINDOW_SIZE: [f32; 2] = [500.0, 380.0];
+const MANAGER_WINDOW_SIZE: [f32; 2] = [640.0, 420.0];
+const WINDOW_MIN_SIZE: [f32; 2] = [480.0, 340.0];
+const SECRET_RAIL_WIDTH: f32 = 180.0;
+const WORKSPACE_CARD_WIDTH: f32 = 380.0;
+const AUTH_FORM_WIDTH: f32 = 340.0;
 
 pub fn run_desktop() -> Result<(), &'static str> {
     let path = default_vault_path().ok_or("Ladon cannot resolve the per-user data directory")?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 620.0])
-            .with_min_inner_size([720.0, 520.0]),
+            .with_inner_size(AUTH_WINDOW_SIZE)
+            .with_min_inner_size(WINDOW_MIN_SIZE),
         centered: true,
         ..Default::default()
     };
@@ -72,6 +78,7 @@ struct LadonDesktop {
     discard_confirmation: bool,
     pending_delete: Option<SecretId>,
     last_phase: VaultUiPhase,
+    manager_window_active: bool,
 }
 
 enum ApprovalAction {
@@ -105,6 +112,13 @@ enum DetailAction {
     Cancel,
 }
 
+#[derive(Clone, Copy)]
+enum DeleteAction {
+    Request,
+    Confirm,
+    Cancel,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfirmationAction {
     TouchId,
@@ -124,6 +138,28 @@ fn confirmation_actions(touch_id_available: bool, pin_configured: bool) -> Vec<C
         actions.push(ConfirmationAction::Pin);
     }
     actions
+}
+
+struct FieldNameSummary<'a> {
+    primary: Option<&'a str>,
+    additional_count: usize,
+    additional_hover: String,
+}
+
+fn summarize_field_names(field_names: &[String]) -> FieldNameSummary<'_> {
+    FieldNameSummary {
+        primary: field_names.first().map(String::as_str),
+        additional_count: field_names.len().saturating_sub(1),
+        additional_hover: field_names.get(1..).unwrap_or_default().join("\n"),
+    }
+}
+
+fn window_size(manager_active: bool) -> [f32; 2] {
+    if manager_active {
+        MANAGER_WINDOW_SIZE
+    } else {
+        AUTH_WINDOW_SIZE
+    }
 }
 
 struct Notice {
@@ -168,6 +204,7 @@ impl LadonDesktop {
             discard_confirmation: false,
             pending_delete: None,
             last_phase,
+            manager_window_active: false,
         })
     }
 
@@ -253,7 +290,7 @@ impl LadonDesktop {
         centered_column(ui, |ui| {
             ui.label(
                 RichText::new("Confirm protected actions")
-                    .size(28.0)
+                    .size(24.0)
                     .color(INK),
             );
             ui.add_space(8.0);
@@ -263,7 +300,7 @@ impl LadonDesktop {
                 )
                 .color(MUTED),
             );
-            ui.add_space(22.0);
+            ui.add_space(14.0);
 
             let touch_id_available = TouchIdAuthenticator::is_available();
             let can_continue_with_touch_id = can_finish_session_setup(touch_id_available, false);
@@ -279,14 +316,14 @@ impl LadonDesktop {
             }
 
             if touch_id_available {
-                ui.add_space(18.0);
-                ui.label(RichText::new("Optional session PIN").color(MUTED));
                 ui.add_space(12.0);
+                ui.label(RichText::new("Optional session PIN").color(MUTED));
+                ui.add_space(8.0);
             }
             password_field(ui, &mut self.session_pin, "PIN (4–12 digits)");
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             password_field(ui, &mut self.session_pin_confirmation, "Repeat PIN");
-            ui.add_space(18.0);
+            ui.add_space(12.0);
             if primary_button(ui, "Set PIN and continue").clicked() {
                 match SessionPin::new(&self.session_pin, &self.session_pin_confirmation) {
                     Ok(pin) => {
@@ -311,26 +348,35 @@ impl LadonDesktop {
         });
     }
 
+    fn synchronize_window_size(&mut self, context: &egui::Context, manager_active: bool) {
+        if self.manager_window_active == manager_active {
+            return;
+        }
+        self.manager_window_active = manager_active;
+        let size = window_size(manager_active);
+        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
+    }
+
     fn show_unlocked(&mut self, context: &egui::Context) {
         self.show_secret_rail(context);
         let selected_metadata = self.selected_metadata();
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(CANVAS).inner_margin(Margin::same(38)))
+            .frame(Frame::new().fill(CANVAS).inner_margin(Margin::same(20)))
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         if let Some(secret) = &selected_metadata {
-                            ui.label(RichText::new(&secret.name).size(28.0).color(INK));
+                            ui.label(RichText::new(&secret.name).size(24.0).color(INK));
                             ui.label(
-                                RichText::new(format!("Immutable ID: {}", secret.id)).color(MUTED),
+                                RichText::new(format!("ID: {}", secret.id))
+                                    .size(11.0)
+                                    .color(MUTED),
                             );
                         } else {
-                            ui.label(RichText::new("Add a secret").size(28.0).color(INK));
+                            ui.label(RichText::new("Add a secret").size(24.0).color(INK));
                             ui.label(
-                                RichText::new(
-                                    "One name, one value — add more fields only when needed.",
-                                )
-                                .color(MUTED),
+                                RichText::new("One name, one value. Add fields when needed.")
+                                    .color(MUTED),
                             );
                         }
                     });
@@ -340,13 +386,15 @@ impl LadonDesktop {
                         }
                     });
                 });
-                ui.add_space(28.0);
-                if let Some(secret) = &selected_metadata {
-                    self.show_selected_workspace(ui, secret);
-                } else {
-                    self.show_add_workspace(ui);
-                }
-                self.show_notice(ui);
+                ui.add_space(16.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(secret) = &selected_metadata {
+                        self.show_selected_workspace(ui, secret);
+                    } else {
+                        self.show_add_workspace(ui);
+                    }
+                    self.show_notice(ui);
+                });
             });
 
         if self.unlock_confirmation {
@@ -367,9 +415,9 @@ impl LadonDesktop {
             .fill(PANEL)
             .stroke(Stroke::new(1.0_f32, BORDER))
             .corner_radius(10)
-            .inner_margin(Margin::same(24))
+            .inner_margin(Margin::same(18))
             .show(ui, |ui| {
-                ui.set_max_width(570.0);
+                ui.set_width(WORKSPACE_CARD_WIDTH);
                 field_label(ui, "Name");
                 ui.add(
                     TextEdit::singleline(self.draft.name_mut())
@@ -391,7 +439,7 @@ impl LadonDesktop {
                             ui.add(
                                 TextEdit::singleline(field.name_mut())
                                     .hint_text("field_name")
-                                    .desired_width(180.0),
+                                    .desired_width(120.0),
                             );
                         });
                         ui.add_space(10.0);
@@ -401,7 +449,7 @@ impl LadonDesktop {
                                 ui,
                                 field.value_mut(),
                                 "kept out of chat and command arguments",
-                                350.0,
+                                230.0,
                             );
                         });
                     });
@@ -427,13 +475,48 @@ impl LadonDesktop {
         let session_id = self.vault_session_id().ok();
         let authorized = session_id.is_some_and(|id| self.detail.is_authorized(id));
         let mut action = None;
+        let mut delete_action = None;
+        let editing = self.detail.is_editing();
         Frame::new()
             .fill(PANEL)
             .stroke(Stroke::new(1.0_f32, BORDER))
             .corner_radius(10)
-            .inner_margin(Margin::same(24))
+            .inner_margin(Margin::same(18))
             .show(ui, |ui| {
-                ui.set_max_width(570.0);
+                ui.set_width(WORKSPACE_CARD_WIDTH);
+                if !editing {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Secret values").strong().color(INK));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if self.pending_delete == Some(secret.id) {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Delete").color(Color32::WHITE),
+                                        )
+                                        .fill(DANGER),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_action = Some(DeleteAction::Confirm);
+                                }
+                                if quiet_button(ui, "Cancel").clicked() {
+                                    delete_action = Some(DeleteAction::Cancel);
+                                }
+                            } else if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Delete").color(DANGER))
+                                        .frame(false),
+                                )
+                                .clicked()
+                            {
+                                delete_action = Some(DeleteAction::Request);
+                            }
+                        });
+                    });
+                    ui.separator();
+                    ui.add_space(8.0);
+                }
                 if !authorized {
                     for field_name in &secret.field_names {
                         field_label(ui, field_name);
@@ -506,7 +589,7 @@ impl LadonDesktop {
                                     .add(
                                         TextEdit::singleline(field.name_mut())
                                             .hint_text("field_name")
-                                            .desired_width(170.0),
+                                            .desired_width(118.0),
                                     )
                                     .changed()
                                 {
@@ -514,7 +597,7 @@ impl LadonDesktop {
                                 }
                                 match field.value_mut() {
                                     EditableValue::Text(value) => {
-                                        if sensitive_text_field(ui, value, "secret value", 270.0)
+                                        if sensitive_text_field(ui, value, "secret value", 210.0)
                                             .changed()
                                         {
                                             *dirty = true;
@@ -530,7 +613,7 @@ impl LadonDesktop {
                                         );
                                     }
                                 }
-                                if ui.button("Remove").clicked() {
+                                if ui.button("×").on_hover_text("Remove field").clicked() {
                                     remove_index = Some(index);
                                 }
                             });
@@ -559,6 +642,25 @@ impl LadonDesktop {
                 }
             });
 
+        match delete_action {
+            Some(DeleteAction::Request) => {
+                self.pending_delete = Some(secret.id);
+                self.notice = Some(Notice {
+                    text: "Delete this secret permanently?".to_owned(),
+                    danger: true,
+                });
+            }
+            Some(DeleteAction::Confirm) => {
+                let result = self.delete_secret(secret.id);
+                self.pending_delete = None;
+                self.handle_delete_result(result);
+            }
+            Some(DeleteAction::Cancel) => {
+                self.pending_delete = None;
+            }
+            None => {}
+        }
+
         if let Some(action) = action {
             self.handle_detail_action(action);
         }
@@ -566,8 +668,8 @@ impl LadonDesktop {
 
     fn show_secret_rail(&mut self, context: &egui::Context) {
         egui::SidePanel::left("secret-rail")
-            .exact_width(248.0)
-            .frame(Frame::new().fill(INK).inner_margin(Margin::same(18)))
+            .exact_width(SECRET_RAIL_WIDTH)
+            .frame(Frame::new().fill(INK).inner_margin(Margin::same(12)))
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -584,7 +686,7 @@ impl LadonDesktop {
                         );
                     });
                 });
-                ui.add_space(18.0);
+                ui.add_space(12.0);
                 let remaining = with_controller(&self.controller, |controller| {
                     Ok(controller.remaining_unlocked().unwrap_or_default())
                 })
@@ -604,10 +706,10 @@ impl LadonDesktop {
                         .and_then(LocalBrokerHandle::revoke_grants);
                     self.notice_from(result, "Agent access revoked");
                 }
-                ui.add_space(28.0);
+                ui.add_space(18.0);
                 ui.label(
-                    RichText::new("SECRETS")
-                        .size(11.0)
+                    RichText::new("Secrets")
+                        .size(12.0)
                         .color(Color32::from_rgb(158, 176, 211)),
                 );
                 ui.add_space(8.0);
@@ -633,60 +735,43 @@ impl LadonDesktop {
                 }
                 for secret in &secrets {
                     let selected = self.detail.selected() == Some(secret.id);
-                    if ui
-                        .selectable_label(
-                            selected,
-                            RichText::new(&secret.name).color(Color32::WHITE),
-                        )
-                        .clicked()
-                    {
-                        self.request_navigation(NavigationTarget::Secret(secret.id));
-                    }
-                    ui.label(
-                        RichText::new(secret.field_names.join(", "))
-                            .size(11.0)
-                            .color(Color32::from_rgb(158, 176, 211)),
-                    );
-                    ui.add_space(8.0);
-                }
-
-                if let Some(selected) = self.detail.selected()
-                    && !self.detail.is_editing()
-                {
-                    ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                        if self.pending_delete == Some(selected) {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Confirm delete").color(DANGER),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    let result = self.delete_secret(selected);
-                                    self.pending_delete = None;
-                                    self.handle_delete_result(result);
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    self.pending_delete = None;
-                                }
-                            });
-                        } else if ui
-                            .add(
-                                egui::Button::new(RichText::new("Delete selected").color(DANGER))
-                                    .frame(false),
+                    let summary = summarize_field_names(&secret.field_names);
+                    let mut select = false;
+                    ui.horizontal(|ui| {
+                        select = ui
+                            .add_sized(
+                                [74.0, 22.0],
+                                egui::Button::selectable(
+                                    selected,
+                                    RichText::new(&secret.name).color(Color32::WHITE),
+                                )
+                                .frame(false)
+                                .truncate(),
                             )
-                            .clicked()
-                        {
-                            self.pending_delete = Some(selected);
-                            self.notice = Some(Notice {
-                                text: "Delete this secret permanently?".to_owned(),
-                                danger: true,
-                            });
+                            .on_hover_text(&secret.name)
+                            .clicked();
+                        if let Some(primary) = summary.primary {
+                            ui.label(
+                                RichText::new(primary)
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(173, 187, 214)),
+                            )
+                            .on_hover_text(primary);
+                        }
+                        if summary.additional_count > 0 {
+                            ui.label(
+                                RichText::new(format!("+{}", summary.additional_count))
+                                    .size(10.0)
+                                    .strong()
+                                    .color(COBALT),
+                            )
+                            .on_hover_text(&summary.additional_hover);
                         }
                     });
+                    if select {
+                        self.request_navigation(NavigationTarget::Secret(secret.id));
+                    }
+                    ui.add_space(4.0);
                 }
             });
     }
@@ -733,10 +818,10 @@ impl LadonDesktop {
             .frame(
                 Frame::window(&context.style())
                     .fill(PANEL)
-                    .inner_margin(Margin::same(24)),
+                    .inner_margin(Margin::same(18)),
             )
             .show(context, |ui| {
-                ui.set_width(430.0);
+                ui.set_width(AUTH_FORM_WIDTH);
                 ui.label(RichText::new("Unlock this secret").size(24.0).color(INK));
                 ui.label(RichText::new("Confirm once for this selected secret.").color(MUTED));
                 ui.add_space(18.0);
@@ -1037,10 +1122,10 @@ impl LadonDesktop {
             .frame(
                 Frame::window(&context.style())
                     .fill(PANEL)
-                    .inner_margin(Margin::same(24)),
+                    .inner_margin(Margin::same(18)),
             )
             .show(context, |ui| {
-                ui.set_width(390.0);
+                ui.set_width(AUTH_FORM_WIDTH);
                 ui.label(
                     RichText::new("Discard unsaved changes?")
                         .size(22.0)
@@ -1594,6 +1679,10 @@ impl eframe::App for LadonDesktop {
         let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
             .unwrap_or(VaultUiPhase::Locked);
         self.synchronize_phase(phase);
+        self.synchronize_window_size(
+            context,
+            phase == VaultUiPhase::Unlocked && self.session_confirmation.is_some(),
+        );
         self.process_touch_id_result();
         if phase == VaultUiPhase::Unlocked
             && context.input(|input| input.viewport().close_requested())
@@ -1666,14 +1755,14 @@ fn configure_style(context: &egui::Context) {
 
 fn shell(context: &egui::Context, content: impl FnOnce(&mut egui::Ui)) {
     egui::CentralPanel::default()
-        .frame(Frame::new().fill(CANVAS).inner_margin(Margin::same(36)))
+        .frame(Frame::new().fill(CANVAS).inner_margin(Margin::same(24)))
         .show(context, content);
 }
 
 fn centered_column(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     ui.with_layout(Layout::top_down(Align::Center), |ui| {
-        ui.add_space(90.0);
-        ui.set_max_width(430.0);
+        ui.add_space(24.0);
+        ui.set_max_width(AUTH_FORM_WIDTH);
         content(ui);
     });
 }
@@ -1683,7 +1772,7 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 }
 
 fn password_field(ui: &mut egui::Ui, value: &mut SensitiveText, hint: &str) -> egui::Response {
-    sensitive_text_field(ui, value, hint, 430.0)
+    sensitive_text_field(ui, value, hint, AUTH_FORM_WIDTH)
 }
 
 fn sensitive_text_field(
@@ -1823,6 +1912,7 @@ mod tests {
                 discard_confirmation: editing,
                 pending_delete: None,
                 last_phase: VaultUiPhase::Unlocked,
+                manager_window_active: true,
             },
             endpoint,
             directory,
@@ -2091,6 +2181,7 @@ mod tests {
             discard_confirmation: true,
             pending_delete: None,
             last_phase: VaultUiPhase::Unlocked,
+            manager_window_active: true,
         };
 
         controller.lock().unwrap().lock();
@@ -2143,6 +2234,7 @@ mod tests {
             discard_confirmation: true,
             pending_delete: Some(SecretId::new()),
             last_phase: VaultUiPhase::Unlocked,
+            manager_window_active: true,
         };
 
         app.finish_immediate_lock(Err(LadonError::ProcessFailure));
@@ -2206,5 +2298,38 @@ mod tests {
         pin.push_str("654321");
         assert!(update_focused_approval(&mut focused, &mut pin, None));
         assert!(pin.as_str().is_empty());
+    }
+
+    #[test]
+    fn compact_desktop_layout_has_stable_dimensions() {
+        assert_eq!(AUTH_WINDOW_SIZE, [500.0, 380.0]);
+        assert_eq!(MANAGER_WINDOW_SIZE, [640.0, 420.0]);
+        assert_eq!(WINDOW_MIN_SIZE, [480.0, 340.0]);
+        assert_eq!(SECRET_RAIL_WIDTH, 180.0);
+        assert_eq!(WORKSPACE_CARD_WIDTH, 380.0);
+        assert_eq!(AUTH_FORM_WIDTH, 340.0);
+        assert_eq!(window_size(false), AUTH_WINDOW_SIZE);
+        assert_eq!(window_size(true), MANAGER_WINDOW_SIZE);
+    }
+
+    #[test]
+    fn secret_rail_keeps_one_field_inline_and_hides_the_rest_in_hover_text() {
+        let fields = vec![
+            "value".to_owned(),
+            "username".to_owned(),
+            "endpoint".to_owned(),
+        ];
+
+        let summary = summarize_field_names(&fields);
+
+        assert_eq!(summary.primary, Some("value"));
+        assert_eq!(summary.additional_count, 2);
+        assert_eq!(summary.additional_hover, "username\nendpoint");
+
+        let single_field = ["token".to_owned()];
+        let single = summarize_field_names(&single_field);
+        assert_eq!(single.primary, Some("token"));
+        assert_eq!(single.additional_count, 0);
+        assert!(single.additional_hover.is_empty());
     }
 }

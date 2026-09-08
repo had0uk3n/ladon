@@ -179,6 +179,10 @@ fn window_size(manager_active: bool) -> [f32; 2] {
     }
 }
 
+fn manager_rendering_allowed(phase: VaultUiPhase, desktop_lock: DesktopLockState) -> bool {
+    phase == VaultUiPhase::Unlocked && desktop_lock == DesktopLockState::Active
+}
+
 struct Notice {
     text: String,
     danger: bool,
@@ -379,7 +383,7 @@ impl LadonDesktop {
         context.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
     }
 
-    fn show_unlocked(&mut self, context: &egui::Context) {
+    fn show_unlocked(&mut self, context: &egui::Context) -> bool {
         self.show_secret_rail(context);
         let selected_metadata = self.selected_metadata();
         egui::CentralPanel::default()
@@ -420,6 +424,14 @@ impl LadonDesktop {
                 });
             });
 
+        let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
+            .unwrap_or(VaultUiPhase::Locked);
+        if !manager_rendering_allowed(phase, self.desktop_lock) {
+            self.synchronize_window_size(context, false);
+            self.show_lock_overlay(context, phase);
+            return false;
+        }
+
         if self.unlock_confirmation {
             if let Some(secret) = self.selected_metadata() {
                 self.show_secret_confirmation(context, &secret);
@@ -431,6 +443,30 @@ impl LadonDesktop {
         if self.discard_confirmation {
             self.show_discard_confirmation(context);
         }
+        true
+    }
+
+    fn show_lock_overlay(&mut self, context: &egui::Context, phase: VaultUiPhase) {
+        let rect = context.screen_rect();
+        let overlay_id = egui::Id::new("app-lock-content");
+        context
+            .layer_painter(egui::LayerId::new(egui::Order::Foreground, overlay_id))
+            .rect_filled(rect, 0.0, CANVAS);
+        egui::Area::new(overlay_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(context, |ui| {
+                ui.set_min_size(rect.size());
+                match phase {
+                    VaultUiPhase::Locked => self.show_locked(ui),
+                    VaultUiPhase::Unlocked => match self.desktop_lock {
+                        DesktopLockState::Locking { .. } => self.show_app_locking(ui),
+                        DesktopLockState::Locked { .. } => self.show_app_locked(ui),
+                        DesktopLockState::Active => {}
+                    },
+                    VaultUiPhase::FirstRun | VaultUiPhase::RecoveryRequired => {}
+                }
+            });
     }
 
     fn show_add_workspace(&mut self, ui: &mut egui::Ui) {
@@ -1842,9 +1878,10 @@ impl eframe::App for LadonDesktop {
                     shell(context, |ui| self.show_session_auth_setup(ui));
                 }
                 DesktopLockState::Active => {
-                    self.show_unlocked(context);
-                    #[cfg(unix)]
-                    self.show_pending_approval(context);
+                    if self.show_unlocked(context) {
+                        #[cfg(unix)]
+                        self.show_pending_approval(context);
+                    }
                 }
             },
         }
@@ -2450,6 +2487,26 @@ mod tests {
             vec![ConfirmationAction::Pin]
         );
         assert!(confirmation_actions(false, false).is_empty());
+    }
+
+    #[test]
+    fn manager_rendering_stops_as_soon_as_app_lock_begins() {
+        assert!(manager_rendering_allowed(
+            VaultUiPhase::Unlocked,
+            DesktopLockState::Active
+        ));
+        assert!(!manager_rendering_allowed(
+            VaultUiPhase::Unlocked,
+            DesktopLockState::Locking { epoch: 1 }
+        ));
+        assert!(!manager_rendering_allowed(
+            VaultUiPhase::Unlocked,
+            DesktopLockState::Locked { epoch: 1 }
+        ));
+        assert!(!manager_rendering_allowed(
+            VaultUiPhase::Locked,
+            DesktopLockState::Active
+        ));
     }
 
     #[test]

@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ladon_app::{ApprovalCoordinator, ApprovalSecret, PendingApproval, RunCancellation};
+use ladon_app::{
+    AppAccessState, ApprovalCoordinator, ApprovalSecret, PendingApproval, RunCancellation,
+};
 use ladon_core::{LadonError, MonotonicClock, SecretId};
 use uuid::Uuid;
 
@@ -557,4 +559,145 @@ fn mutation_commit_failure_stays_revoked_and_requires_future_reapproval() {
     let pending = wait_for_pending(&coordinator);
     coordinator.deny(pending.id()).unwrap();
     assert_eq!(retry.join().unwrap(), Err(LadonError::ApprovalDenied));
+}
+
+#[test]
+fn app_access_gate_rejects_stale_and_overlapping_transitions() {
+    let coordinator = ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(30 * 60),
+        Duration::from_secs(2),
+    );
+
+    assert_eq!(
+        coordinator.app_access_state().unwrap(),
+        AppAccessState::Active
+    );
+    let first = coordinator.begin_app_lock().unwrap();
+    assert_eq!(
+        coordinator.app_access_state().unwrap(),
+        AppAccessState::Locking { epoch: first }
+    );
+    assert_eq!(coordinator.begin_app_lock(), Err(LadonError::Busy));
+    assert_eq!(
+        coordinator.finish_app_lock(first.wrapping_add(1)),
+        Err(LadonError::InvalidRequest)
+    );
+
+    coordinator.finish_app_lock(first).unwrap();
+    assert_eq!(
+        coordinator.app_access_state().unwrap(),
+        AppAccessState::Locked { epoch: first }
+    );
+    assert_eq!(
+        coordinator.unlock_app(first.wrapping_add(1)),
+        Err(LadonError::InvalidRequest)
+    );
+    coordinator.unlock_app(first).unwrap();
+    assert_eq!(
+        coordinator.app_access_state().unwrap(),
+        AppAccessState::Active
+    );
+}
+
+#[test]
+fn hard_lock_reset_invalidates_a_soft_lock_epoch() {
+    let coordinator = ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(30 * 60),
+        Duration::from_secs(2),
+    );
+    let epoch = coordinator.begin_app_lock().unwrap();
+    coordinator.finish_app_lock(epoch).unwrap();
+    coordinator.reset_after_vault_lock().unwrap();
+
+    assert_eq!(
+        coordinator.app_access_state().unwrap(),
+        AppAccessState::Active
+    );
+    assert_eq!(
+        coordinator.unlock_app(epoch),
+        Err(LadonError::InvalidRequest)
+    );
+}
+
+#[test]
+fn app_lock_cancels_pending_approval() {
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(30 * 60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "pending")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    wait_for_pending(&coordinator);
+
+    coordinator.begin_app_lock().unwrap();
+
+    assert_eq!(waiting.join().unwrap(), Err(LadonError::ApprovalCancelled));
+    assert_eq!(coordinator.pending().unwrap(), None);
+}
+
+#[test]
+fn app_lock_revokes_grants_before_secret_resolution() {
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(30 * 60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "granted")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator.approve(pending.id()).unwrap();
+    let ticket = waiting.join().unwrap().unwrap();
+    let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    coordinator.begin_app_lock().unwrap();
+
+    assert_eq!(
+        coordinator.with_valid_grant(&ticket, || {
+            resolved.store(true, Ordering::Relaxed);
+            Ok(())
+        }),
+        Err(LadonError::ApprovalCancelled)
+    );
+    assert!(!resolved.load(Ordering::Relaxed));
+}
+
+#[test]
+fn locked_app_rejects_new_authorizations_without_pending_request() {
+    let coordinator = ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(30 * 60),
+        Duration::from_secs(2),
+    );
+    let epoch = coordinator.begin_app_lock().unwrap();
+    coordinator.finish_app_lock(epoch).unwrap();
+
+    assert_eq!(
+        coordinator.authorize(
+            request(Uuid::new_v4(), &[(SecretId::new(), "blocked")]),
+            &RunCancellation::new(),
+        ),
+        Err(LadonError::VaultLocked)
+    );
+    assert_eq!(coordinator.pending().unwrap(), None);
 }

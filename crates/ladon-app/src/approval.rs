@@ -132,10 +132,19 @@ pub struct ApprovalCoordinator<C = SystemMonotonicClock> {
     approval_timeout: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppAccessState {
+    Active,
+    Locking { epoch: u64 },
+    Locked { epoch: u64 },
+}
+
 struct ApprovalState<C> {
     grants: GrantStore<C>,
     vault_session_id: Option<Uuid>,
     pending: Option<PendingState>,
+    app_access: AppAccessState,
+    lock_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,6 +175,8 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                 grants: GrantStore::new(clock, grant_lifetime),
                 vault_session_id: None,
                 pending: None,
+                app_access: AppAccessState::Active,
+                lock_epoch: 0,
             }),
             changed: Condvar::new(),
             approval_timeout,
@@ -178,6 +189,9 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         cancellation: &RunCancellation,
     ) -> Result<GrantTicket, LadonError> {
         let mut state = self.lock_state()?;
+        if !is_app_active(&state) {
+            return Err(LadonError::VaultLocked);
+        }
         if state.pending.is_some() {
             return Err(LadonError::Busy);
         }
@@ -272,6 +286,70 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             .map(|pending| pending.request.clone()))
     }
 
+    pub fn app_access_state(&self) -> Result<AppAccessState, LadonError> {
+        Ok(self.lock_state()?.app_access)
+    }
+
+    pub fn require_app_active(&self) -> Result<(), LadonError> {
+        let state = self.lock_state()?;
+        if is_app_active(&state) {
+            Ok(())
+        } else {
+            Err(LadonError::VaultLocked)
+        }
+    }
+
+    pub fn begin_app_lock(&self) -> Result<u64, LadonError> {
+        let mut state = self.lock_state()?;
+        if !is_app_active(&state) {
+            return Err(LadonError::Busy);
+        }
+        let epoch = state
+            .lock_epoch
+            .checked_add(1)
+            .ok_or(LadonError::InvalidRequest)?;
+        state.lock_epoch = epoch;
+        state.app_access = AppAccessState::Locking { epoch };
+        cancel_pending(&mut state);
+        state.grants.revoke_all();
+        self.changed.notify_all();
+        Ok(epoch)
+    }
+
+    pub fn finish_app_lock(&self, epoch: u64) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        if state.app_access != (AppAccessState::Locking { epoch }) {
+            return Err(LadonError::InvalidRequest);
+        }
+        state.app_access = AppAccessState::Locked { epoch };
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn unlock_app(&self, epoch: u64) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        if state.app_access != (AppAccessState::Locked { epoch }) {
+            return Err(LadonError::InvalidRequest);
+        }
+        state.app_access = AppAccessState::Active;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn reset_after_vault_lock(&self) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        state.lock_epoch = state
+            .lock_epoch
+            .checked_add(1)
+            .ok_or(LadonError::InvalidRequest)?;
+        state.app_access = AppAccessState::Active;
+        cancel_pending(&mut state);
+        state.grants.revoke_all();
+        state.vault_session_id = None;
+        self.changed.notify_all();
+        Ok(())
+    }
+
     pub fn approve(&self, approval_id: Uuid) -> Result<(), LadonError> {
         self.set_decision(approval_id, ApprovalDecision::Approve)
     }
@@ -320,7 +398,8 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         operation: impl FnOnce() -> Result<T, LadonError>,
     ) -> Result<T, LadonError> {
         let mut state = self.lock_state()?;
-        if state.vault_session_id != Some(ticket.vault_session_id)
+        if !is_app_active(&state)
+            || state.vault_session_id != Some(ticket.vault_session_id)
             || !state
                 .grants
                 .missing(ticket.client_session_id, ticket.secret_ids.iter().copied())
@@ -351,6 +430,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
     }
 }
 
+fn is_app_active<C>(state: &ApprovalState<C>) -> bool {
+    state.app_access == AppAccessState::Active
+}
+
 impl ApprovalCoordinator<SystemMonotonicClock> {
     #[must_use]
     pub fn session_defaults() -> Self {
@@ -377,5 +460,11 @@ fn clear_pending<C>(state: &mut ApprovalState<C>, approval_id: Uuid) {
         .is_some_and(|pending| pending.request.id == approval_id)
     {
         state.pending = None;
+    }
+}
+
+fn cancel_pending<C>(state: &mut ApprovalState<C>) {
+    if let Some(pending) = state.pending.as_mut() {
+        pending.decision = Some(ApprovalDecision::Cancel);
     }
 }

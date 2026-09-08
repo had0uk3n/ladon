@@ -13,7 +13,9 @@ mod ui;
 
 #[cfg(unix)]
 pub use agent_broker::LocalBrokerHandle;
-pub use approval::{ApprovalCoordinator, ApprovalSecret, GrantTicket, PendingApproval};
+pub use approval::{
+    AppAccessState, ApprovalCoordinator, ApprovalSecret, GrantTicket, PendingApproval,
+};
 #[cfg(feature = "gui")]
 pub use desktop::run_desktop;
 #[cfg(unix)]

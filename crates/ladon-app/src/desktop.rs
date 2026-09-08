@@ -13,7 +13,7 @@ use eframe::egui::{
 use ladon_core::{LadonError, SecretId, SecretMetadata};
 
 #[cfg(unix)]
-use crate::LocalBrokerHandle;
+use crate::agent_broker::{AppLockAttempt, LocalBrokerHandle};
 use crate::touch_id::TouchIdAttempt;
 use crate::{
     AddSecretDraft, DetailMode, LocalAuthAttempt, NavigationResult, NavigationTarget,
@@ -36,6 +36,18 @@ const WINDOW_MIN_SIZE: [f32; 2] = [480.0, 340.0];
 const SECRET_RAIL_WIDTH: f32 = 180.0;
 const WORKSPACE_CARD_WIDTH: f32 = 380.0;
 const AUTH_FORM_WIDTH: f32 = 340.0;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DesktopLockState {
+    #[default]
+    Active,
+    Locking {
+        epoch: u64,
+    },
+    Locked {
+        epoch: u64,
+    },
+}
 
 pub fn run_desktop() -> Result<(), &'static str> {
     let path = default_vault_path().ok_or("Ladon cannot resolve the per-user data directory")?;
@@ -69,6 +81,11 @@ struct LadonDesktop {
     session_pin_confirmation: SensitiveText,
     local_pin: SensitiveText,
     session_confirmation: Option<SessionConfirmation>,
+    desktop_lock: DesktopLockState,
+    desktop_lock_epoch: u64,
+    #[cfg(unix)]
+    pending_app_lock: Option<AppLockAttempt>,
+    app_unlock_pin_visible: bool,
     pending_touch_id: Option<PendingTouchId>,
     focused_approval: Option<uuid::Uuid>,
     draft: AddSecretDraft,
@@ -195,6 +212,11 @@ impl LadonDesktop {
             session_pin_confirmation: SensitiveText::default(),
             local_pin: SensitiveText::default(),
             session_confirmation: None,
+            desktop_lock: DesktopLockState::default(),
+            desktop_lock_epoch: 0,
+            #[cfg(unix)]
+            pending_app_lock: None,
+            app_unlock_pin_visible: false,
             pending_touch_id: None,
             focused_approval: None,
             draft: AddSecretDraft::new(),
@@ -381,8 +403,9 @@ impl LadonDesktop {
                         }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if quiet_button(ui, "Lock now").clicked() {
-                            self.lock_immediately();
+                        if quiet_button(ui, "Lock app").clicked() {
+                            self.lock_app();
+                            context.request_repaint();
                         }
                     });
                 });
@@ -1184,11 +1207,112 @@ impl LadonDesktop {
         self.finish_immediate_lock(result);
     }
 
+    fn lock_app(&mut self) {
+        self.lock_app_with_touch_id_availability(TouchIdAuthenticator::is_available());
+    }
+
+    fn lock_app_with_touch_id_availability(&mut self, touch_id_available: bool) {
+        let can_unlock = touch_id_available
+            || self
+                .session_confirmation
+                .as_ref()
+                .is_some_and(SessionConfirmation::has_pin);
+        if !can_unlock {
+            self.lock_immediately();
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            let attempt = self
+                .broker
+                .as_ref()
+                .ok_or(LadonError::EndpointUnavailable)
+                .and_then(LocalBrokerHandle::begin_app_lock);
+            match attempt {
+                Ok(attempt) => {
+                    let epoch = attempt.epoch();
+                    self.desktop_lock_epoch = epoch;
+                    self.desktop_lock = DesktopLockState::Locking { epoch };
+                    self.pending_app_lock = Some(attempt);
+                    self.clear_for_app_lock();
+                }
+                Err(_) => self.lock_immediately(),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let Some(epoch) = self.desktop_lock_epoch.checked_add(1) else {
+                self.lock_immediately();
+                return;
+            };
+            self.desktop_lock_epoch = epoch;
+            self.desktop_lock = DesktopLockState::Locking { epoch };
+            self.clear_for_app_lock();
+            self.desktop_lock = DesktopLockState::Locked { epoch };
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_app_lock_result(&mut self) {
+        let completion = self
+            .pending_app_lock
+            .as_ref()
+            .and_then(|attempt| attempt.try_result().map(|result| (attempt.epoch(), result)));
+        let Some((epoch, result)) = completion else {
+            return;
+        };
+        self.pending_app_lock = None;
+        self.finish_app_lock_result(epoch, result);
+    }
+
+    #[cfg(unix)]
+    fn finish_app_lock_result(&mut self, epoch: u64, result: Result<(), LadonError>) {
+        let expected = self.desktop_lock == DesktopLockState::Locking { epoch }
+            && self.desktop_lock_epoch == epoch;
+        if result.is_ok() && expected {
+            self.desktop_lock = DesktopLockState::Locked { epoch };
+        } else {
+            self.lock_immediately();
+        }
+    }
+
+    fn show_app_locking(&mut self, ui: &mut egui::Ui) {
+        centered_column(ui, |ui| {
+            ui.label(RichText::new("Ladon").size(28.0).color(INK));
+            ui.add_space(8.0);
+            ui.label(RichText::new("Finishing active command cleanup…").color(MUTED));
+        });
+    }
+
+    fn show_app_locked(&mut self, ui: &mut egui::Ui) {
+        centered_column(ui, |ui| {
+            ui.label(RichText::new("Ladon").size(28.0).color(INK));
+            ui.add_space(8.0);
+            ui.label(RichText::new("App locked").color(MUTED));
+            ui.add_space(22.0);
+            if quiet_button(ui, "Lock vault completely").clicked() {
+                self.lock_immediately();
+            }
+        });
+    }
+
     fn finish_immediate_lock(&mut self, result: Result<(), LadonError>) {
         self.clear_sensitive_state();
         match result {
             Ok(()) => self.notice = None,
             Err(error) => self.notice_from(Err(error), ""),
+        }
+    }
+
+    fn finish_auto_lock(&mut self, auto_locked: bool) {
+        if auto_locked {
+            self.clear_sensitive_state();
+            self.notice = Some(Notice {
+                text: "Vault locked after 30 minutes without secret activity".to_owned(),
+                danger: false,
+            });
         }
     }
 
@@ -1222,12 +1346,12 @@ impl LadonDesktop {
         self.confirmation.clear();
     }
 
-    fn clear_sensitive_state(&mut self) {
+    fn clear_for_app_lock(&mut self) {
         self.clear_unlock_fields();
         self.session_pin.clear();
         self.session_pin_confirmation.clear();
         self.local_pin.clear();
-        self.session_confirmation = None;
+        self.app_unlock_pin_visible = false;
         self.pending_touch_id = None;
         self.focused_approval = None;
         self.draft = AddSecretDraft::new();
@@ -1235,6 +1359,17 @@ impl LadonDesktop {
         self.unlock_confirmation = false;
         self.discard_confirmation = false;
         self.pending_delete = None;
+        self.notice = None;
+    }
+
+    fn clear_sensitive_state(&mut self) {
+        self.clear_for_app_lock();
+        self.session_confirmation = None;
+        #[cfg(unix)]
+        {
+            self.pending_app_lock = None;
+        }
+        self.desktop_lock = DesktopLockState::Active;
     }
 
     fn synchronize_phase(&mut self, phase: VaultUiPhase) {
@@ -1667,24 +1802,24 @@ impl eframe::App for LadonDesktop {
             Ok(controller.auto_lock_if_idle())
         })
         .unwrap_or(false);
-        if auto_locked {
-            self.clear_sensitive_state();
-            self.notice = Some(Notice {
-                text: "Vault locked after 30 minutes without secret activity".to_owned(),
-                danger: false,
-            });
-        }
+        self.finish_auto_lock(auto_locked);
         context.request_repaint_after(Duration::from_secs(1));
+
+        #[cfg(unix)]
+        self.process_app_lock_result();
+        self.process_touch_id_result();
 
         let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
             .unwrap_or(VaultUiPhase::Locked);
         self.synchronize_phase(phase);
         self.synchronize_window_size(
             context,
-            phase == VaultUiPhase::Unlocked && self.session_confirmation.is_some(),
+            phase == VaultUiPhase::Unlocked
+                && self.desktop_lock == DesktopLockState::Active
+                && self.session_confirmation.is_some(),
         );
-        self.process_touch_id_result();
         if phase == VaultUiPhase::Unlocked
+            && self.desktop_lock == DesktopLockState::Active
             && context.input(|input| input.viewport().close_requested())
             && self.detail.request_navigation(NavigationTarget::Close)
                 == NavigationResult::ConfirmDiscard
@@ -1696,14 +1831,22 @@ impl eframe::App for LadonDesktop {
             VaultUiPhase::FirstRun => shell(context, |ui| self.show_first_run(ui)),
             VaultUiPhase::Locked => shell(context, |ui| self.show_locked(ui)),
             VaultUiPhase::RecoveryRequired => shell(context, |ui| self.show_recovery(ui)),
-            VaultUiPhase::Unlocked if self.session_confirmation.is_none() => {
-                shell(context, |ui| self.show_session_auth_setup(ui));
-            }
-            VaultUiPhase::Unlocked => {
-                self.show_unlocked(context);
-                #[cfg(unix)]
-                self.show_pending_approval(context);
-            }
+            VaultUiPhase::Unlocked => match self.desktop_lock {
+                DesktopLockState::Locking { .. } => {
+                    shell(context, |ui| self.show_app_locking(ui));
+                }
+                DesktopLockState::Locked { .. } => {
+                    shell(context, |ui| self.show_app_locked(ui));
+                }
+                DesktopLockState::Active if self.session_confirmation.is_none() => {
+                    shell(context, |ui| self.show_session_auth_setup(ui));
+                }
+                DesktopLockState::Active => {
+                    self.show_unlocked(context);
+                    #[cfg(unix)]
+                    self.show_pending_approval(context);
+                }
+            },
         }
     }
 
@@ -1903,6 +2046,10 @@ mod tests {
                 session_pin_confirmation: SensitiveText::default(),
                 local_pin: SensitiveText::from("1234"),
                 session_confirmation: Some(SessionConfirmation::with_pin(session_pin)),
+                desktop_lock: DesktopLockState::Active,
+                desktop_lock_epoch: 0,
+                pending_app_lock: None,
+                app_unlock_pin_visible: false,
                 pending_touch_id: None,
                 focused_approval: None,
                 draft: AddSecretDraft::new(),
@@ -2064,6 +2211,222 @@ mod tests {
         drop(directory);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn app_lock_clears_gui_owned_secret_values_without_ending_the_vault_session() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(true);
+        app.passphrase = SensitiveText::from("fake-passphrase");
+        app.confirmation = SensitiveText::from("fake-passphrase");
+        app.session_pin = SensitiveText::from("1234");
+        app.session_pin_confirmation = SensitiveText::from("1234");
+        app.focused_approval = Some(Uuid::new_v4());
+        app.draft.set_name("unsaved");
+        app.draft.fields_mut()[0]
+            .value_mut()
+            .push_str("fake-draft-secret");
+        app.unlock_confirmation = true;
+        app.pending_delete = Some(SecretId::new());
+        app.notice = Some(Notice {
+            text: "fake-secret-notice".to_owned(),
+            danger: false,
+        });
+        app.desktop_lock_epoch = 12;
+        app.desktop_lock = DesktopLockState::Locked { epoch: 12 };
+        app.app_unlock_pin_visible = true;
+        let vault_session_id = app.vault_session_id().unwrap();
+
+        app.clear_for_app_lock();
+
+        assert_eq!(app.vault_session_id().unwrap(), vault_session_id);
+        assert!(app.session_confirmation.is_some());
+        assert_eq!(app.desktop_lock, DesktopLockState::Locked { epoch: 12 });
+        assert_eq!(app.desktop_lock_epoch, 12);
+        assert!(!app.app_unlock_pin_visible);
+        assert!(app.passphrase.as_str().is_empty());
+        assert!(app.confirmation.as_str().is_empty());
+        assert!(app.session_pin.as_str().is_empty());
+        assert!(app.session_pin_confirmation.as_str().is_empty());
+        assert!(app.draft.name().is_empty());
+        assert!(app.draft.fields()[0].value().as_str().is_empty());
+        assert!(app.local_pin.as_str().is_empty());
+        assert!(app.detail.selected().is_none());
+        assert!(!app.detail.has_sensitive_buffer());
+        assert!(app.pending_touch_id.is_none());
+        assert!(app.focused_approval.is_none());
+        assert!(!app.unlock_confirmation);
+        assert!(!app.discard_confirmation);
+        assert!(app.pending_delete.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[cfg(unix)]
+    fn finish_pending_app_lock(app: &mut LadonDesktop) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while matches!(app.desktop_lock, DesktopLockState::Locking { .. }) {
+            app.process_app_lock_result();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "app lock cleanup did not complete"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_lock_and_unlock_do_not_extend_the_controller_idle_deadline() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        let before = app.controller.lock().unwrap().remaining_unlocked().unwrap();
+
+        app.lock_app();
+        assert!(matches!(app.desktop_lock, DesktopLockState::Locking { .. }));
+        assert!(app.pending_app_lock.is_some());
+        assert!(app.session_confirmation.is_some());
+        assert!(app.detail.selected().is_none());
+        assert!(!app.detail.has_sensitive_buffer());
+        finish_pending_app_lock(&mut app);
+        let DesktopLockState::Locked { epoch } = app.desktop_lock else {
+            panic!("app lock did not reach the locked state");
+        };
+        let after_lock = app.controller.lock().unwrap().remaining_unlocked().unwrap();
+        app.broker.as_ref().unwrap().unlock_app(epoch).unwrap();
+        app.desktop_lock = DesktopLockState::Active;
+        let after_unlock = app.controller.lock().unwrap().remaining_unlocked().unwrap();
+
+        assert!(after_lock <= before);
+        assert!(after_unlock <= after_lock);
+        assert!(before.saturating_sub(after_unlock) < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_lock_completion_for_the_wrong_epoch_hard_locks_the_vault() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.desktop_lock_epoch = 9;
+        app.desktop_lock = DesktopLockState::Locking { epoch: 9 };
+
+        app.finish_app_lock_result(8, Ok(()));
+
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_expiry_while_app_locked_clears_the_retained_confirmation() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.desktop_lock_epoch = 4;
+        app.desktop_lock = DesktopLockState::Locked { epoch: 4 };
+        app.clear_for_app_lock();
+        app.controller.lock().unwrap().lock();
+
+        app.finish_auto_lock(true);
+
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_mcp_lock_upgrades_an_app_lock_to_a_hard_vault_lock() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        assert!(matches!(app.desktop_lock, DesktopLockState::Locked { .. }));
+
+        let client = crate::LocalClient::new(endpoint);
+        let locking = std::thread::spawn(move || {
+            client.call(&ladon_core::RpcRequest {
+                version: 2,
+                request_id: Uuid::new_v4(),
+                client_session_id: Uuid::new_v4(),
+                client_label: "app-locked hard-lock regression".to_owned(),
+                method: ladon_core::RpcMethod::Lock,
+            })
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if app
+                .broker
+                .as_ref()
+                .unwrap()
+                .pending_external_lock()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "external lock notification never arrived"
+            );
+            std::thread::yield_now();
+        }
+
+        app.process_external_lock();
+
+        assert!(locking.join().unwrap().is_ok());
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_lock_completion_failure_wipes_gui_buffers_and_hard_locks_the_vault() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(true);
+        app.desktop_lock_epoch = 7;
+        app.desktop_lock = DesktopLockState::Locking { epoch: 7 };
+        app.passphrase = SensitiveText::from("fake-passphrase");
+        app.local_pin = SensitiveText::from("1234");
+        app.draft.set_name("fake-draft");
+
+        app.finish_app_lock_result(7, Err(LadonError::ProcessFailure));
+
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+        assert!(app.passphrase.as_str().is_empty());
+        assert!(app.local_pin.as_str().is_empty());
+        assert!(app.draft.name().is_empty());
+        assert!(app.detail.selected().is_none());
+        assert!(!app.detail.has_sensitive_buffer());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_lock_without_a_local_unlock_method_falls_back_to_a_hard_vault_lock() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.session_confirmation = Some(SessionConfirmation::touch_id_only());
+
+        app.lock_app_with_touch_id_availability(false);
+
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_lock_begin_failure_wipes_gui_buffers_and_hard_locks_the_vault() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(true);
+        app.broker = None;
+        app.draft.set_name("fake-draft");
+        app.local_pin = SensitiveText::from("1234");
+
+        app.lock_app_with_touch_id_availability(false);
+
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+        assert!(app.draft.name().is_empty());
+        assert!(app.local_pin.as_str().is_empty());
+        assert!(app.detail.selected().is_none());
+        assert!(!app.detail.has_sensitive_buffer());
+    }
+
     #[test]
     fn session_setup_requires_pin_only_when_touch_id_is_unavailable() {
         assert!(can_finish_session_setup(true, false));
@@ -2172,6 +2535,11 @@ mod tests {
                 )
                 .unwrap(),
             )),
+            desktop_lock: DesktopLockState::Active,
+            desktop_lock_epoch: 0,
+            #[cfg(unix)]
+            pending_app_lock: None,
+            app_unlock_pin_visible: false,
             pending_touch_id: None,
             focused_approval: Some(Uuid::new_v4()),
             draft,
@@ -2183,6 +2551,9 @@ mod tests {
             last_phase: VaultUiPhase::Unlocked,
             manager_window_active: true,
         };
+        app.desktop_lock_epoch = 5;
+        app.desktop_lock = DesktopLockState::Locked { epoch: 5 };
+        app.app_unlock_pin_visible = true;
 
         controller.lock().unwrap().lock();
         app.synchronize_phase(VaultUiPhase::Locked);
@@ -2198,6 +2569,10 @@ mod tests {
         assert!(!app.unlock_confirmation);
         assert!(!app.discard_confirmation);
         assert!(app.focused_approval.is_none());
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(!app.app_unlock_pin_visible);
+        #[cfg(unix)]
+        assert!(app.pending_app_lock.is_none());
     }
 
     #[test]
@@ -2225,6 +2600,11 @@ mod tests {
                 )
                 .unwrap(),
             )),
+            desktop_lock: DesktopLockState::Active,
+            desktop_lock_epoch: 0,
+            #[cfg(unix)]
+            pending_app_lock: None,
+            app_unlock_pin_visible: false,
             pending_touch_id: None,
             focused_approval: Some(Uuid::new_v4()),
             draft,
@@ -2236,6 +2616,9 @@ mod tests {
             last_phase: VaultUiPhase::Unlocked,
             manager_window_active: true,
         };
+        app.desktop_lock_epoch = 6;
+        app.desktop_lock = DesktopLockState::Locking { epoch: 6 };
+        app.app_unlock_pin_visible = true;
 
         app.finish_immediate_lock(Err(LadonError::ProcessFailure));
 
@@ -2247,6 +2630,10 @@ mod tests {
         assert!(!app.discard_confirmation);
         assert!(app.pending_delete.is_none());
         assert!(app.focused_approval.is_none());
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(!app.app_unlock_pin_visible);
+        #[cfg(unix)]
+        assert!(app.pending_app_lock.is_none());
     }
 
     #[test]

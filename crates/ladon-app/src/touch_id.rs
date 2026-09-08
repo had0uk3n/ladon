@@ -6,6 +6,8 @@ use std::sync::{
 
 use ladon_core::LadonError;
 
+const APP_UNLOCK_REASON: &str = "Unlock Ladon on this device";
+
 pub struct TouchIdAuthenticator;
 
 pub(crate) struct TouchIdAttempt {
@@ -68,6 +70,10 @@ impl TouchIdAuthenticator {
         TouchIdAttempt::start(
             "Allow this agent session to use the displayed Ladon secrets for 30 minutes".to_owned(),
         )
+    }
+
+    pub(crate) fn authenticate_app() -> Result<TouchIdAttempt, LadonError> {
+        TouchIdAttempt::start(APP_UNLOCK_REASON.to_owned())
     }
 }
 
@@ -157,6 +163,12 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn app_unlock_reason_is_static_and_contains_no_contextual_data() {
+        assert!(!APP_UNLOCK_REASON.is_empty());
+        assert_eq!(APP_UNLOCK_REASON, "Unlock Ladon on this device");
+    }
 
     #[test]
     fn touch_id_attempt_runs_off_the_caller_thread_and_cancels_on_drop() {

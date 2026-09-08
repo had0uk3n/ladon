@@ -109,6 +109,10 @@ struct PendingTouchId {
 }
 
 enum TouchIdTarget {
+    AppUnlock {
+        vault_session_id: uuid::Uuid,
+        lock_epoch: u64,
+    },
     Secret {
         attempt: LocalAuthAttempt,
         vault_session_id: uuid::Uuid,
@@ -140,6 +144,21 @@ enum DeleteAction {
 enum ConfirmationAction {
     TouchId,
     Pin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppUnlockStart {
+    TouchId,
+    Pin,
+    HardLock,
+}
+
+fn app_unlock_start(touch_id_available: bool, pin_configured: bool) -> AppUnlockStart {
+    match (touch_id_available, pin_configured) {
+        (true, _) => AppUnlockStart::TouchId,
+        (false, true) => AppUnlockStart::Pin,
+        (false, false) => AppUnlockStart::HardLock,
+    }
 }
 
 fn can_finish_session_setup(touch_id_available: bool, pin_configured: bool) -> bool {
@@ -1011,7 +1030,15 @@ impl LadonDesktop {
         let Some(pending) = self.pending_touch_id.take() else {
             return;
         };
+        self.local_pin.clear();
         match (pending.target, result) {
+            (
+                TouchIdTarget::AppUnlock {
+                    vault_session_id,
+                    lock_epoch,
+                },
+                Ok(()),
+            ) => self.finish_app_unlock_touch_id(vault_session_id, lock_epoch),
             (
                 TouchIdTarget::Secret {
                     attempt,
@@ -1328,9 +1355,199 @@ impl LadonDesktop {
             ui.add_space(8.0);
             ui.label(RichText::new("App locked").color(MUTED));
             ui.add_space(22.0);
+            let mut focus_pin = false;
+            if !self.app_unlock_pin_visible && primary_button(ui, "Unlock").clicked() {
+                focus_pin = self.begin_app_unlock() == AppUnlockStart::Pin;
+            }
+            let pin_configured = self
+                .session_confirmation
+                .as_ref()
+                .is_some_and(SessionConfirmation::has_pin);
+            if pin_configured && !self.app_unlock_pin_visible {
+                ui.add_space(10.0);
+                if quiet_button(ui, "Use PIN instead").clicked() {
+                    self.use_app_unlock_pin();
+                    focus_pin = true;
+                }
+            }
+            if self.app_unlock_pin_visible {
+                ui.add_space(14.0);
+                let response = password_field(ui, &mut self.local_pin, "Session PIN");
+                if focus_pin {
+                    response.request_focus();
+                }
+                let submit =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                ui.add_space(10.0);
+                if primary_button(ui, "Unlock with PIN").clicked() || submit {
+                    self.authenticate_app_pin();
+                }
+            }
+            self.show_notice(ui);
+            ui.add_space(10.0);
             if quiet_button(ui, "Lock vault completely").clicked() {
                 self.lock_immediately();
             }
+        });
+    }
+
+    fn begin_app_unlock(&mut self) -> AppUnlockStart {
+        self.begin_app_unlock_with(
+            TouchIdAuthenticator::is_available(),
+            TouchIdAuthenticator::authenticate_app,
+        )
+    }
+
+    fn begin_app_unlock_with(
+        &mut self,
+        touch_id_available: bool,
+        authenticate: impl FnOnce() -> Result<TouchIdAttempt, LadonError>,
+    ) -> AppUnlockStart {
+        let pin_configured = self
+            .session_confirmation
+            .as_ref()
+            .is_some_and(SessionConfirmation::has_pin);
+        let start = app_unlock_start(touch_id_available, pin_configured);
+        match start {
+            AppUnlockStart::TouchId => {
+                if self.pending_touch_id.is_some() {
+                    return start;
+                }
+                let Some((vault_session_id, lock_epoch)) = self.current_app_unlock_context() else {
+                    self.reject_stale_app_unlock();
+                    return start;
+                };
+                self.app_unlock_pin_visible = false;
+                self.local_pin.clear();
+                match authenticate() {
+                    Ok(authentication) => {
+                        self.pending_touch_id = Some(PendingTouchId {
+                            authentication,
+                            target: TouchIdTarget::AppUnlock {
+                                vault_session_id,
+                                lock_epoch,
+                            },
+                        });
+                    }
+                    Err(error) => self.notice_from(Err(error), ""),
+                }
+            }
+            AppUnlockStart::Pin => self.use_app_unlock_pin(),
+            AppUnlockStart::HardLock => self.lock_immediately(),
+        }
+        start
+    }
+
+    fn use_app_unlock_pin(&mut self) {
+        self.pending_touch_id = None;
+        self.local_pin.clear();
+        self.app_unlock_pin_visible = true;
+        self.notice = None;
+    }
+
+    fn authenticate_app_pin(&mut self) {
+        let Some((vault_session_id, lock_epoch)) = self.current_app_unlock_context() else {
+            self.reject_stale_app_unlock();
+            return;
+        };
+        self.authenticate_app_pin_for_context(vault_session_id, lock_epoch);
+    }
+
+    fn authenticate_app_pin_for_context(&mut self, vault_session_id: uuid::Uuid, lock_epoch: u64) {
+        if !self.app_unlock_context_matches(vault_session_id, lock_epoch) {
+            self.reject_stale_app_unlock();
+            return;
+        }
+        self.pending_touch_id = None;
+        let verification = self
+            .session_confirmation
+            .as_mut()
+            .ok_or(LadonError::ApprovalAuthenticationFailed)
+            .and_then(|confirmation| confirmation.verify_pin(&self.local_pin));
+        self.local_pin.clear();
+        match verification {
+            Ok(PinVerification::Accepted) => self.finish_app_unlock(vault_session_id, lock_epoch),
+            Ok(PinVerification::Rejected { remaining_attempts }) => {
+                self.notice = Some(Notice {
+                    text: format!("PIN rejected; {remaining_attempts} attempts remain"),
+                    danger: true,
+                });
+            }
+            Ok(PinVerification::LockVault) => self.lock_immediately(),
+            Err(error) => self.notice_from(Err(error), ""),
+        }
+    }
+
+    fn finish_app_unlock_touch_id(&mut self, vault_session_id: uuid::Uuid, lock_epoch: u64) {
+        self.local_pin.clear();
+        if !self.app_unlock_context_matches(vault_session_id, lock_epoch) {
+            self.reject_stale_app_unlock();
+            return;
+        }
+        let Some(confirmation) = &mut self.session_confirmation else {
+            self.reject_stale_app_unlock();
+            return;
+        };
+        confirmation.record_touch_id_success();
+        self.finish_app_unlock(vault_session_id, lock_epoch);
+    }
+
+    fn finish_app_unlock(&mut self, vault_session_id: uuid::Uuid, lock_epoch: u64) {
+        self.pending_touch_id = None;
+        self.local_pin.clear();
+        if !self.app_unlock_context_matches(vault_session_id, lock_epoch) {
+            self.reject_stale_app_unlock();
+            return;
+        }
+
+        #[cfg(unix)]
+        let result = self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(|broker| broker.unlock_app(lock_epoch));
+        #[cfg(not(unix))]
+        let result = Ok::<(), LadonError>(());
+
+        match result {
+            Ok(()) => {
+                self.desktop_lock = DesktopLockState::Active;
+                self.app_unlock_pin_visible = false;
+                self.notice = Some(Notice {
+                    text: "App unlocked".to_owned(),
+                    danger: false,
+                });
+            }
+            Err(error) => self.notice_from(Err(error), ""),
+        }
+    }
+
+    fn current_app_unlock_context(&self) -> Option<(uuid::Uuid, u64)> {
+        let DesktopLockState::Locked { epoch } = self.desktop_lock else {
+            return None;
+        };
+        if self.desktop_lock_epoch != epoch {
+            return None;
+        }
+        let controller = self.controller.lock().ok()?;
+        if controller.phase() != VaultUiPhase::Unlocked {
+            return None;
+        }
+        controller
+            .session_id()
+            .map(|vault_session_id| (vault_session_id, epoch))
+    }
+
+    fn app_unlock_context_matches(&self, vault_session_id: uuid::Uuid, lock_epoch: u64) -> bool {
+        self.current_app_unlock_context() == Some((vault_session_id, lock_epoch))
+    }
+
+    fn reject_stale_app_unlock(&mut self) {
+        self.pending_touch_id = None;
+        self.local_pin.clear();
+        self.notice = Some(Notice {
+            text: "Authentication expired because the app lock context changed".to_owned(),
+            danger: true,
         });
     }
 
@@ -2309,6 +2526,309 @@ mod tests {
         }
     }
 
+    #[test]
+    fn app_unlock_start_prefers_touch_id_and_falls_back_safely() {
+        assert_eq!(app_unlock_start(true, true), AppUnlockStart::TouchId);
+        assert_eq!(app_unlock_start(true, false), AppUnlockStart::TouchId);
+        assert_eq!(app_unlock_start(false, true), AppUnlockStart::Pin);
+        assert_eq!(app_unlock_start(false, false), AppUnlockStart::HardLock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_single_start_chooses_touch_id_when_pin_is_also_configured() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        let DesktopLockState::Locked { epoch } = app.desktop_lock else {
+            panic!("app lock did not reach the locked state");
+        };
+        let vault_session_id = app.vault_session_id().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let start = app.begin_app_unlock_with(true, || {
+            TouchIdAttempt::spawn_with(move |_| {
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+
+        assert_eq!(start, AppUnlockStart::TouchId);
+        assert!(matches!(
+            app.pending_touch_id.as_ref().map(|pending| &pending.target),
+            Some(TouchIdTarget::AppUnlock {
+                vault_session_id: pending_session_id,
+                lock_epoch: pending_epoch,
+            }) if *pending_session_id == vault_session_id && *pending_epoch == epoch
+        ));
+        assert!(!app.app_unlock_pin_visible);
+        release_tx.send(()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_stale_touch_id_success_does_not_reopen_the_broker_or_manager() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        let DesktopLockState::Locked { epoch } = app.desktop_lock else {
+            panic!("app lock did not reach the locked state");
+        };
+        let vault_session_id = app.vault_session_id().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let authentication = TouchIdAttempt::spawn_with(move |_| {
+            release_rx.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        app.pending_touch_id = Some(PendingTouchId {
+            authentication,
+            target: TouchIdTarget::AppUnlock {
+                vault_session_id,
+                lock_epoch: epoch,
+            },
+        });
+        let next_epoch = epoch.checked_add(1).unwrap();
+        app.desktop_lock_epoch = next_epoch;
+        app.desktop_lock = DesktopLockState::Locked { epoch: next_epoch };
+
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while app.pending_touch_id.is_some() {
+            app.process_touch_id_result();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake Touch ID result never arrived"
+            );
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            app.desktop_lock,
+            DesktopLockState::Locked { epoch: next_epoch }
+        );
+        assert!(!manager_rendering_allowed(
+            app.controller.lock().unwrap().phase(),
+            app.desktop_lock
+        ));
+        assert!(matches!(
+            app.broker.as_ref().unwrap().begin_app_lock(),
+            Err(LadonError::Busy)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_touch_id_success_for_another_vault_session_stays_locked() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        let DesktopLockState::Locked { epoch } = app.desktop_lock else {
+            panic!("app lock did not reach the locked state");
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let authentication = TouchIdAttempt::spawn_with(move |_| {
+            release_rx.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        app.pending_touch_id = Some(PendingTouchId {
+            authentication,
+            target: TouchIdTarget::AppUnlock {
+                vault_session_id: Uuid::new_v4(),
+                lock_epoch: epoch,
+            },
+        });
+
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while app.pending_touch_id.is_some() {
+            app.process_touch_id_result();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake Touch ID result never arrived"
+            );
+            std::thread::yield_now();
+        }
+
+        assert_eq!(app.desktop_lock, DesktopLockState::Locked { epoch });
+        assert!(matches!(
+            app.broker.as_ref().unwrap().begin_app_lock(),
+            Err(LadonError::Busy)
+        ));
+    }
+
+    #[cfg(unix)]
+    fn finish_fake_app_unlock_touch_id(app: &mut LadonDesktop, result: Result<(), LadonError>) {
+        let (vault_session_id, lock_epoch) = app.current_app_unlock_context().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let authentication = TouchIdAttempt::spawn_with(move |_| {
+            release_rx.recv().unwrap();
+            result
+        })
+        .unwrap();
+        app.pending_touch_id = Some(PendingTouchId {
+            authentication,
+            target: TouchIdTarget::AppUnlock {
+                vault_session_id,
+                lock_epoch,
+            },
+        });
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while app.pending_touch_id.is_some() {
+            app.process_touch_id_result();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake Touch ID result never arrived"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_cancelled_and_failed_touch_id_leave_pin_failures_untouched() {
+        for result in [
+            Err(LadonError::ApprovalCancelled),
+            Err(LadonError::ApprovalAuthenticationFailed),
+        ] {
+            let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+            app.lock_app();
+            finish_pending_app_lock(&mut app);
+            app.local_pin = SensitiveText::from("transient-value");
+
+            finish_fake_app_unlock_touch_id(&mut app, result);
+
+            assert!(matches!(app.desktop_lock, DesktopLockState::Locked { .. }));
+            assert!(app.local_pin.as_str().is_empty());
+            app.use_app_unlock_pin();
+            app.local_pin = SensitiveText::from("9999");
+            app.authenticate_app_pin();
+            assert_eq!(
+                app.notice.as_ref().unwrap().text,
+                "PIN rejected; 4 attempts remain"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_touch_id_success_resets_the_shared_pin_failure_counter() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        app.use_app_unlock_pin();
+        for remaining in [4, 3, 2, 1] {
+            app.local_pin = SensitiveText::from("9999");
+            app.authenticate_app_pin();
+            assert_eq!(
+                app.notice.as_ref().unwrap().text,
+                format!("PIN rejected; {remaining} attempts remain")
+            );
+        }
+
+        finish_fake_app_unlock_touch_id(&mut app, Ok(()));
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        app.use_app_unlock_pin();
+        app.local_pin = SensitiveText::from("9999");
+        app.authenticate_app_pin();
+
+        assert_eq!(
+            app.notice.as_ref().unwrap().text,
+            "PIN rejected; 4 attempts remain"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_five_wrong_pins_hard_lock_the_vault() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        app.use_app_unlock_pin();
+
+        for _ in 0..5 {
+            app.local_pin = SensitiveText::from("9999");
+            app.authenticate_app_pin();
+        }
+
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+        assert!(app.pending_touch_id.is_none());
+        assert!(app.local_pin.as_str().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_valid_pin_reopens_the_broker_and_manager() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        app.use_app_unlock_pin();
+        app.local_pin = SensitiveText::from("1234");
+
+        app.authenticate_app_pin();
+
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(manager_rendering_allowed(
+            app.controller.lock().unwrap().phase(),
+            app.desktop_lock
+        ));
+        assert!(app.local_pin.as_str().is_empty());
+        assert!(app.pending_touch_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_valid_pin_for_stale_context_does_not_reopen_the_gate() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.lock_app();
+        finish_pending_app_lock(&mut app);
+        let DesktopLockState::Locked { epoch } = app.desktop_lock else {
+            panic!("app lock did not reach the locked state");
+        };
+        app.use_app_unlock_pin();
+        app.local_pin = SensitiveText::from("9999");
+        app.authenticate_app_pin();
+        app.local_pin = SensitiveText::from("1234");
+
+        app.authenticate_app_pin_for_context(Uuid::new_v4(), epoch);
+
+        assert_eq!(app.desktop_lock, DesktopLockState::Locked { epoch });
+        assert!(app.local_pin.as_str().is_empty());
+        app.local_pin = SensitiveText::from("9999");
+        app.authenticate_app_pin();
+        assert_eq!(
+            app.notice.as_ref().unwrap().text,
+            "PIN rejected; 3 attempts remain"
+        );
+        assert!(matches!(
+            app.broker.as_ref().unwrap().begin_app_lock(),
+            Err(LadonError::Busy)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_unlock_without_an_available_method_hard_locks_the_vault() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.session_confirmation = Some(SessionConfirmation::touch_id_only());
+        app.lock_app_with_touch_id_availability(true);
+        finish_pending_app_lock(&mut app);
+
+        let start =
+            app.begin_app_unlock_with(false, || panic!("Touch ID must not start when unavailable"));
+
+        assert_eq!(start, AppUnlockStart::HardLock);
+        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        assert_eq!(app.desktop_lock, DesktopLockState::Active);
+        assert!(app.session_confirmation.is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn app_lock_and_unlock_do_not_extend_the_controller_idle_deadline() {
@@ -2322,12 +2842,11 @@ mod tests {
         assert!(app.detail.selected().is_none());
         assert!(!app.detail.has_sensitive_buffer());
         finish_pending_app_lock(&mut app);
-        let DesktopLockState::Locked { epoch } = app.desktop_lock else {
+        let DesktopLockState::Locked { .. } = app.desktop_lock else {
             panic!("app lock did not reach the locked state");
         };
         let after_lock = app.controller.lock().unwrap().remaining_unlocked().unwrap();
-        app.broker.as_ref().unwrap().unlock_app(epoch).unwrap();
-        app.desktop_lock = DesktopLockState::Active;
+        finish_fake_app_unlock_touch_id(&mut app, Ok(()));
         let after_unlock = app.controller.lock().unwrap().remaining_unlocked().unwrap();
 
         assert!(after_lock <= before);

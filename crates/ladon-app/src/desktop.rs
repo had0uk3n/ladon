@@ -190,6 +190,14 @@ fn summarize_field_names(field_names: &[String]) -> FieldNameSummary<'_> {
     }
 }
 
+fn secret_row_fill(selected: bool) -> Color32 {
+    if selected {
+        COBALT
+    } else {
+        Color32::TRANSPARENT
+    }
+}
+
 fn window_size(manager_active: bool) -> [f32; 2] {
     if manager_active {
         MANAGER_WINDOW_SIZE
@@ -567,27 +575,13 @@ impl LadonDesktop {
                         ui.label(RichText::new("Secret values").strong().color(INK));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if self.pending_delete == Some(secret.id) {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Delete").color(Color32::WHITE),
-                                        )
-                                        .fill(DANGER),
-                                    )
-                                    .clicked()
-                                {
+                                if danger_button(ui, "Delete").clicked() {
                                     delete_action = Some(DeleteAction::Confirm);
                                 }
                                 if quiet_button(ui, "Cancel").clicked() {
                                     delete_action = Some(DeleteAction::Cancel);
                                 }
-                            } else if ui
-                                .add(
-                                    egui::Button::new(RichText::new("Delete").color(DANGER))
-                                        .frame(false),
-                                )
-                                .clicked()
-                            {
+                            } else if danger_button(ui, "Delete").clicked() {
                                 delete_action = Some(DeleteAction::Request);
                             }
                         });
@@ -814,39 +808,49 @@ impl LadonDesktop {
                 for secret in &secrets {
                     let selected = self.detail.selected() == Some(secret.id);
                     let summary = summarize_field_names(&secret.field_names);
-                    let mut select = false;
-                    ui.horizontal(|ui| {
-                        select = ui
-                            .add_sized(
-                                [74.0, 22.0],
-                                egui::Button::selectable(
-                                    selected,
-                                    RichText::new(&secret.name).color(Color32::WHITE),
+                    let metadata_color = if selected {
+                        Color32::from_rgb(226, 234, 255)
+                    } else {
+                        Color32::from_rgb(173, 187, 214)
+                    };
+                    let row = Frame::new()
+                        .fill(secret_row_fill(selected))
+                        .corner_radius(6)
+                        .inner_margin(Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [74.0, 22.0],
+                                    egui::Label::new(
+                                        RichText::new(&secret.name).color(Color32::WHITE),
+                                    )
+                                    .truncate(),
                                 )
-                                .frame(false)
-                                .truncate(),
-                            )
-                            .on_hover_text(&secret.name)
-                            .clicked();
-                        if let Some(primary) = summary.primary {
-                            ui.label(
-                                RichText::new(primary)
-                                    .size(10.0)
-                                    .color(Color32::from_rgb(173, 187, 214)),
-                            )
-                            .on_hover_text(primary);
-                        }
-                        if summary.additional_count > 0 {
-                            ui.label(
-                                RichText::new(format!("+{}", summary.additional_count))
-                                    .size(10.0)
-                                    .strong()
-                                    .color(COBALT),
-                            )
-                            .on_hover_text(&summary.additional_hover);
-                        }
-                    });
-                    if select {
+                                .on_hover_text(&secret.name);
+                                if let Some(primary) = summary.primary {
+                                    ui.label(
+                                        RichText::new(primary).size(10.0).color(metadata_color),
+                                    )
+                                    .on_hover_text(primary);
+                                }
+                                if summary.additional_count > 0 {
+                                    ui.label(
+                                        RichText::new(format!("+{}", summary.additional_count))
+                                            .size(10.0)
+                                            .strong()
+                                            .color(metadata_color),
+                                    )
+                                    .on_hover_text(&summary.additional_hover);
+                                }
+                            });
+                        });
+                    let response = ui.interact(
+                        row.response.rect,
+                        ui.make_persistent_id(("secret-row", secret.id.to_string())),
+                        egui::Sense::click(),
+                    );
+                    if response.clicked() {
                         self.request_navigation(NavigationTarget::Secret(secret.id));
                     }
                     ui.add_space(4.0);
@@ -2199,6 +2203,15 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
+fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
+            .fill(DANGER)
+            .stroke(Stroke::NONE)
+            .corner_radius(6),
+    )
+}
+
 fn quiet_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(INK))
@@ -3294,5 +3307,11 @@ mod tests {
         assert_eq!(single.primary, Some("token"));
         assert_eq!(single.additional_count, 0);
         assert!(single.additional_hover.is_empty());
+    }
+
+    #[test]
+    fn selected_secret_row_uses_cobalt_fill() {
+        assert_eq!(secret_row_fill(true), COBALT);
+        assert_eq!(secret_row_fill(false), Color32::TRANSPARENT);
     }
 }

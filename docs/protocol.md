@@ -23,6 +23,21 @@ Protocol version 2 supports four methods:
 - `run`: executable, arguments, working directory, secret references, binding
   targets, timeout, and output limit.
 
+App lock is a GUI-only state and does not add a protocol method or change any
+schema. While the GUI is `AppLocked`, the existing methods produce these
+results:
+
+```text
+AppLocked status => state "locked", idle_remaining_ms absent/null
+AppLocked list   => vault_locked
+AppLocked run    => vault_locked
+AppLocked lock   => success after hard vault lock
+```
+
+No RPC can request soft lock, start Touch ID, submit a PIN, or unlock the app.
+The agent-facing `lock` operation always performs the full vault lock and
+requires the passphrase for a subsequent unlock.
+
 There is no get/export/plaintext method. A run response contains exit status,
 termination reason, bounded redacted stdout/stderr, duration, redaction count,
 truncation state, and a non-sensitive temporary-file cleanup warning.

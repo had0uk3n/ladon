@@ -25,6 +25,14 @@ They may request metadata, locking, or a bounded run, but cannot request secret
 plaintext. A launched child is trusted for the fields deliberately injected
 into it and untrusted for all other fields.
 
+`AppLocked` is an additional trust boundary inside the unlocked process. The
+unlocked vault key and session PIN verifier remain in Ladon memory only until
+the original idle deadline; GUI values are wiped, agent admission is closed,
+all grants are revoked, and active supervised runs are cancelled before
+completion. This improves accidental-disclosure behavior, but it does not
+improve resistance to a same-user process that can inspect or control Ladon
+memory.
+
 Secret-bearing runs also require an unexpired in-memory grant for every
 referenced secret. A grant is scoped to a random client-session UUID and an
 immutable secret ID for a fixed 30 minutes, within one vault unlock lifetime.
@@ -88,16 +96,18 @@ secrecy.
 4. Vault headers and payloads are authenticated; authentication errors are
    non-oracular.
 5. Secret output is redacted or suppressed before crossing the broker boundary.
-6. Lock cancels an active supervised process before dropping the unlocked
-   session.
-7. Setup writes only an absolute local MCP command and makes a backup before
+6. App lock blocks agent admission before clearing GUI values and does not
+   complete until active child cleanup finishes.
+7. Hard lock additionally drops the unlocked session.
+8. Setup writes only an absolute local MCP command and makes a backup before
    changing an existing client configuration.
-8. Session PIN verifiers, Touch ID choice, pending approvals, and grants are
-   memory-only and are removed when the app exits; no native credential store
-   is used.
-9. Any new vault unlock lifetime invalidates grants from the preceding one;
+9. Session PIN verifiers, Touch ID choice, pending approvals, and grants are
+   memory-only. App lock clears pending approvals and grants but retains the
+   in-memory session confirmation only until the original idle deadline; hard
+   lock and process exit remove it. No native credential store is used.
+10. Any new vault unlock lifetime invalidates grants from the preceding one;
    grant expiry or revocation is rechecked before plaintext resolution.
-10. Saving or deleting a secret invalidates every grant for that immutable
+11. Saving or deleting a secret invalidates every grant for that immutable
     secret ID before future plaintext resolution; agent-facing APIs remain
     value-free.
 

@@ -55,17 +55,29 @@ method can confirm a protected action. Whenever strict Touch ID is unavailable,
 configuring a 4–12 digit session PIN is required before secret use. Five
 consecutive wrong PIN submissions lock the vault; a successful PIN or Touch ID
 confirmation resets the counter. The PIN verifier and all agent permissions
-stay only in memory and are forgotten when Ladon locks or exits. The resulting
-release binaries do not require Rust to be installed on the computer where they
-run.
+stay only in memory. A hard vault lock or process exit forgets the PIN verifier;
+**Lock app** revokes all agent permissions while retaining the verifier only
+until the original idle deadline. The resulting release binaries do not require
+Rust to be installed on the computer where they run.
+
+While the vault is unlocked, choose **Lock app** for a temporary UI lock. It
+clears the visible selection, reveal and edit buffers, pending approvals, and
+all agent grants, closes agent admission, and cancels the active agent run
+before the lock completes. The unlocked vault key and session PIN verifier
+remain available only until the original idle deadline. One **Unlock** click
+starts Touch ID when it is
+available; when a session PIN is configured, **Use PIN instead** provides the
+fallback. App lock and app unlock do not extend the idle deadline. Choose
+**Lock vault completely** when the passphrase should be required again.
 
 ## Viewing and editing a secret
 
 Select a secret in the unlocked GUI to see its metadata and a constant mask,
 never its value. Authenticate the selected secret with Touch ID or the configured
 PIN before choosing **Show value** or **Edit**. Values remain visible only until
-you explicitly choose **Hide value**, navigate away, lock the vault, or close the
-app; a selection requires authentication again after you leave and return.
+you explicitly choose **Hide value**, navigate away, lock the app or vault, or
+close the app; a selection requires authentication again after you leave and
+return.
 
 Edits are prepared and validated before a single atomic vault update, preserving
 the secret ID. Existing binary fields are preserved but cannot be edited inline.
@@ -138,16 +150,24 @@ process may use the displayed secret for a fixed 30 minutes; use does not extend
 the timer. A different MCP process or another secret asks separately. Use
 **Revoke agent access** in the GUI to clear every permission immediately. A
 one-shot `ladon run` invocation has a fresh client identity, so it asks each
-time. Revocation also cancels the active supervised run before returning, and
-locking/reopening always starts with no permissions.
+time. Revocation also cancels the active supervised run before returning.
+
+**Lock app** is a soft UI lock. It revokes grants, cancels the active run,
+closes agent admission, and makes `list` and `run` return `vault_locked`; it
+retains the unlocked vault key and session PIN verifier only until the original
+idle deadline. Use the local GUI's **Unlock** action to resume, with Touch ID
+started by the first click when available and **Use PIN instead** when a session
+PIN is configured. A hard vault lock drops the unlocked session and requires
+the passphrase again. The MCP `lock` operation always performs that full vault
+lock; an agent cannot request a soft lock, submit a PIN, or unlock Ladon.
 
 Saving or deleting a secret also revokes every existing grant for that immutable
 secret ID. Agent-facing CLI, MCP, and local IPC APIs remain value-free: they
 expose metadata and redacted run results, never a secret-value read or export.
 
-If the vault is locked, the request returns `vault_locked`; unlock Ladon in the
-local GUI, choose the session confirmation method, and retry it. An approval
-waits for at most two minutes and starts no child process before confirmation.
+If an app or vault lock is active, the request returns `vault_locked`; unlock
+Ladon in the local GUI and retry it. An approval waits for at most two minutes
+and starts no child process before confirmation.
 
 ## Security boundary
 

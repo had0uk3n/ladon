@@ -137,6 +137,14 @@ enum DetailAction {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedActionSet {
+    Unlock,
+    Hidden,
+    Revealed,
+    Editing,
+}
+
 #[derive(Clone, Copy)]
 enum DeleteAction {
     Request,
@@ -178,6 +186,15 @@ fn confirmation_actions(touch_id_available: bool, pin_configured: bool) -> Vec<C
         actions.push(ConfirmationAction::Pin);
     }
     actions
+}
+
+fn selected_action_set(authorized: bool, mode: &DetailMode) -> SelectedActionSet {
+    match (authorized, mode) {
+        (_, DetailMode::Editing { .. }) => SelectedActionSet::Editing,
+        (false, _) => SelectedActionSet::Unlock,
+        (true, DetailMode::Hidden) => SelectedActionSet::Hidden,
+        (true, DetailMode::Revealed(_)) => SelectedActionSet::Revealed,
+    }
 }
 
 struct FieldNameSummary<'a> {
@@ -610,6 +627,7 @@ impl LadonDesktop {
         let mut action = None;
         let mut delete_action = None;
         let editing = self.detail.is_editing();
+        let action_set = selected_action_set(authorized, self.detail.mode());
         Frame::new()
             .fill(PANEL)
             .stroke(Stroke::new(1.0_f32, BORDER))
@@ -636,15 +654,36 @@ impl LadonDesktop {
                     ui.separator();
                     ui.add_space(8.0);
                 }
+                if !editing {
+                    ui.horizontal(|ui| match action_set {
+                        SelectedActionSet::Unlock => {
+                            if primary_button(ui, "Unlock this secret").clicked() {
+                                self.unlock_confirmation = true;
+                                self.local_pin.clear();
+                            }
+                        }
+                        SelectedActionSet::Hidden => {
+                            if primary_button(ui, "Show").clicked() {
+                                action = Some(DetailAction::Show);
+                            }
+                            if quiet_button(ui, "Edit").clicked() {
+                                action = Some(DetailAction::Edit);
+                            }
+                        }
+                        SelectedActionSet::Revealed => {
+                            if quiet_button(ui, "Hide").clicked() {
+                                action = Some(DetailAction::Hide);
+                            }
+                        }
+                        SelectedActionSet::Editing => {}
+                    });
+                    ui.add_space(14.0);
+                }
                 if !authorized {
                     for field_name in &secret.field_names {
                         field_label(ui, field_name);
                         ui.label(RichText::new("••••••••").color(MUTED));
                         ui.add_space(14.0);
-                    }
-                    if primary_button(ui, "Unlock this secret").clicked() {
-                        self.unlock_confirmation = true;
-                        self.local_pin.clear();
                     }
                     return;
                 }
@@ -656,14 +695,6 @@ impl LadonDesktop {
                             ui.label(RichText::new("••••••••").color(MUTED));
                             ui.add_space(14.0);
                         }
-                        ui.horizontal(|ui| {
-                            if primary_button(ui, "Show").clicked() {
-                                action = Some(DetailAction::Show);
-                            }
-                            if quiet_button(ui, "Edit").clicked() {
-                                action = Some(DetailAction::Edit);
-                            }
-                        });
                     }
                     DetailMode::Revealed(draft) => {
                         for field in draft.fields() {
@@ -685,9 +716,6 @@ impl LadonDesktop {
                                 }
                             }
                             ui.add_space(14.0);
-                        }
-                        if quiet_button(ui, "Hide").clicked() {
-                            action = Some(DetailAction::Hide);
                         }
                     }
                     DetailMode::Editing { draft, dirty } => {
@@ -3421,6 +3449,38 @@ mod tests {
         pin.push_str("654321");
         assert!(update_focused_approval(&mut focused, &mut pin, None));
         assert!(pin.as_str().is_empty());
+    }
+
+    #[test]
+    fn selected_action_set_is_independent_of_field_count() {
+        let hidden = DetailMode::Hidden;
+        assert_eq!(
+            selected_action_set(false, &hidden),
+            SelectedActionSet::Unlock
+        );
+        assert_eq!(
+            selected_action_set(true, &hidden),
+            SelectedActionSet::Hidden
+        );
+
+        let revealed = DetailMode::Revealed(crate::EditSecretDraft::from_parts(
+            SecretId::new(),
+            "example",
+            vec![],
+        ));
+        assert_eq!(
+            selected_action_set(true, &revealed),
+            SelectedActionSet::Revealed
+        );
+
+        let editing = DetailMode::Editing {
+            draft: crate::EditSecretDraft::from_parts(SecretId::new(), "example", vec![]),
+            dirty: false,
+        };
+        assert_eq!(
+            selected_action_set(true, &editing),
+            SelectedActionSet::Editing
+        );
     }
 
     #[test]

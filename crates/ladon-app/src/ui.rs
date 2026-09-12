@@ -166,6 +166,7 @@ pub(crate) enum AddDraftValidationError {
 }
 
 impl AddDraftValidationError {
+    #[cfg(feature = "gui")]
     pub(crate) const fn field_index(self) -> usize {
         match self {
             Self::MissingName { field_index }

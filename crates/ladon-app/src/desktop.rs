@@ -968,6 +968,13 @@ impl LadonDesktop {
         self.notice = None;
     }
 
+    fn finish_discard_navigation(&mut self) -> bool {
+        let closing = self.detail.pending_navigation() == Some(NavigationTarget::Close);
+        self.detail.discard_pending_navigation();
+        self.finish_applied_navigation();
+        closing
+    }
+
     fn show_secret_confirmation(&mut self, context: &egui::Context, secret: &SecretMetadata) {
         let touch_id_available = TouchIdAuthenticator::is_available();
         let pin_configured = self
@@ -1326,12 +1333,7 @@ impl LadonDesktop {
             self.detail.cancel_pending_navigation();
             self.discard_confirmation = false;
         } else if discard {
-            let closing = self.detail.pending_navigation() == Some(NavigationTarget::Close);
-            self.detail.discard_pending_navigation();
-            self.discard_confirmation = false;
-            self.unlock_confirmation = false;
-            self.local_pin.clear();
-            self.pending_delete = None;
+            let closing = self.finish_discard_navigation();
             if closing {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -3243,6 +3245,29 @@ mod tests {
 
         app.request_navigation(NavigationTarget::Add);
 
+        assert!(app.add_form_error.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_discard_navigation_clears_form_feedback() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(true);
+        app.discard_confirmation = false;
+        app.add_form_error = Some(AddDraftValidationError::InvalidName { field_index: 1 });
+        app.notice = Some(Notice {
+            text: "stale feedback".to_owned(),
+            danger: true,
+        });
+
+        app.request_navigation(NavigationTarget::Add);
+        assert!(app.discard_confirmation);
+
+        let closing = app.finish_discard_navigation();
+
+        assert!(!closing);
+        assert!(app.detail.selected().is_none());
+        assert!(!app.discard_confirmation);
         assert!(app.add_form_error.is_none());
         assert!(app.notice.is_none());
     }

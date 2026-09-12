@@ -1,13 +1,15 @@
 use std::{
+    collections::HashSet,
     fmt, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use ladon_core::{
-    ActivitySink, FieldName, LadonError, PreparedRecordReplacement, ResolvedSecretBinding,
-    SecretField, SecretId, SecretMetadata, SecretRef, SensitiveBytes, TextHint,
-    ValidatedSecretBinding, VaultOpen, VaultPayload, VaultSession, VaultStore, create_vault,
+    ActivitySink, FieldName, LadonError, MAX_FIELD_BYTES, MAX_FIELDS_PER_RECORD,
+    PreparedRecordReplacement, ResolvedSecretBinding, SecretField, SecretId, SecretMetadata,
+    SecretRef, SensitiveBytes, TextHint, ValidatedSecretBinding, VaultOpen, VaultPayload,
+    VaultSession, VaultStore, create_vault,
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -155,6 +157,24 @@ pub struct DraftField {
     value: SensitiveText,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AddDraftValidationError {
+    MissingName { field_index: usize },
+    InvalidName { field_index: usize },
+    DuplicateName { field_index: usize },
+    ValueTooLarge { field_index: usize },
+}
+
+impl AddDraftValidationError {
+    const fn as_ladon_error(self) -> LadonError {
+        match self {
+            Self::MissingName { .. } | Self::InvalidName { .. } => LadonError::InvalidFieldName,
+            Self::DuplicateName { .. } => LadonError::DuplicateField,
+            Self::ValueTooLarge { .. } => LadonError::FieldTooLarge,
+        }
+    }
+}
+
 impl DraftField {
     #[must_use]
     pub fn name(&self) -> &str {
@@ -178,6 +198,10 @@ impl DraftField {
     #[must_use]
     pub const fn value_mut(&mut self) -> &mut SensitiveText {
         &mut self.value
+    }
+
+    fn is_untouched(&self) -> bool {
+        self.name.is_empty() && self.value.as_str().is_empty()
     }
 }
 
@@ -233,10 +257,51 @@ impl AddSecretDraft {
     }
 
     pub fn add_field(&mut self) {
-        self.fields.push(DraftField {
-            name: String::new(),
-            value: SensitiveText::default(),
-        });
+        if self.can_add_field() {
+            self.fields.push(DraftField {
+                name: String::new(),
+                value: SensitiveText::default(),
+            });
+        }
+    }
+
+    #[must_use]
+    pub fn can_add_field(&self) -> bool {
+        self.fields.len() < MAX_FIELDS_PER_RECORD
+    }
+
+    pub fn remove_field(&mut self, index: usize) -> bool {
+        if index == 0 || index >= self.fields.len() {
+            return false;
+        }
+        self.fields[index].value.clear();
+        self.fields.remove(index);
+        true
+    }
+
+    fn included_fields(&self) -> impl Iterator<Item = (usize, &DraftField)> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(index, field)| *index == 0 || !field.is_untouched())
+    }
+
+    pub(crate) fn validate_fields(&self) -> Result<(), AddDraftValidationError> {
+        let mut names = HashSet::new();
+        for (field_index, field) in self.included_fields() {
+            if field_index > 0 && field.name().is_empty() {
+                return Err(AddDraftValidationError::MissingName { field_index });
+            }
+            let name = FieldName::parse(field.name())
+                .map_err(|_| AddDraftValidationError::InvalidName { field_index })?;
+            if field.value().as_str().len() > MAX_FIELD_BYTES {
+                return Err(AddDraftValidationError::ValueTooLarge { field_index });
+            }
+            if !names.insert(name) {
+                return Err(AddDraftValidationError::DuplicateName { field_index });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -507,10 +572,12 @@ impl VaultController {
     }
 
     pub fn add_secret(&mut self, draft: &mut AddSecretDraft) -> Result<SecretId, LadonError> {
+        draft
+            .validate_fields()
+            .map_err(AddDraftValidationError::as_ladon_error)?;
         let fields = draft
-            .fields()
-            .iter()
-            .map(|field| {
+            .included_fields()
+            .map(|(_, field)| {
                 SecretField::new(
                     FieldName::parse(field.name())?,
                     field.value().to_sensitive_bytes().expose(<[u8]>::to_vec),
@@ -1089,6 +1156,75 @@ pub(crate) fn sanitize_untrusted(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_draft_validation_targets_the_displayed_field() {
+        let mut draft = AddSecretDraft::new();
+        draft.add_field();
+        draft.fields_mut()[1].value_mut().push_str("fake-value");
+        assert_eq!(
+            draft.validate_fields(),
+            Err(AddDraftValidationError::MissingName { field_index: 1 })
+        );
+
+        draft.fields_mut()[1].set_name("not valid");
+        assert_eq!(
+            draft.validate_fields(),
+            Err(AddDraftValidationError::InvalidName { field_index: 1 })
+        );
+
+        draft.fields_mut()[1].set_name("value");
+        assert_eq!(
+            draft.validate_fields(),
+            Err(AddDraftValidationError::DuplicateName { field_index: 1 })
+        );
+    }
+
+    #[test]
+    fn whitespace_is_not_an_untouched_optional_field() {
+        let mut draft = AddSecretDraft::new();
+        draft.add_field();
+        draft.fields_mut()[1].set_name(" ");
+        assert_eq!(
+            draft.validate_fields(),
+            Err(AddDraftValidationError::InvalidName { field_index: 1 })
+        );
+    }
+
+    #[test]
+    fn add_draft_stops_at_the_core_field_limit() {
+        let mut draft = AddSecretDraft::new();
+        for _ in 1..ladon_core::MAX_FIELDS_PER_RECORD {
+            draft.add_field();
+        }
+        assert!(!draft.can_add_field());
+        draft.add_field();
+        assert_eq!(draft.fields().len(), ladon_core::MAX_FIELDS_PER_RECORD);
+    }
+
+    #[test]
+    fn oversized_add_value_targets_its_visible_field() {
+        let mut draft = AddSecretDraft::new();
+        draft.fields_mut()[0]
+            .value_mut()
+            .push_str(&"x".repeat(ladon_core::MAX_FIELD_BYTES + 1));
+        assert_eq!(
+            draft.validate_fields(),
+            Err(AddDraftValidationError::ValueTooLarge { field_index: 0 })
+        );
+    }
+
+    #[test]
+    fn validation_keeps_indices_from_the_visible_draft() {
+        let mut draft = AddSecretDraft::new();
+        draft.add_field();
+        draft.add_field();
+        draft.fields_mut()[2].set_name("not valid");
+        assert_eq!(
+            draft.validate_fields(),
+            Err(AddDraftValidationError::InvalidName { field_index: 2 })
+        );
+    }
 
     #[test]
     fn recovery_plaintext_obeys_the_same_idle_deadline_as_an_unlocked_vault() {

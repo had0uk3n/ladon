@@ -31,6 +31,65 @@ fn add_form_starts_simple_and_expands_to_ordered_additional_fields() {
     assert_eq!(draft.fields()[1].name(), "access_key");
 }
 
+#[test]
+fn untouched_optional_fields_are_ignored_when_saved() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vault.ladon");
+    let passphrase = SensitiveText::from("correct horse");
+    let mut controller = VaultController::new(path);
+    controller.create(&passphrase, &passphrase).unwrap();
+    let mut draft = AddSecretDraft::new();
+    draft.set_name("example");
+    draft.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-primary-value");
+    draft.add_field();
+
+    let id = controller.add_secret(&mut draft).unwrap();
+    let loaded = controller.load_secret(id).unwrap();
+
+    assert_eq!(loaded.fields().len(), 1);
+    assert_eq!(loaded.fields()[0].name(), "value");
+}
+
+#[test]
+fn optional_fields_can_be_removed_but_the_primary_field_cannot() {
+    let mut draft = AddSecretDraft::new();
+    draft.add_field();
+    draft.fields_mut()[1]
+        .value_mut()
+        .push_str("fake-removed-value");
+
+    assert!(!draft.remove_field(0));
+    assert!(draft.remove_field(1));
+    assert_eq!(draft.fields().len(), 1);
+    assert_eq!(draft.fields()[0].name(), "value");
+}
+
+#[test]
+fn rejected_add_keeps_every_visible_draft_field() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vault.ladon");
+    let passphrase = SensitiveText::from("correct horse");
+    let mut controller = VaultController::new(path);
+    controller.create(&passphrase, &passphrase).unwrap();
+    let mut draft = AddSecretDraft::new();
+    draft.set_name("id:not-a-valid-secret-name");
+    draft.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-preserved-value");
+    draft.add_field();
+
+    assert_eq!(
+        controller.add_secret(&mut draft),
+        Err(LadonError::InvalidSecretRef)
+    );
+    assert_eq!(draft.fields().len(), 2);
+    assert_eq!(draft.fields()[0].value().as_str(), "fake-preserved-value");
+    assert!(draft.fields()[1].name().is_empty());
+    assert!(draft.fields()[1].value().as_str().is_empty());
+}
+
 fn text_draft(id: SecretId) -> EditSecretDraft {
     EditSecretDraft::from_parts(
         id,

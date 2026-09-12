@@ -20,7 +20,10 @@ use crate::{
     PendingRequestView, PinVerification, SecretDetailState, SensitiveText, SessionConfirmation,
     SessionPin, Supervisor, TouchIdAuthenticator, VaultController, VaultUiPhase,
 };
-use crate::{EditableValue, ui::ReadOnlySensitiveText};
+use crate::{
+    EditableValue,
+    ui::{AddDraftValidationError, ReadOnlySensitiveText},
+};
 
 const CANVAS: Color32 = Color32::from_rgb(244, 247, 251);
 const INK: Color32 = Color32::from_rgb(23, 35, 60);
@@ -89,6 +92,7 @@ struct LadonDesktop {
     pending_touch_id: Option<PendingTouchId>,
     focused_approval: Option<uuid::Uuid>,
     draft: AddSecretDraft,
+    add_form_error: Option<AddDraftValidationError>,
     notice: Option<Notice>,
     detail: SecretDetailState,
     unlock_confirmation: bool,
@@ -251,6 +255,7 @@ impl LadonDesktop {
             pending_touch_id: None,
             focused_approval: None,
             draft: AddSecretDraft::new(),
+            add_form_error: None,
             notice: None,
             detail: SecretDetailState::default(),
             unlock_confirmation: false,
@@ -505,12 +510,16 @@ impl LadonDesktop {
             .show(ui, |ui| {
                 ui.set_width(WORKSPACE_CARD_WIDTH);
                 field_label(ui, "Name");
-                ui.add(
-                    TextEdit::singleline(self.draft.name_mut())
-                        .hint_text("e.g. production-api")
-                        .desired_width(f32::INFINITY),
-                );
+                let mut changed = ui
+                    .add(
+                        TextEdit::singleline(self.draft.name_mut())
+                            .hint_text("e.g. production-api")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed();
                 ui.add_space(18.0);
+                let current_error = self.add_form_error;
+                let mut remove_index = None;
                 for (index, field) in self.draft.fields_mut().iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
@@ -522,35 +531,73 @@ impl LadonDesktop {
                                     "Additional field"
                                 },
                             );
-                            ui.add(
-                                TextEdit::singleline(field.name_mut())
-                                    .hint_text("field_name")
-                                    .desired_width(120.0),
-                            );
+                            changed |= ui
+                                .add(
+                                    TextEdit::singleline(field.name_mut())
+                                        .hint_text("field_name")
+                                        .desired_width(104.0),
+                                )
+                                .changed();
                         });
                         ui.add_space(10.0);
                         ui.vertical(|ui| {
                             field_label(ui, "Secret value");
-                            sensitive_text_field(
+                            changed |= visible_sensitive_text_field(
                                 ui,
                                 field.value_mut(),
-                                "kept out of chat and command arguments",
-                                230.0,
-                            );
+                                "Secret value",
+                                210.0,
+                            )
+                            .changed();
                         });
+                        if index > 0
+                            && quiet_button(ui, "×")
+                                .on_hover_text("Remove field")
+                                .clicked()
+                        {
+                            remove_index = Some(index);
+                        }
                     });
+                    if let Some(error) = current_error.filter(|error| error.field_index() == index)
+                    {
+                        ui.label(RichText::new(add_form_error_text(error)).color(DANGER));
+                    }
                     ui.add_space(12.0);
                 }
+                if let Some(index) = remove_index {
+                    changed |= self.draft.remove_field(index);
+                }
+                if changed {
+                    self.add_form_error = None;
+                    self.notice = None;
+                }
                 ui.horizontal(|ui| {
-                    if quiet_button(ui, "+ Add field").clicked() {
+                    let add_field = ui.add_enabled(
+                        self.draft.can_add_field(),
+                        egui::Button::new(RichText::new("+ Add field").color(INK))
+                            .fill(PANEL)
+                            .stroke(Stroke::new(1.0_f32, BORDER))
+                            .corner_radius(6),
+                    );
+                    if add_field.clicked() {
                         self.draft.add_field();
+                        self.add_form_error = None;
+                        self.notice = None;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if primary_button(ui, "Save secret").clicked() {
-                            let result = with_controller(&self.controller, |controller| {
-                                controller.add_secret(&mut self.draft)
-                            });
-                            self.handle_add_result(result);
+                            match self.draft.validate_fields() {
+                                Ok(()) => {
+                                    let result = with_controller(&self.controller, |controller| {
+                                        controller.add_secret(&mut self.draft)
+                                    });
+                                    self.handle_add_result(result);
+                                }
+                                Err(error) => {
+                                    self.add_form_error = Some(error);
+                                    self.notice = None;
+                                }
+                            }
                         }
                     });
                 });
@@ -875,16 +922,22 @@ impl LadonDesktop {
     fn request_navigation(&mut self, target: NavigationTarget) {
         match self.detail.request_navigation(target) {
             NavigationResult::Applied => {
-                self.pending_touch_id = None;
-                self.unlock_confirmation = false;
-                self.discard_confirmation = false;
-                self.local_pin.clear();
-                self.pending_delete = None;
+                self.finish_applied_navigation();
             }
             NavigationResult::ConfirmDiscard => {
                 self.discard_confirmation = true;
             }
         }
+    }
+
+    fn finish_applied_navigation(&mut self) {
+        self.pending_touch_id = None;
+        self.unlock_confirmation = false;
+        self.discard_confirmation = false;
+        self.local_pin.clear();
+        self.pending_delete = None;
+        self.add_form_error = None;
+        self.notice = None;
     }
 
     fn show_secret_confirmation(&mut self, context: &egui::Context, secret: &SecretMetadata) {
@@ -1173,6 +1226,7 @@ impl LadonDesktop {
     fn handle_add_result(&mut self, result: Result<SecretId, LadonError>) {
         match result {
             Ok(_) => {
+                self.add_form_error = None;
                 self.notice = Some(Notice {
                     text: "Secret saved locally".to_owned(),
                     danger: false,
@@ -1616,6 +1670,7 @@ impl LadonDesktop {
         self.unlock_confirmation = false;
         self.discard_confirmation = false;
         self.pending_delete = None;
+        self.add_form_error = None;
         self.notice = None;
     }
 
@@ -2182,8 +2237,27 @@ fn sensitive_text_field(
     hint: &str,
     width: f32,
 ) -> egui::Response {
+    sensitive_text_edit(ui, value, hint, width, true)
+}
+
+fn visible_sensitive_text_field(
+    ui: &mut egui::Ui,
+    value: &mut SensitiveText,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    sensitive_text_edit(ui, value, hint, width, false)
+}
+
+fn sensitive_text_edit(
+    ui: &mut egui::Ui,
+    value: &mut SensitiveText,
+    hint: &str,
+    width: f32,
+    password: bool,
+) -> egui::Response {
     let mut output = TextEdit::singleline(value)
-        .password(true)
+        .password(password)
         .hint_text(hint)
         .desired_width(width)
         .show(ui);
@@ -2192,6 +2266,19 @@ fn sensitive_text_field(
     output.state.clear_undoer();
     output.state.store(ui.ctx(), output.response.id);
     output.response
+}
+
+fn add_form_error_text(error: AddDraftValidationError) -> String {
+    let field = error.field_index() + 1;
+    let detail = match error {
+        AddDraftValidationError::MissingName { .. } => "enter a name or remove this field",
+        AddDraftValidationError::InvalidName { .. } => {
+            "start with a letter; then use letters, numbers, _ or -"
+        }
+        AddDraftValidationError::DuplicateName { .. } => "this name is already used",
+        AddDraftValidationError::ValueTooLarge { .. } => "value exceeds 1 MiB",
+    };
+    format!("Field {field}: {detail}")
 }
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -2320,6 +2407,7 @@ mod tests {
                 pending_touch_id: None,
                 focused_approval: None,
                 draft: AddSecretDraft::new(),
+                add_form_error: None,
                 notice: None,
                 detail,
                 unlock_confirmation: false,
@@ -3076,6 +3164,62 @@ mod tests {
     }
 
     #[test]
+    fn visible_sensitive_widget_does_not_retain_undo_history() {
+        let context = egui::Context::default();
+        let mut value = SensitiveText::from("fake-visible-secret");
+        let mut widget_id = None;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                widget_id =
+                    Some(visible_sensitive_text_field(ui, &mut value, "Secret value", 230.0).id);
+            });
+        });
+        let state = TextEdit::load_state(&context, widget_id.unwrap()).unwrap();
+        let current = (
+            state.cursor.char_range().unwrap_or_default(),
+            value.as_str().to_owned(),
+        );
+
+        assert!(!state.undoer().has_undo(&current));
+    }
+
+    #[test]
+    fn add_form_error_copy_identifies_the_visible_row() {
+        assert_eq!(
+            add_form_error_text(AddDraftValidationError::MissingName { field_index: 1 }),
+            "Field 2: enter a name or remove this field"
+        );
+        assert_eq!(
+            add_form_error_text(AddDraftValidationError::DuplicateName { field_index: 2 }),
+            "Field 3: this name is already used"
+        );
+        assert_eq!(
+            add_form_error_text(AddDraftValidationError::InvalidName { field_index: 0 }),
+            "Field 1: start with a letter; then use letters, numbers, _ or -"
+        );
+        assert_eq!(
+            add_form_error_text(AddDraftValidationError::ValueTooLarge { field_index: 3 }),
+            "Field 4: value exceeds 1 MiB"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applied_navigation_clears_form_feedback() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.add_form_error = Some(AddDraftValidationError::InvalidName { field_index: 1 });
+        app.notice = Some(Notice {
+            text: "stale feedback".to_owned(),
+            danger: true,
+        });
+
+        app.request_navigation(NavigationTarget::Add);
+
+        assert!(app.add_form_error.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
     fn leaving_unlocked_clears_gui_owned_secret_drafts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vault.ladon");
@@ -3132,6 +3276,7 @@ mod tests {
             pending_touch_id: None,
             focused_approval: Some(Uuid::new_v4()),
             draft,
+            add_form_error: Some(AddDraftValidationError::InvalidName { field_index: 0 }),
             notice: None,
             detail,
             unlock_confirmation: true,
@@ -3157,6 +3302,7 @@ mod tests {
         assert!(!app.detail.has_sensitive_buffer());
         assert!(!app.unlock_confirmation);
         assert!(!app.discard_confirmation);
+        assert!(app.add_form_error.is_none());
         assert!(app.focused_approval.is_none());
         assert_eq!(app.desktop_lock, DesktopLockState::Active);
         assert!(!app.app_unlock_pin_visible);
@@ -3197,6 +3343,7 @@ mod tests {
             pending_touch_id: None,
             focused_approval: Some(Uuid::new_v4()),
             draft,
+            add_form_error: None,
             notice: None,
             detail: SecretDetailState::default(),
             unlock_confirmation: true,

@@ -166,6 +166,15 @@ pub(crate) enum AddDraftValidationError {
 }
 
 impl AddDraftValidationError {
+    pub(crate) const fn field_index(self) -> usize {
+        match self {
+            Self::MissingName { field_index }
+            | Self::InvalidName { field_index }
+            | Self::DuplicateName { field_index }
+            | Self::ValueTooLarge { field_index } => field_index,
+        }
+    }
+
     const fn as_ladon_error(self) -> LadonError {
         match self {
             Self::MissingName { .. } | Self::InvalidName { .. } => LadonError::InvalidFieldName,

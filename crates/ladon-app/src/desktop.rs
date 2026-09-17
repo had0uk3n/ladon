@@ -2392,16 +2392,18 @@ fn sensitive_text_edit(
     password: bool,
 ) -> egui::Response {
     // Only the explicit Copy button may export a secret, through SecretClipboard.
-    // Hide Copy/Cut while this widget handles input, then restore their original
-    // positions so shortcuts still work in other (non-sensitive) widgets.
+    // Hide Copy/Cut while this widget handles input. egui can remove all IME
+    // events on a focus change, so track their contribution to each saved index.
     let clipboard_events = ui.input_mut(|input| {
         let mut clipboard_events = Vec::new();
         let mut index = 0;
+        let mut preceding_ime_events = 0;
         input.events.retain(|event| {
             let clipboard_event = matches!(event, egui::Event::Copy | egui::Event::Cut);
             if clipboard_event {
-                clipboard_events.push((index, event.clone()));
+                clipboard_events.push((index, preceding_ime_events, event.clone()));
             }
+            preceding_ime_events += usize::from(matches!(event, egui::Event::Ime(_)));
             index += 1;
             !clipboard_event
         });
@@ -2415,7 +2417,16 @@ fn sensitive_text_edit(
             .desired_width(width),
     );
     ui.input_mut(|input| {
-        for (index, event) in clipboard_events {
+        let ime_events_removed = !input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Ime(_)));
+        for (index, preceding_ime_events, event) in clipboard_events {
+            let index = if ime_events_removed {
+                index - preceding_ime_events
+            } else {
+                index
+            };
             input.events.insert(index.min(input.events.len()), event);
         }
     });
@@ -3643,6 +3654,108 @@ mod tests {
             );
             assert_eq!(name, if cut { "" } else { "ordinary-name" });
             assert_eq!(secret.as_str(), "fake-selected-secret");
+        }
+    }
+
+    fn ime_clipboard_output(
+        shortcut: egui::Event,
+        move_focus_to_name: bool,
+        ime_before_shortcut: bool,
+    ) -> (egui::FullOutput, SensitiveText, String) {
+        let context = egui::Context::default();
+        let mut secret = SensitiveText::from("fake-selected-secret");
+        let mut name = "ordinary-name".to_owned();
+        let mut ids = None;
+        let mut output = None;
+        for frame in 0..4 {
+            let events = match frame {
+                2 => vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+                3 => {
+                    let mut events = vec![shortcut.clone(), egui::Event::Text("x".to_owned())];
+                    events.insert(
+                        usize::from(!ime_before_shortcut),
+                        egui::Event::Ime(egui::ImeEvent::Disabled),
+                    );
+                    events
+                }
+                _ => vec![],
+            };
+            output = Some(context.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    if let Some((sensitive_id, ordinary_id)) = ids {
+                        let ordinary_focused = frame == 3 && move_focus_to_name;
+                        let focused = if ordinary_focused {
+                            ordinary_id
+                        } else {
+                            sensitive_id
+                        };
+                        context.memory_mut(|memory| memory.request_focus(focused));
+                        if frame == 3 {
+                            let mut state = TextEdit::load_state(context, focused).unwrap();
+                            state
+                                .cursor
+                                .set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(if ordinary_focused {
+                                        13
+                                    } else {
+                                        20
+                                    }),
+                                )));
+                            state.store(context, focused);
+                        }
+                    }
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let sensitive =
+                            visible_sensitive_text_field(ui, &mut secret, "Secret", 230.0);
+                        if frame == 3 && move_focus_to_name {
+                            assert!(
+                                ui.input(|input| !input
+                                    .events
+                                    .iter()
+                                    .any(|event| matches!(event, egui::Event::Ime(_)))),
+                                "test must exercise egui's focus-loss IME removal"
+                            );
+                        }
+                        let ordinary = ui.add(TextEdit::singleline(&mut name));
+                        ids = Some((sensitive.id, ordinary.id));
+                    });
+                },
+            ));
+        }
+        (output.unwrap(), secret, name)
+    }
+
+    #[test]
+    fn ime_focus_transition_preserves_ordinary_copy_cut_before_text() {
+        for shortcut in [egui::Event::Copy, egui::Event::Cut] {
+            for ime_before_shortcut in [true, false] {
+                let (output, secret, name) =
+                    ime_clipboard_output(shortcut.clone(), true, ime_before_shortcut);
+                assert!(
+                    matches!(output.platform_output.commands.as_slice(), [egui::OutputCommand::CopyText(text)] if text == "ordinary-name"),
+                    "ordinary shortcut must run before the subsequent Text event"
+                );
+                assert_eq!(name, "x");
+                assert_eq!(secret.as_str(), "fake-selected-secret");
+            }
+        }
+    }
+
+    #[test]
+    fn ime_sensitive_copy_cut_stays_suppressed_while_text_input_works() {
+        for shortcut in [egui::Event::Copy, egui::Event::Cut] {
+            for ime_before_shortcut in [true, false] {
+                let (output, secret, name) =
+                    ime_clipboard_output(shortcut.clone(), false, ime_before_shortcut);
+                assert!(output.platform_output.commands.is_empty());
+                assert_eq!(secret.as_str(), "x");
+                assert_eq!(name, "ordinary-name");
+            }
         }
     }
 

@@ -3,17 +3,18 @@ use std::{
     fs::{self, File, OpenOptions},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
     Vec2,
 };
-use ladon_core::{LadonError, SecretId, SecretMetadata};
+use ladon_core::{LadonError, SecretId, SecretMetadata, SensitiveBytes};
 
 #[cfg(unix)]
 use crate::agent_broker::{AppLockAttempt, LocalBrokerHandle};
+use crate::clipboard::SecretClipboard;
 use crate::touch_id::TouchIdAttempt;
 use crate::{
     AddSecretDraft, DetailMode, LocalAuthAttempt, NavigationResult, NavigationTarget,
@@ -39,6 +40,8 @@ const WINDOW_MIN_SIZE: [f32; 2] = [480.0, 340.0];
 const SECRET_RAIL_WIDTH: f32 = 180.0;
 const WORKSPACE_CARD_WIDTH: f32 = 380.0;
 const AUTH_FORM_WIDTH: f32 = 340.0;
+const SENSITIVE_FIELD_HEIGHT: f32 = 34.0;
+const REMOVE_BUTTON_HEIGHT: f32 = SENSITIVE_FIELD_HEIGHT;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DesktopLockState {
@@ -94,6 +97,9 @@ struct LadonDesktop {
     draft: AddSecretDraft,
     add_form_error: Option<AddDraftValidationError>,
     notice: Option<Notice>,
+    clipboard: SecretClipboard,
+    ui_clock_started: Instant,
+    clipboard_clear_notice_shown: bool,
     detail: SecretDetailState,
     unlock_confirmation: bool,
     discard_confirmation: bool,
@@ -197,6 +203,16 @@ fn selected_action_set(authorized: bool, mode: &DetailMode) -> SelectedActionSet
     }
 }
 
+fn selected_action_labels(actions: SelectedActionSet) -> (&'static [&'static str], &'static str) {
+    let primary: &[&str] = match actions {
+        SelectedActionSet::Unlock => &["Unlock this secret"],
+        SelectedActionSet::Hidden => &["Show", "Edit"],
+        SelectedActionSet::Revealed => &["Hide", "Edit"],
+        SelectedActionSet::Editing => &[],
+    };
+    (primary, "Delete")
+}
+
 struct FieldNameSummary<'a> {
     primary: Option<&'a str>,
     additional_count: usize,
@@ -234,6 +250,22 @@ fn manager_rendering_allowed(phase: VaultUiPhase, desktop_lock: DesktopLockState
 struct Notice {
     text: String,
     danger: bool,
+}
+
+fn copyable_text(value: &EditableValue) -> Option<&str> {
+    match value {
+        EditableValue::Text(text) => Some(text.as_str()),
+        EditableValue::Binary { .. } => None,
+    }
+}
+
+fn set_clipboard_notice(notice: &mut Option<Notice>, text: &'static str) {
+    if !notice.as_ref().is_some_and(|notice| notice.danger) {
+        *notice = Some(Notice {
+            text: text.to_owned(),
+            danger: false,
+        });
+    }
 }
 
 impl LadonDesktop {
@@ -274,6 +306,9 @@ impl LadonDesktop {
             draft: AddSecretDraft::new(),
             add_form_error: None,
             notice: None,
+            clipboard: SecretClipboard::default(),
+            ui_clock_started: Instant::now(),
+            clipboard_clear_notice_shown: false,
             detail: SecretDetailState::default(),
             unlock_confirmation: false,
             discard_confirmation: false,
@@ -538,43 +573,48 @@ impl LadonDesktop {
                 let current_error = self.add_form_error;
                 let mut remove_index = None;
                 for (index, field) in self.draft.fields_mut().iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            field_label(
-                                ui,
-                                if index == 0 {
-                                    "Field"
-                                } else {
-                                    "Additional field"
-                                },
-                            );
-                            changed |= ui
-                                .add(
-                                    TextEdit::singleline(field.name_mut())
-                                        .hint_text("field_name")
-                                        .desired_width(104.0),
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), SENSITIVE_FIELD_HEIGHT),
+                        Layout::left_to_right(Align::Max),
+                        |ui| {
+                            ui.vertical(|ui| {
+                                field_label(
+                                    ui,
+                                    if index == 0 {
+                                        "Field"
+                                    } else {
+                                        "Additional field"
+                                    },
+                                );
+                                changed |= ui
+                                    .add_sized(
+                                        [104.0, SENSITIVE_FIELD_HEIGHT],
+                                        TextEdit::singleline(field.name_mut())
+                                            .hint_text("field_name")
+                                            .desired_width(104.0),
+                                    )
+                                    .changed();
+                            });
+                            ui.add_space(10.0);
+                            ui.vertical(|ui| {
+                                field_label(ui, "Secret value");
+                                changed |= visible_sensitive_text_field(
+                                    ui,
+                                    field.value_mut(),
+                                    "Secret value",
+                                    210.0,
                                 )
                                 .changed();
-                        });
-                        ui.add_space(10.0);
-                        ui.vertical(|ui| {
-                            field_label(ui, "Secret value");
-                            changed |= visible_sensitive_text_field(
-                                ui,
-                                field.value_mut(),
-                                "Secret value",
-                                210.0,
-                            )
-                            .changed();
-                        });
-                        if index > 0
-                            && quiet_button(ui, "×")
-                                .on_hover_text("Remove field")
-                                .clicked()
-                        {
-                            remove_index = Some(index);
-                        }
-                    });
+                            });
+                            if index > 0
+                                && remove_field_button(ui)
+                                    .on_hover_text("Remove field")
+                                    .clicked()
+                            {
+                                remove_index = Some(index);
+                            }
+                        },
+                    );
                     if let Some(error) = current_error.filter(|error| error.field_index() == index)
                     {
                         ui.label(RichText::new(add_form_error_text(error)).color(DANGER));
@@ -626,8 +666,10 @@ impl LadonDesktop {
         let authorized = session_id.is_some_and(|id| self.detail.is_authorized(id));
         let mut action = None;
         let mut delete_action = None;
+        let mut copy_request = None;
         let editing = self.detail.is_editing();
         let action_set = selected_action_set(authorized, self.detail.mode());
+        let (primary_labels, delete_label) = selected_action_labels(action_set);
         Frame::new()
             .fill(PANEL)
             .stroke(Stroke::new(1.0_f32, BORDER))
@@ -637,45 +679,45 @@ impl LadonDesktop {
                 ui.set_width(WORKSPACE_CARD_WIDTH);
                 if !editing {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Secret values").strong().color(INK));
+                        match action_set {
+                            SelectedActionSet::Unlock => {
+                                if primary_button(ui, primary_labels[0]).clicked() {
+                                    self.unlock_confirmation = true;
+                                    self.local_pin.clear();
+                                }
+                            }
+                            SelectedActionSet::Hidden | SelectedActionSet::Revealed => {
+                                let revealed = action_set == SelectedActionSet::Revealed;
+                                let response = if revealed {
+                                    quiet_button(ui, primary_labels[0])
+                                } else {
+                                    primary_button(ui, primary_labels[0])
+                                };
+                                if response.clicked() {
+                                    action = Some(if revealed {
+                                        DetailAction::Hide
+                                    } else {
+                                        DetailAction::Show
+                                    });
+                                }
+                                if quiet_button(ui, primary_labels[1]).clicked() {
+                                    action = Some(DetailAction::Edit);
+                                }
+                            }
+                            SelectedActionSet::Editing => {}
+                        }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if self.pending_delete == Some(secret.id) {
-                                if danger_button(ui, "Delete").clicked() {
-                                    delete_action = Some(DeleteAction::Confirm);
-                                }
                                 if quiet_button(ui, "Cancel").clicked() {
                                     delete_action = Some(DeleteAction::Cancel);
                                 }
-                            } else if danger_button(ui, "Delete").clicked() {
+                                if danger_button(ui, delete_label).clicked() {
+                                    delete_action = Some(DeleteAction::Confirm);
+                                }
+                            } else if danger_button(ui, delete_label).clicked() {
                                 delete_action = Some(DeleteAction::Request);
                             }
                         });
-                    });
-                    ui.separator();
-                    ui.add_space(8.0);
-                }
-                if !editing {
-                    ui.horizontal(|ui| match action_set {
-                        SelectedActionSet::Unlock => {
-                            if primary_button(ui, "Unlock this secret").clicked() {
-                                self.unlock_confirmation = true;
-                                self.local_pin.clear();
-                            }
-                        }
-                        SelectedActionSet::Hidden => {
-                            if primary_button(ui, "Show").clicked() {
-                                action = Some(DetailAction::Show);
-                            }
-                            if quiet_button(ui, "Edit").clicked() {
-                                action = Some(DetailAction::Edit);
-                            }
-                        }
-                        SelectedActionSet::Revealed => {
-                            if quiet_button(ui, "Hide").clicked() {
-                                action = Some(DetailAction::Hide);
-                            }
-                        }
-                        SelectedActionSet::Editing => {}
                     });
                     ui.add_space(14.0);
                 }
@@ -701,12 +743,17 @@ impl LadonDesktop {
                             field_label(ui, field.name());
                             match field.value() {
                                 EditableValue::Text(value) => {
-                                    let mut buffer = ReadOnlySensitiveText::new(value);
-                                    ui.add(
-                                        TextEdit::singleline(&mut buffer)
-                                            .interactive(false)
-                                            .desired_width(f32::INFINITY),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        let width = (ui.available_width() - 60.0).max(24.0);
+                                        let mut buffer = ReadOnlySensitiveText::new(value);
+                                        ui.add_sized(
+                                            [width, SENSITIVE_FIELD_HEIGHT],
+                                            TextEdit::singleline(&mut buffer)
+                                                .interactive(false)
+                                                .desired_width(width),
+                                        );
+                                        copy_value_button(ui, field.value(), &mut copy_request);
+                                    });
                                 }
                                 EditableValue::Binary { bytes, .. } => {
                                     ui.label(
@@ -730,13 +777,15 @@ impl LadonDesktop {
                         }
                         ui.add_space(16.0);
                         let mut remove_index = None;
+                        let can_remove = draft.fields().len() > 1;
                         for (index, field) in draft.fields_mut().iter_mut().enumerate() {
                             ui.horizontal(|ui| {
                                 if ui
-                                    .add(
+                                    .add_sized(
+                                        [94.0, SENSITIVE_FIELD_HEIGHT],
                                         TextEdit::singleline(field.name_mut())
                                             .hint_text("field_name")
-                                            .desired_width(118.0),
+                                            .desired_width(94.0),
                                     )
                                     .changed()
                                 {
@@ -744,8 +793,14 @@ impl LadonDesktop {
                                 }
                                 match field.value_mut() {
                                     EditableValue::Text(value) => {
-                                        if sensitive_text_field(ui, value, "secret value", 210.0)
-                                            .changed()
+                                        let width = (ui.available_width() - 98.0).max(24.0);
+                                        if visible_sensitive_text_field(
+                                            ui,
+                                            value,
+                                            "secret value",
+                                            width,
+                                        )
+                                        .changed()
                                         {
                                             *dirty = true;
                                         }
@@ -760,7 +815,13 @@ impl LadonDesktop {
                                         );
                                     }
                                 }
-                                if ui.button("×").on_hover_text("Remove field").clicked() {
+                                copy_value_button(ui, field.value(), &mut copy_request);
+                                if ui
+                                    .add_enabled_ui(can_remove, remove_field_button)
+                                    .inner
+                                    .on_hover_text("Remove field")
+                                    .clicked()
+                                {
                                     remove_index = Some(index);
                                 }
                             });
@@ -788,6 +849,20 @@ impl LadonDesktop {
                     }
                 }
             });
+
+        if let Some(value) = copy_request {
+            let now = self.ui_clock_millis();
+            match self.clipboard.copy(value, now) {
+                Ok(()) => {
+                    self.clipboard_clear_notice_shown = false;
+                    set_clipboard_notice(
+                        &mut self.notice,
+                        "Copied; Ladon will clear it after 30 seconds if unchanged",
+                    );
+                }
+                Err(_) => set_clipboard_notice(&mut self.notice, "Clipboard is unavailable"),
+            }
+        }
 
         match delete_action {
             Some(DeleteAction::Request) => {
@@ -1341,6 +1416,7 @@ impl LadonDesktop {
     }
 
     fn lock_immediately(&mut self) {
+        self.clear_clipboard();
         #[cfg(unix)]
         let result = if let Some(broker) = &self.broker {
             broker.cancel_active_run_and_lock(&self.controller)
@@ -1363,6 +1439,7 @@ impl LadonDesktop {
     }
 
     fn lock_app_with_touch_id_availability(&mut self, touch_id_available: bool) {
+        self.clear_clipboard();
         let can_unlock = touch_id_available
             || self
                 .session_confirmation
@@ -1688,6 +1765,7 @@ impl LadonDesktop {
     }
 
     fn clear_for_app_lock(&mut self) {
+        self.clear_clipboard();
         self.clear_unlock_fields();
         self.session_pin.clear();
         self.session_pin_confirmation.clear();
@@ -1712,6 +1790,31 @@ impl LadonDesktop {
             self.pending_app_lock = None;
         }
         self.desktop_lock = DesktopLockState::Active;
+    }
+
+    fn ui_clock_millis(&self) -> u64 {
+        u64::try_from(self.ui_clock_started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn poll_clipboard(&mut self) {
+        if self.clipboard.poll_clear(self.ui_clock_millis()).is_err() {
+            if !self.clipboard_clear_notice_shown {
+                set_clipboard_notice(
+                    &mut self.notice,
+                    "Clipboard could not be cleared; Ladon will retry",
+                );
+                self.clipboard_clear_notice_shown = true;
+            }
+        } else {
+            self.clipboard_clear_notice_shown = false;
+        }
+    }
+
+    fn clear_clipboard(&mut self) {
+        // Drop the lease even if the OS clipboard cannot be read or cleared at lock/exit.
+        let mut clipboard = std::mem::take(&mut self.clipboard);
+        let _ = clipboard.clear_if_owned();
+        self.clipboard_clear_notice_shown = false;
     }
 
     fn synchronize_phase(&mut self, phase: VaultUiPhase) {
@@ -2125,6 +2228,7 @@ fn unlock_instance_file(file: &File) {
 
 impl eframe::App for LadonDesktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_clipboard();
         #[cfg(unix)]
         self.process_external_lock();
 
@@ -2194,6 +2298,7 @@ impl eframe::App for LadonDesktop {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.clear_clipboard();
         #[cfg(unix)]
         self.process_external_lock();
 
@@ -2286,16 +2391,38 @@ fn sensitive_text_edit(
     width: f32,
     password: bool,
 ) -> egui::Response {
-    let mut output = TextEdit::singleline(value)
-        .password(password)
-        .hint_text(hint)
-        .desired_width(width)
-        .show(ui);
+    let response = ui.add_sized(
+        [width, SENSITIVE_FIELD_HEIGHT],
+        TextEdit::singleline(value)
+            .password(password)
+            .hint_text(hint)
+            .desired_width(width),
+    );
     // egui stores ordinary Strings for undo. Password mode blocks copy/accessibility output,
     // and clearing the undoer immediately prevents those copies surviving in widget state.
-    output.state.clear_undoer();
-    output.state.store(ui.ctx(), output.response.id);
-    output.response
+    if let Some(mut state) = TextEdit::load_state(ui.ctx(), response.id) {
+        state.clear_undoer();
+        state.store(ui.ctx(), response.id);
+    }
+    response
+}
+
+fn remove_field_button(ui: &mut egui::Ui) -> egui::Response {
+    ui.add_sized([30.0, REMOVE_BUTTON_HEIGHT], egui::Button::new("×"))
+}
+
+fn copy_value_button(
+    ui: &mut egui::Ui,
+    value: &EditableValue,
+    request: &mut Option<SensitiveBytes>,
+) {
+    if let Some(text) = copyable_text(value)
+        && ui
+            .add_sized([52.0, SENSITIVE_FIELD_HEIGHT], egui::Button::new("Copy"))
+            .clicked()
+    {
+        *request = Some(SensitiveBytes::new(text.as_bytes().to_vec()));
+    }
 }
 
 fn add_form_error_text(error: AddDraftValidationError) -> String {
@@ -2380,6 +2507,189 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[test]
+    fn selected_action_rows_keep_delete_with_the_primary_actions() {
+        assert_eq!(
+            selected_action_labels(SelectedActionSet::Unlock),
+            (["Unlock this secret"].as_slice(), "Delete")
+        );
+        assert_eq!(
+            selected_action_labels(SelectedActionSet::Hidden),
+            (["Show", "Edit"].as_slice(), "Delete")
+        );
+        assert_eq!(
+            selected_action_labels(SelectedActionSet::Revealed),
+            (["Hide", "Edit"].as_slice(), "Delete")
+        );
+        assert_eq!(
+            selected_action_labels(SelectedActionSet::Editing).0,
+            &[] as &[&str]
+        );
+    }
+
+    #[test]
+    fn remove_control_matches_the_sensitive_text_row_height() {
+        assert_eq!(REMOVE_BUTTON_HEIGHT, SENSITIVE_FIELD_HEIGHT);
+    }
+
+    #[test]
+    fn only_text_values_are_copyable() {
+        let text = EditableValue::Text(SensitiveText::from("fake-copy-value"));
+        assert_eq!(copyable_text(&text), Some("fake-copy-value"));
+        let binary = EditableValue::Binary {
+            bytes: ladon_core::SensitiveBytes::new(vec![0xff]),
+            original_hint: ladon_core::TextHint::Binary,
+        };
+        assert_eq!(copyable_text(&binary), None);
+    }
+
+    #[test]
+    fn clipboard_notice_preserves_authentication_and_destructive_errors() {
+        for text in ["Authentication failed", "Delete failed"] {
+            let mut notice = Some(Notice {
+                text: text.to_owned(),
+                danger: true,
+            });
+            set_clipboard_notice(&mut notice, "Clipboard is unavailable");
+            assert_eq!(notice.unwrap().text, text);
+        }
+        let mut notice = None;
+        set_clipboard_notice(&mut notice, "Clipboard is unavailable");
+        assert_eq!(notice.unwrap().text, "Clipboard is unavailable");
+    }
+
+    fn shape_contains_text(shape: &egui::epaint::Shape, expected: &str) -> bool {
+        match shape {
+            egui::epaint::Shape::Text(text) => text.galley.job.text == expected,
+            egui::epaint::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    fn text_position(shapes: &[egui::epaint::ClippedShape], expected: &str) -> egui::Pos2 {
+        shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == expected => {
+                    Some(text.pos)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing rendered text: {expected}"))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selected_actions_share_one_row_before_fields_including_delete_confirmation() {
+        let (mut app, _, _directory) = app_with_sensitive_detail(false);
+        let secret = app.controller.lock().unwrap().secrets().remove(0);
+        let context = egui::Context::default();
+        configure_style(&context);
+        for confirm in [false, true] {
+            app.pending_delete = confirm.then_some(secret.id);
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default()
+                    .show(context, |ui| app.show_selected_workspace(ui, &secret));
+            });
+            let hide = text_position(&output.shapes, "Hide");
+            let edit = text_position(&output.shapes, "Edit");
+            let delete = text_position(&output.shapes, "Delete");
+            assert_eq!(hide.y, edit.y);
+            assert_eq!(edit.y, delete.y);
+            assert!(delete.y < text_position(&output.shapes, &secret.field_names[0]).y);
+            if confirm {
+                let cancel = text_position(&output.shapes, "Cancel");
+                assert_eq!(delete.y, cancel.y);
+                assert!(
+                    delete.x < cancel.x,
+                    "confirmation keeps Delete then Cancel in the right-hand area"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sensitive_row_widgets_have_equal_rendered_heights() {
+        let context = egui::Context::default();
+        configure_style(&context);
+        let mut value = SensitiveText::from("fake-value");
+        let mut name = "value".to_owned();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.horizontal(|ui| {
+                    let name = ui.add_sized(
+                        [94.0, SENSITIVE_FIELD_HEIGHT],
+                        TextEdit::singleline(&mut name),
+                    );
+                    let value = visible_sensitive_text_field(ui, &mut value, "Value", 170.0);
+                    let copy = ui.scope(|ui| {
+                        copy_value_button(
+                            ui,
+                            &EditableValue::Text(SensitiveText::from("fake-copy")),
+                            &mut None,
+                        )
+                    });
+                    let remove = remove_field_button(ui);
+                    assert_eq!(name.rect.height(), value.rect.height());
+                    assert_eq!(value.rect.height(), copy.response.rect.height());
+                    assert_eq!(value.rect.height(), remove.rect.height());
+                    assert_eq!(remove.rect.height(), 34.0);
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn add_field_rows_stay_compact_and_keep_remove_aligned_with_values() {
+        let (mut app, _, _directory) = app_with_sensitive_detail(false);
+        app.draft.fields_mut()[0]
+            .value_mut()
+            .push_str("fake-primary");
+        app.draft.add_field();
+        app.draft.fields_mut()[1]
+            .value_mut()
+            .push_str("fake-additional");
+        let context = egui::Context::default();
+        configure_style(&context);
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| app.show_add_workspace(ui));
+        });
+        let primary = text_position(&output.shapes, "fake-primary");
+        let additional = text_position(&output.shapes, "fake-additional");
+        let remove = text_position(&output.shapes, "×");
+        assert!(primary.y < 200.0);
+        assert!(additional.y < 300.0);
+        assert!(
+            (additional.y - remove.y).abs() < 10.0,
+            "remove must align with its value input"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn editing_sensitive_input_is_visible_and_clears_undo() {
+        let (mut app, _, _directory) = app_with_sensitive_detail(true);
+        let secret = app.controller.lock().unwrap().secrets().remove(0);
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                app.show_selected_workspace(ui, &secret);
+            });
+        });
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, "fake-external-lock-secret")),
+            "edit values must render visibly"
+        );
+        // Exercise the same visible-sensitive widget's persisted undo state.
+        visible_sensitive_widget_does_not_retain_undo_history();
+    }
+
     #[cfg(unix)]
     fn app_with_sensitive_detail(editing: bool) -> (LadonDesktop, PathBuf, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -2439,6 +2749,9 @@ mod tests {
                 draft: AddSecretDraft::new(),
                 add_form_error: None,
                 notice: None,
+                clipboard: SecretClipboard::default(),
+                ui_clock_started: Instant::now(),
+                clipboard_clear_notice_shown: false,
                 detail,
                 unlock_confirmation: false,
                 discard_confirmation: editing,
@@ -3204,13 +3517,30 @@ mod tests {
                     Some(visible_sensitive_text_field(ui, &mut value, "Secret value", 230.0).id);
             });
         });
-        let state = TextEdit::load_state(&context, widget_id.unwrap()).unwrap();
+        let id = widget_id.unwrap();
+        let mut state = TextEdit::load_state(&context, id).unwrap();
         let current = (
             state.cursor.char_range().unwrap_or_default(),
             value.as_str().to_owned(),
         );
+        let mut undoer = state.undoer();
+        undoer.add_undo(&(current.0, "fake-previous-secret".to_owned()));
+        assert!(undoer.has_undo(&current));
+        state.set_undoer(undoer);
+        state.store(&context, id);
+
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                assert_eq!(
+                    visible_sensitive_text_field(ui, &mut value, "Secret value", 230.0).id,
+                    id
+                );
+            });
+        });
+        let state = TextEdit::load_state(&context, id).unwrap();
 
         assert!(!state.undoer().has_undo(&current));
+        assert!(!state.undoer().is_in_flux());
     }
 
     #[test]
@@ -3332,6 +3662,9 @@ mod tests {
             add_form_error: Some(AddDraftValidationError::InvalidName { field_index: 0 }),
             notice: None,
             detail,
+            clipboard: SecretClipboard::default(),
+            ui_clock_started: Instant::now(),
+            clipboard_clear_notice_shown: false,
             unlock_confirmation: true,
             discard_confirmation: true,
             pending_delete: None,
@@ -3398,6 +3731,9 @@ mod tests {
             draft,
             add_form_error: None,
             notice: None,
+            clipboard: SecretClipboard::default(),
+            ui_clock_started: Instant::now(),
+            clipboard_clear_notice_shown: false,
             detail: SecretDetailState::default(),
             unlock_confirmation: true,
             discard_confirmation: true,

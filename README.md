@@ -19,7 +19,7 @@ owner-authenticated named-pipe transport is not implemented yet.
 - optional memory-only 4–12 digit session PIN on every platform plus strict
   Touch ID on macOS;
 - one-confirmation, fixed 30-minute access per agent-process/secret pair, with
-  manual revocation;
+  a live GUI access list and per-grant or all-grant revocation;
 - generic direct process execution without a shell added by Ladon;
 - environment, stdin, and temporary-file injection by secret name or ID;
 - bounded stdout/stderr capture and redaction of common raw/encoded forms;
@@ -78,6 +78,15 @@ PIN before choosing **Show value** or **Edit**. Values remain visible only until
 you explicitly choose **Hide value**, navigate away, lock the app or vault, or
 close the app; a selection requires authentication again after you leave and
 return.
+
+Revealed text and text being edited are readable. Use the explicit **Copy**
+button to copy a text field; binary fields cannot be copied this way. Ladon
+attempts to clear the copy after 30 seconds only if the clipboard still contains
+the copied text, preserving newer, different clipboard content. App lock, vault
+lock, and exit also attempt this conditional cleanup. Clipboard access can fail;
+this is best-effort cleanup, not a guarantee of erasure. Clipboard managers and
+OS history may retain copies outside Ladon's control. Keyboard Copy/Cut in
+sensitive fields is disabled so copies use the managed **Copy** button.
 
 Edits are prepared and validated before a single atomic vault update, preserving
 the secret ID. Existing binary fields are preserved but cannot be edited inline.
@@ -144,13 +153,28 @@ Secret names, field names, executable paths, arguments, and working directories
 are metadata visible to the agent. Do not put secret material in those names or
 arguments.
 
+The MCP server exposes five tools: `ladon_status`, `ladon_list_secrets`,
+`ladon_lock`, `ladon_identify_session`, and `ladon_run`.
+`ladon_identify_session` is optional: it sets a process-local, untrusted,
+non-secret reported name, such as `Codex — demo task`. Its `display_name` is
+trimmed and must contain 1–64 UTF-8 bytes with no control characters. Without
+it, Ladon uses a valid MCP `clientInfo.name`, or `MCP client` as a fallback.
+The new name reaches the GUI on the next broker request. It does not change
+the session ID, grant duration, or permissions, and does not authenticate a chat.
+
 The first run from an MCP process that needs a particular secret opens a local
 approval window. Confirm once with the session PIN or Touch ID and that MCP
 process may use the displayed secret for a fixed 30 minutes; use does not extend
-the timer. A different MCP process or another secret asks separately. Use
-**Revoke agent access** in the GUI to clear every permission immediately. A
-one-shot `ladon run` invocation has a fresh client identity, so it asks each
-time. Revocation also cancels the active supervised run before returning.
+the timer. A different MCP process or another secret asks separately. The GUI's
+**Agent access** panel shows one row per active process/secret grant, with its
+reported name, eight-character session ID, secret name, remaining time, and
+**Running** while that pair is in use. **Revoke** removes only that row's grant
+and cancels a matching supervised run before returning, preserving unrelated
+grants. **Revoke all** clears every grant and cancels the active run. These
+active-grant views and targeted revoke controls are GUI-only; neither is
+exposed over RPC or MCP. A one-shot `ladon run` invocation has a fresh client
+identity, so it asks each time. Revocation cannot erase bytes a child has
+already consumed, retained, or transmitted.
 
 **Lock app** is a soft UI lock. It revokes grants, cancels the active run,
 closes agent admission, and makes `list` and `run` return `vault_locked`; it
@@ -175,8 +199,9 @@ Ladon primarily prevents accidental disclosure into chat, shell history,
 process arguments, logs, and ordinary command output. It encrypts the vault at
 rest and rejects other OS users at the local Unix endpoint.
 
-It cannot protect a secret from malware already running as your user, a
-malicious authorized child process, screen/keyboard capture, or deliberate
+Same-user client impersonation, clipboard managers, and OS clipboard history
+remain out of scope. Ladon cannot protect a secret from malware running as your
+user, a malicious authorized child process, screen/keyboard capture, or deliberate
 transformation and exfiltration by a child. Redaction recognizes common exact
 representations; it is not semantic DLP. Expiry or revocation prevents future
 resolution but cannot erase a value already delivered to a running authorized
@@ -188,8 +213,9 @@ child. Read [SECURITY.md](SECURITY.md) and the
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo test --workspace --all-features -- --test-threads=1
 scripts/smoke-test.sh
+cargo build --workspace --all-features --release
 ```
 
 Unix socket integration tests need permission to create a local Unix socket;

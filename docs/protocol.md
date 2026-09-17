@@ -15,6 +15,10 @@ command uses a fresh value. It is internal protocol metadata, never an MCP tool
 argument or result, and scopes grants without claiming to identify a logical
 chat or resist impersonation by a malicious same-user process.
 
+The existing `client_label` field carries the current untrusted reported name;
+it is non-secret display metadata, not an authentication claim. The GUI marks
+it as reported and shows an eight-character session ID for disambiguation.
+
 Protocol version 2 supports four methods:
 
 - `status`: lock state and non-secret idle time;
@@ -56,9 +60,17 @@ Only one run may reserve the approval/execution slot at a time, so a busy reques
 cannot accidentally obtain a grant. Lock and app shutdown cancel a pending
 approval and clear all grants. Each unlock has a fresh internal epoch, so an
 abnormal lock cannot leave a reusable permission. The broker rechecks expiry
-and revocation immediately before plaintext resolution. Manual revocation also
-cancels and waits for the active run; it still cannot erase bytes retained or
-transmitted by a child that was already authorized.
+and revocation immediately before plaintext resolution.
+
+The GUI's **Agent access** panel lists active grants, their reported names,
+session IDs, secret names, remaining time, and whether each pair is running.
+Its per-row **Revoke** removes exactly one `(client_session_id, secret_id)`
+grant, cancels and waits for a matching active run, and preserves other grants.
+**Revoke all** clears every grant and cancels and waits for the active run.
+Active-grant snapshots and targeted revocation are GUI-only and never cross
+RPC or MCP; protocol v2 still has only the four methods above. Revocation
+cannot erase bytes already consumed, retained, or transmitted by an authorized
+child.
 
 Saving or deleting a secret in the GUI also invalidates every grant for that
 immutable secret ID. This does not add a protocol method: the local selected-
@@ -66,16 +78,40 @@ secret view/edit flow is GUI-only, requires a fresh PIN or Touch ID confirmation
 and rejects a stale Touch ID completion after the selection or vault session
 changes. CLI, MCP, and local IPC remain value-free.
 
+The GUI's explicit **Copy** action supports text fields only. It attempts to
+clear the clipboard after 30 seconds, or on app lock, vault lock, or exit, only
+when its contents still equal the copied text. Newer, different contents are
+preserved. Cleanup is best-effort if the clipboard is unavailable and cannot
+clear clipboard managers or OS history. Clipboard values never enter RPC/MCP.
+
 ## MCP
 
-`ladon mcp` is a local stdio MCP server exposing only:
+`ladon mcp` is a local stdio MCP server exposing only these five tools:
 
 - `ladon_status`
 - `ladon_list_secrets`
 - `ladon_lock`
+- `ladon_identify_session`
 - `ladon_run`
 
-Tool arguments contain references such as `my-secret` or
+`ladon_identify_session` is optional and process-local. Its only argument is
+`display_name`, a non-secret, untrusted reported name. The server trims it and
+requires 1–64 UTF-8 bytes with no control characters; unknown arguments are
+rejected. For example:
+
+```json
+{"display_name": "Codex — demo task"}
+```
+
+This call updates only the MCP process's label and does not contact the broker.
+The next broker request forwards the new label in the existing `client_label`
+field, without changing the private session UUID or renewing any grant. The
+response acknowledges `identified: true` without returning the label or UUID.
+If no explicit name is supplied, a valid `clientInfo.name` from initialization
+is used; otherwise the label is `MCP client`. Reported names cannot authenticate
+a client or chat, and same-user impersonation remains out of scope.
+
+Run tool arguments contain references such as `my-secret` or
 `id:<uuid>` plus a field name. They never contain a value property. The MCP run
 timeout is capped at 15 minutes. stdout is reserved for JSON-RPC; ordinary
 diagnostics use stderr and stable non-secret error messages.

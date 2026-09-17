@@ -106,7 +106,9 @@ impl<C: MonotonicClock> GrantStore<C> {
 
     pub fn revoke_pair(&mut self, client_session_id: Uuid, secret_id: SecretId) -> bool {
         self.purge_expired();
-        self.deadlines.remove(&(client_session_id, secret_id)).is_some()
+        self.deadlines
+            .remove(&(client_session_id, secret_id))
+            .is_some()
     }
 
     #[must_use]

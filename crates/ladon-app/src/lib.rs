@@ -2,6 +2,9 @@
 mod agent_broker;
 mod approval;
 #[cfg(feature = "gui")]
+#[allow(dead_code)]
+mod clipboard;
+#[cfg(feature = "gui")]
 mod desktop;
 #[cfg(unix)]
 mod ipc;

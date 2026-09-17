@@ -180,6 +180,8 @@ fn reveal_and_edit_reject_authorization_from_a_stale_vault_session() {
 #[test]
 fn clipboard_is_cleared_only_if_the_copied_value_is_still_present() {
     let lease = ClipboardLease::new(SensitiveBytes::new(b"copied-value".to_vec()), 5_000);
+    assert!(!lease.is_expired(34_999));
+    assert!(lease.is_expired(35_000));
     assert!(!lease.should_clear(34_999, b"copied-value"));
     assert!(lease.should_clear(35_000, b"copied-value"));
     assert!(!lease.should_clear(35_000, b"user-replaced-it"));

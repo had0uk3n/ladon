@@ -1039,9 +1039,18 @@ impl ClipboardLease {
     }
 
     #[must_use]
-    pub fn should_clear(&self, now_millis: u64, current_clipboard: &[u8]) -> bool {
+    pub const fn is_expired(&self, now_millis: u64) -> bool {
         now_millis >= self.deadline_millis
-            && self.value.expose(|copied| copied == current_clipboard)
+    }
+
+    #[must_use]
+    pub(crate) fn matches(&self, current_clipboard: &[u8]) -> bool {
+        self.value.expose(|copied| copied == current_clipboard)
+    }
+
+    #[must_use]
+    pub fn should_clear(&self, now_millis: u64, current_clipboard: &[u8]) -> bool {
+        self.is_expired(now_millis) && self.matches(current_clipboard)
     }
 }
 

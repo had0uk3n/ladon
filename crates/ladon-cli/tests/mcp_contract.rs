@@ -30,12 +30,13 @@ impl RpcTransport for FakeTransport {
 }
 
 #[test]
-fn exposes_only_status_list_lock_and_generic_run_tools() {
+fn exposes_ladon_tools_without_secret_or_session_identifier_leaks() {
     let transport = FakeTransport::new();
     let input = concat!(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_status\",\"arguments\":{}}}\n",
     );
     let mut output = Vec::new();
 
@@ -46,8 +47,63 @@ fn exposes_only_status_list_lock_and_generic_run_tools() {
     assert!(output.contains("ladon_list_secrets"));
     assert!(output.contains("ladon_lock"));
     assert!(output.contains("ladon_run"));
+    assert!(output.contains("ladon_identify_session"));
     assert!(!output.contains("ladon_reveal"));
     assert!(!output.contains("ladon_add"));
+    assert!(!output.contains("fake-plaintext-value"));
+    assert!(!output.contains(&transport.seen.borrow()[0].client_session_id.to_string()));
+}
+
+#[test]
+fn identify_session_changes_the_reported_label_without_exposing_the_private_id() {
+    let transport = FakeTransport::new();
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"Codex\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_identify_session\",\"arguments\":{\"display_name\":\"Codex — deploy payments\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_status\",\"arguments\":{}}}\n",
+    );
+    let mut output = Vec::new();
+
+    serve_mcp(input.as_bytes(), &mut output, &transport).unwrap();
+
+    let seen = transport.seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].client_label, "Codex — deploy payments");
+    assert!(
+        !String::from_utf8(output)
+            .unwrap()
+            .contains(&seen[0].client_session_id.to_string())
+    );
+}
+
+#[test]
+fn invalid_identification_preserves_the_initialized_client_name() {
+    let transport = FakeTransport::new();
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"Codex\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_identify_session\",\"arguments\":{\"display_name\":\"bad\\nname\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_status\",\"arguments\":{}}}\n",
+    );
+    let mut output = Vec::new();
+
+    serve_mcp(input.as_bytes(), &mut output, &transport).unwrap();
+
+    assert_eq!(transport.seen.borrow()[0].client_label, "Codex");
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("invalid_request")
+    );
+}
+
+#[test]
+fn absent_identification_uses_the_mcp_client_fallback() {
+    let transport = FakeTransport::new();
+    let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ladon_status\",\"arguments\":{}}}\n";
+
+    serve_mcp(input.as_slice(), &mut Vec::new(), &transport).unwrap();
+
+    assert_eq!(transport.seen.borrow()[0].client_label, "MCP client");
 }
 
 #[test]

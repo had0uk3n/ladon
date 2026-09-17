@@ -13,6 +13,52 @@ use crate::{RpcTransport, commands::resolve_executable};
 
 const MCP_LEGACY_VERSION: &str = "2025-11-25";
 const MCP_MODERN_VERSION: &str = "2026-07-28";
+const MAX_REPORTED_NAME_BYTES: usize = 64;
+
+struct McpSession {
+    id: Uuid,
+    initialized_name: Option<String>,
+    display_name: Option<String>,
+}
+
+impl McpSession {
+    fn new() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            initialized_name: None,
+            display_name: None,
+        }
+    }
+
+    fn label(&self) -> &str {
+        self.display_name
+            .as_deref()
+            .or(self.initialized_name.as_deref())
+            .unwrap_or("MCP client")
+    }
+
+    fn validate_name(value: &str) -> Result<String, LadonError> {
+        let value = value.trim();
+        if value.is_empty()
+            || value.len() > MAX_REPORTED_NAME_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(LadonError::InvalidRequest);
+        }
+        Ok(value.to_owned())
+    }
+
+    fn identify(&mut self, value: &str) -> Result<(), LadonError> {
+        self.display_name = Some(Self::validate_name(value)?);
+        Ok(())
+    }
+
+    fn record_initialized_name(&mut self, value: &str) {
+        if let Ok(name) = Self::validate_name(value) {
+            self.initialized_name = Some(name);
+        }
+    }
+}
 
 pub fn serve_mcp(
     input: impl Read,
@@ -20,7 +66,7 @@ pub fn serve_mcp(
     transport: &impl RpcTransport,
 ) -> Result<(), LadonError> {
     let mut input = BufReader::new(input);
-    let client_session_id = Uuid::new_v4();
+    let mut session = McpSession::new();
     loop {
         let mut line = String::new();
         let read = input
@@ -38,7 +84,7 @@ pub fn serve_mcp(
         if trimmed.is_empty() {
             continue;
         }
-        let response = handle_message(trimmed.as_bytes(), client_session_id, transport);
+        let response = handle_message(trimmed.as_bytes(), &mut session, transport);
         if let Some(response) = response {
             serde_json::to_writer(&mut *output, &response)
                 .map_err(|_| LadonError::InvalidRequest)?;
@@ -52,7 +98,7 @@ pub fn serve_mcp(
 
 fn handle_message(
     input: &[u8],
-    client_session_id: Uuid,
+    session: &mut McpSession,
     transport: &impl RpcTransport,
 ) -> Option<Value> {
     if validate_json_document(input).is_err() {
@@ -70,16 +116,26 @@ fn handle_message(
     let method = method.unwrap_or_default();
     let id = id?;
     match method {
-        "initialize" => Some(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": MCP_LEGACY_VERSION,
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "ladon", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Use named secret references with Ladon tools. Never ask the user to paste a secret value."
+        "initialize" => {
+            if let Some(name) = request
+                .get("params")
+                .and_then(|params| params.get("clientInfo"))
+                .and_then(|client_info| client_info.get("name"))
+                .and_then(Value::as_str)
+            {
+                session.record_initialized_name(name);
             }
-        })),
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": MCP_LEGACY_VERSION,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "ladon", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": "Use named secret references with Ladon tools. Never ask the user to paste a secret value. When useful, call ladon_identify_session once with a short non-secret task name before a secret-bearing run."
+                }
+            }))
+        }
         "server/discover" => Some(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -97,12 +153,7 @@ fn handle_message(
             "id": id,
             "result": { "tools": tools() }
         })),
-        "tools/call" => Some(call_tool(
-            id,
-            request.get("params"),
-            client_session_id,
-            transport,
-        )),
+        "tools/call" => Some(call_tool(id, request.get("params"), session, transport)),
         _ => Some(jsonrpc_error(id, -32601, "method not found")),
     }
 }
@@ -110,7 +161,7 @@ fn handle_message(
 fn call_tool(
     id: Value,
     params: Option<&Value>,
-    client_session_id: Uuid,
+    session: &mut McpSession,
     transport: &impl RpcTransport,
 ) -> Value {
     let Some(params) = params else {
@@ -123,6 +174,9 @@ fn call_tool(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if name == "ladon_identify_session" {
+        return identify_session(id, arguments, session);
+    }
     let method = match name {
         "ladon_status" if empty_object(&arguments) => Ok(RpcMethod::Status),
         "ladon_list_secrets" if empty_object(&arguments) => Ok(RpcMethod::List),
@@ -137,8 +191,8 @@ fn call_tool(
     let request = RpcRequest {
         version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
-        client_session_id,
-        client_label: "MCP client (unverified)".to_owned(),
+        client_session_id: session.id,
+        client_label: session.label().to_owned(),
         method,
     };
     match transport.call(&request) {
@@ -161,6 +215,31 @@ fn call_tool(
                 tool_error(id, "invalid_response", "local Ladon response is invalid")
             }
         }
+        Err(error) => tool_error(id, error.code(), error.safe_message()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentifySessionArguments {
+    display_name: String,
+}
+
+fn identify_session(id: Value, arguments: Value, session: &mut McpSession) -> Value {
+    let arguments: IdentifySessionArguments = match serde_json::from_value(arguments) {
+        Ok(arguments) => arguments,
+        Err(_) => return tool_error(id, "invalid_request", "invalid request"),
+    };
+    match session.identify(&arguments.display_name) {
+        Ok(()) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": "session name recorded" }],
+                "structuredContent": { "identified": true },
+                "isError": false
+            }
+        }),
         Err(error) => tool_error(id, error.code(), error.safe_message()),
     }
 }
@@ -316,6 +395,19 @@ fn tools() -> Value {
             "description": "Lock the local Ladon vault and cancel any active secret-bearing run.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+        },
+        {
+            "name": "ladon_identify_session",
+            "description": "Set a short non-secret reported name for this MCP process, such as 'Codex — deploy payments'. Call once before the first secret-bearing run when a useful task name is known.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["display_name"],
+                "additionalProperties": false,
+                "properties": {
+                    "display_name": { "type": "string", "minLength": 1, "maxLength": 64 }
+                }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false }
         },
         {
             "name": "ladon_run",

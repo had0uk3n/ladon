@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Condvar, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -143,6 +143,7 @@ struct ApprovalState<C> {
     grants: GrantStore<C>,
     vault_session_id: Option<Uuid>,
     pending: Option<PendingState>,
+    client_labels: HashMap<Uuid, String>,
     app_access: AppAccessState,
     lock_epoch: u64,
 }
@@ -154,13 +155,43 @@ pub struct GrantTicket {
     secret_ids: Vec<SecretId>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveGrantSnapshot {
+    client_session_id: Uuid,
+    client_label: String,
+    secret_id: SecretId,
+    remaining: Duration,
+}
+
+impl ActiveGrantSnapshot {
+    #[must_use]
+    pub const fn client_session_id(&self) -> Uuid {
+        self.client_session_id
+    }
+
+    #[must_use]
+    pub fn client_label(&self) -> &str {
+        &self.client_label
+    }
+
+    #[must_use]
+    pub const fn secret_id(&self) -> SecretId {
+        self.secret_id
+    }
+
+    #[must_use]
+    pub const fn remaining(&self) -> Duration {
+        self.remaining
+    }
+}
+
 struct PendingState {
     request: PendingApproval,
     requested_secret_ids: Vec<SecretId>,
     decision: Option<ApprovalDecision>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ApprovalDecision {
     Approve,
     Deny,
@@ -175,6 +206,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                 grants: GrantStore::new(clock, grant_lifetime),
                 vault_session_id: None,
                 pending: None,
+                client_labels: HashMap::new(),
                 app_access: AppAccessState::Active,
                 lock_epoch: 0,
             }),
@@ -198,8 +230,12 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
 
         if state.vault_session_id != Some(request.vault_session_id) {
             state.grants.revoke_all();
+            state.client_labels.clear();
             state.vault_session_id = Some(request.vault_session_id);
         }
+        state
+            .client_labels
+            .insert(request.client_session_id, request.client_label.clone());
         let mut seen = HashSet::new();
         let ticket = GrantTicket {
             vault_session_id: request.vault_session_id,
@@ -244,18 +280,21 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                 let pending = state.pending.take().ok_or(LadonError::ProcessFailure)?;
                 match decision {
                     ApprovalDecision::Approve => {
+                        let client_session_id = pending.request.client_session_id;
+                        let client_label = pending.request.client_label.clone();
                         let secret_ids = pending.request.secrets.iter().map(ApprovalSecret::id);
-                        state
-                            .grants
-                            .grant(pending.request.client_session_id, secret_ids);
+                        state.grants.grant(client_session_id, secret_ids);
+                        state.client_labels.insert(client_session_id, client_label);
                         self.changed.notify_all();
                         return Ok(ticket);
                     }
                     ApprovalDecision::Deny => {
+                        prune_client_labels(&mut state);
                         self.changed.notify_all();
                         return Err(LadonError::ApprovalDenied);
                     }
                     ApprovalDecision::Cancel => {
+                        prune_client_labels(&mut state);
                         self.changed.notify_all();
                         return Err(LadonError::ApprovalCancelled);
                     }
@@ -286,6 +325,58 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             .map(|pending| pending.request.clone()))
     }
 
+    pub fn observe_client(
+        &self,
+        client_session_id: Uuid,
+        client_label: &str,
+    ) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        let owns_active_grant = state
+            .grants
+            .active()
+            .iter()
+            .any(|grant| grant.client_session_id() == client_session_id);
+        let has_pending_request = state.pending.as_ref().is_some_and(|pending| {
+            pending.decision.is_none() && pending.request.client_session_id == client_session_id
+        });
+        if owns_active_grant || has_pending_request {
+            let client_label = client_label.to_owned();
+            if let Some(pending) = state.pending.as_mut()
+                && pending.request.client_session_id == client_session_id
+            {
+                pending.request.client_label = client_label.clone();
+            }
+            state.client_labels.insert(client_session_id, client_label);
+        }
+        prune_client_labels(&mut state);
+        Ok(())
+    }
+
+    pub fn active_grants(&self) -> Result<Vec<ActiveGrantSnapshot>, LadonError> {
+        let mut state = self.lock_state()?;
+        let active = state.grants.active();
+        let active_clients: HashSet<_> = active
+            .iter()
+            .map(|grant| grant.client_session_id())
+            .collect();
+        state
+            .client_labels
+            .retain(|client_session_id, _| active_clients.contains(client_session_id));
+        Ok(active
+            .into_iter()
+            .map(|grant| ActiveGrantSnapshot {
+                client_session_id: grant.client_session_id(),
+                client_label: state
+                    .client_labels
+                    .get(&grant.client_session_id())
+                    .cloned()
+                    .unwrap_or_else(|| "MCP client".to_owned()),
+                secret_id: grant.secret_id(),
+                remaining: grant.remaining(),
+            })
+            .collect())
+    }
+
     pub fn app_access_state(&self) -> Result<AppAccessState, LadonError> {
         Ok(self.lock_state()?.app_access)
     }
@@ -312,6 +403,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         state.app_access = AppAccessState::Locking { epoch };
         cancel_pending(&mut state);
         state.grants.revoke_all();
+        state.client_labels.clear();
         self.changed.notify_all();
         Ok(epoch)
     }
@@ -345,6 +437,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         state.app_access = AppAccessState::Active;
         cancel_pending(&mut state);
         state.grants.revoke_all();
+        state.client_labels.clear();
         state.vault_session_id = None;
         self.changed.notify_all();
         Ok(())
@@ -362,14 +455,35 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         let mut state = self.lock_state()?;
         if let Some(pending) = state.pending.as_mut() {
             pending.decision = Some(ApprovalDecision::Cancel);
+            prune_client_labels(&mut state);
             self.changed.notify_all();
         }
         Ok(())
     }
 
     pub fn revoke_all(&self) -> Result<(), LadonError> {
-        self.lock_state()?.grants.revoke_all();
+        let mut state = self.lock_state()?;
+        state.grants.revoke_all();
+        state.client_labels.clear();
         Ok(())
+    }
+
+    pub fn revoke_pair(
+        &self,
+        client_session_id: Uuid,
+        secret_id: SecretId,
+    ) -> Result<bool, LadonError> {
+        let mut state = self.lock_state()?;
+        if let Some(pending) = state.pending.as_mut()
+            && pending.request.client_session_id == client_session_id
+            && pending.requested_secret_ids.contains(&secret_id)
+        {
+            pending.decision = Some(ApprovalDecision::Cancel);
+        }
+        let revoked = state.grants.revoke_pair(client_session_id, secret_id);
+        prune_client_labels(&mut state);
+        self.changed.notify_all();
+        Ok(revoked)
     }
 
     pub fn coordinate_secret_mutation<P, T>(
@@ -387,6 +501,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             self.changed.notify_all();
         }
         state.grants.revoke_secret(secret_id);
+        prune_client_labels(&mut state);
         let result = commit(prepared);
         self.changed.notify_all();
         result
@@ -421,6 +536,9 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             return Err(LadonError::InvalidRequest);
         }
         pending.decision = Some(decision);
+        if decision != ApprovalDecision::Approve {
+            prune_client_labels(&mut state);
+        }
         self.changed.notify_all();
         Ok(())
     }
@@ -453,18 +571,31 @@ fn decision_for<C>(state: &ApprovalState<C>, approval_id: Uuid) -> Option<Approv
     })
 }
 
-fn clear_pending<C>(state: &mut ApprovalState<C>, approval_id: Uuid) {
+fn clear_pending<C: MonotonicClock>(state: &mut ApprovalState<C>, approval_id: Uuid) {
     if state
         .pending
         .as_ref()
         .is_some_and(|pending| pending.request.id == approval_id)
     {
         state.pending = None;
+        prune_client_labels(state);
     }
 }
 
-fn cancel_pending<C>(state: &mut ApprovalState<C>) {
+fn cancel_pending<C: MonotonicClock>(state: &mut ApprovalState<C>) {
     if let Some(pending) = state.pending.as_mut() {
         pending.decision = Some(ApprovalDecision::Cancel);
     }
+}
+
+fn prune_client_labels<C: MonotonicClock>(state: &mut ApprovalState<C>) {
+    let active_clients: HashSet<_> = state
+        .grants
+        .active()
+        .iter()
+        .map(|grant| grant.client_session_id())
+        .collect();
+    state
+        .client_labels
+        .retain(|client_session_id, _| active_clients.contains(client_session_id));
 }

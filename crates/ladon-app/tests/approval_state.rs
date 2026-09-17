@@ -37,6 +37,21 @@ fn request(client: Uuid, secrets: &[(SecretId, &str)]) -> PendingApproval {
     request_for_vault(Uuid::nil(), client, secrets)
 }
 
+fn request_with_label(client: Uuid, label: &str, secrets: &[(SecretId, &str)]) -> PendingApproval {
+    PendingApproval::new(
+        Uuid::nil(),
+        client,
+        label,
+        secrets
+            .iter()
+            .map(|(id, name)| ApprovalSecret::new(*id, *name, ["value"]))
+            .collect(),
+        "/usr/bin/curl",
+        ["https://example.test"],
+        "/tmp",
+    )
+}
+
 fn request_for_vault(
     vault_session_id: Uuid,
     client: Uuid,
@@ -65,6 +80,102 @@ fn wait_for_pending<C: MonotonicClock>(coordinator: &ApprovalCoordinator<C>) -> 
         assert!(Instant::now() < deadline, "approval never became pending");
         thread::yield_now();
     }
+}
+
+fn approve_request(coordinator: &Arc<ApprovalCoordinator<FakeClock>>, approval: PendingApproval) {
+    let waiting = {
+        let coordinator = Arc::clone(coordinator);
+        thread::spawn(move || coordinator.authorize(approval, &RunCancellation::new()))
+    };
+    let pending = wait_for_pending(coordinator);
+    coordinator.approve(pending.id()).unwrap();
+    assert!(waiting.join().unwrap().is_ok());
+}
+
+#[test]
+fn active_grants_report_untrusted_labels_without_secret_values() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    approve_request(
+        &coordinator,
+        request_with_label(client, "Codex — deploy", &[(secret, "prod")]),
+    );
+
+    clock.advance(Duration::from_secs(15));
+    let active = coordinator.active_grants().unwrap();
+
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].client_session_id(), client);
+    assert_eq!(active[0].secret_id(), secret);
+    assert_eq!(active[0].client_label(), "Codex — deploy");
+    assert_eq!(active[0].remaining(), Duration::from_secs(45));
+    assert!(!format!("{active:?}").contains("fake-state-secret"));
+}
+
+#[test]
+fn rename_updates_display_only_and_exact_revoke_preserves_other_pairs() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let first = SecretId::new();
+    let second = SecretId::new();
+    approve_request(
+        &coordinator,
+        request_with_label(client, "Codex", &[(first, "first"), (second, "second")]),
+    );
+    clock.advance(Duration::from_secs(10));
+
+    coordinator
+        .observe_client(client, "Codex — renamed")
+        .unwrap();
+    let active = coordinator.active_grants().unwrap();
+    assert_eq!(active.len(), 2);
+    assert!(
+        active
+            .iter()
+            .all(|grant| grant.client_label() == "Codex — renamed")
+    );
+    assert!(
+        active
+            .iter()
+            .all(|grant| grant.remaining() == Duration::from_secs(50))
+    );
+
+    assert!(coordinator.revoke_pair(client, first).unwrap());
+    let active = coordinator.active_grants().unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].secret_id(), second);
+}
+
+#[test]
+fn active_grants_purge_expired_pairs_and_unused_labels() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    approve_request(
+        &coordinator,
+        request_with_label(client, "Codex — short-lived", &[(secret, "prod")]),
+    );
+
+    clock.advance(Duration::from_secs(60));
+    assert!(coordinator.active_grants().unwrap().is_empty());
+    coordinator.observe_client(client, "Codex — stale").unwrap();
+    assert!(coordinator.active_grants().unwrap().is_empty());
 }
 
 #[test]
@@ -210,6 +321,7 @@ fn denial_timeout_disconnect_and_revoke_fail_closed() {
     coordinator.approve(pending.id()).unwrap();
     assert!(approved.join().unwrap().is_ok());
     coordinator.revoke_all().unwrap();
+    assert!(coordinator.active_grants().unwrap().is_empty());
 
     let revoked = {
         let coordinator = Arc::clone(&coordinator);
@@ -503,6 +615,7 @@ fn mutation_of_already_granted_secret_cancels_mixed_pending_without_expanding_di
         coordinator.coordinate_secret_mutation(already_granted, || Ok(()), Ok),
         Ok(())
     );
+    assert!(coordinator.active_grants().unwrap().is_empty());
     assert_eq!(mixed.join().unwrap(), Err(LadonError::ApprovalCancelled));
 }
 
@@ -671,6 +784,7 @@ fn app_lock_revokes_grants_before_secret_resolution() {
     let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     coordinator.begin_app_lock().unwrap();
+    assert!(coordinator.active_grants().unwrap().is_empty());
 
     assert_eq!(
         coordinator.with_valid_grant(&ticket, || {

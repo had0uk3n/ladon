@@ -13,9 +13,11 @@ use eframe::egui::{
 use ladon_core::{LadonError, SecretId, SecretMetadata, SensitiveBytes};
 
 #[cfg(unix)]
-use crate::agent_broker::{AppLockAttempt, LocalBrokerHandle};
+use crate::agent_broker::{AgentGrantView, AppLockAttempt, LocalBrokerHandle};
 use crate::clipboard::SecretClipboard;
 use crate::touch_id::TouchIdAttempt;
+#[cfg(unix)]
+use crate::ui::sanitize_untrusted;
 use crate::{
     AddSecretDraft, DetailMode, LocalAuthAttempt, NavigationResult, NavigationTarget,
     PendingRequestView, PinVerification, SecretDetailState, SensitiveText, SessionConfirmation,
@@ -38,6 +40,13 @@ const AUTH_WINDOW_SIZE: [f32; 2] = [500.0, 380.0];
 const MANAGER_WINDOW_SIZE: [f32; 2] = [640.0, 420.0];
 const WINDOW_MIN_SIZE: [f32; 2] = [480.0, 340.0];
 const SECRET_RAIL_WIDTH: f32 = 180.0;
+const SECRET_ROW_TEXT_SIZE: f32 = 13.0;
+const SECRET_ROW_HEIGHT: f32 = 30.0;
+const SECRET_ROW_LEADING_INSET: f32 = 6.0;
+const NEW_SECRET_TEXT_SIZE: f32 = SECRET_ROW_TEXT_SIZE;
+const NEW_SECRET_ROW_HEIGHT: f32 = SECRET_ROW_HEIGHT;
+#[cfg(unix)]
+const AGENT_ACCESS_MAX_HEIGHT: f32 = 160.0;
 const WORKSPACE_CARD_WIDTH: f32 = 380.0;
 const AUTH_FORM_WIDTH: f32 = 340.0;
 const SENSITIVE_FIELD_HEIGHT: f32 = 34.0;
@@ -81,6 +90,12 @@ struct LadonDesktop {
     controller: Arc<Mutex<VaultController>>,
     #[cfg(unix)]
     broker: Option<LocalBrokerHandle>,
+    #[cfg(unix)]
+    agent_grants: Vec<AgentGrantView>,
+    #[cfg(unix)]
+    agent_grants_session: Option<uuid::Uuid>,
+    #[cfg(unix)]
+    agent_grants_error_shown: bool,
     passphrase: SensitiveText,
     confirmation: SensitiveText,
     session_pin: SensitiveText,
@@ -290,6 +305,12 @@ impl LadonDesktop {
             controller,
             #[cfg(unix)]
             broker,
+            #[cfg(unix)]
+            agent_grants: Vec::new(),
+            #[cfg(unix)]
+            agent_grants_session: None,
+            #[cfg(unix)]
+            agent_grants_error_shown: false,
             passphrase: SensitiveText::default(),
             confirmation: SensitiveText::default(),
             session_pin: SensitiveText::default(),
@@ -913,21 +934,20 @@ impl LadonDesktop {
                     Ok(controller.remaining_unlocked().unwrap_or_default())
                 })
                 .unwrap_or_default();
-                ui.label(RichText::new("●  UNLOCKED").strong().color(COBALT));
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 16.0), egui::Sense::hover());
+                    let (center, radius) = status_dot_geometry(rect);
+                    ui.painter().circle_filled(center, radius, COBALT);
+                    ui.label(RichText::new("UNLOCKED").strong().color(COBALT));
+                });
                 ui.label(
                     RichText::new(format_remaining(remaining))
                         .size(12.0)
                         .color(Color32::from_rgb(173, 187, 214)),
                 );
                 #[cfg(unix)]
-                if quiet_button(ui, "Revoke agent access").clicked() {
-                    let result = self
-                        .broker
-                        .as_ref()
-                        .ok_or(LadonError::EndpointUnavailable)
-                        .and_then(LocalBrokerHandle::revoke_grants);
-                    self.notice_from(result, "Agent access revoked");
-                }
+                self.show_agent_access(ui);
                 ui.add_space(18.0);
                 ui.label(
                     RichText::new("Secrets")
@@ -936,16 +956,18 @@ impl LadonDesktop {
                 );
                 ui.add_space(8.0);
 
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("+ New secret").color(Color32::WHITE))
-                            .frame(false),
-                    )
-                    .clicked()
-                {
+                let new_secret =
+                    secret_navigation_row(ui, "new-secret", false, NEW_SECRET_ROW_HEIGHT, |ui| {
+                        ui.label(
+                            RichText::new("+ New secret")
+                                .size(NEW_SECRET_TEXT_SIZE)
+                                .color(Color32::WHITE),
+                        );
+                    });
+                if new_secret.clicked() {
                     self.request_navigation(NavigationTarget::Add);
                 }
-                ui.add_space(10.0);
+                ui.add_space(4.0);
 
                 let secrets =
                     with_controller(&self.controller, |controller| Ok(controller.secrets()))
@@ -963,42 +985,41 @@ impl LadonDesktop {
                     } else {
                         Color32::from_rgb(173, 187, 214)
                     };
-                    let row = Frame::new()
-                        .fill(secret_row_fill(selected))
-                        .corner_radius(6)
-                        .inner_margin(Margin::symmetric(6, 4))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [74.0, 22.0],
-                                    egui::Label::new(
-                                        RichText::new(&secret.name).color(Color32::WHITE),
+                    let response = secret_navigation_row(
+                        ui,
+                        ("secret-row", secret.id.to_string()),
+                        selected,
+                        SECRET_ROW_HEIGHT,
+                        |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(74.0, 22.0),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&secret.name)
+                                                .size(SECRET_ROW_TEXT_SIZE)
+                                                .color(Color32::WHITE),
+                                        )
+                                        .truncate(),
                                     )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&secret.name);
-                                if let Some(primary) = summary.primary {
-                                    ui.label(
-                                        RichText::new(primary).size(10.0).color(metadata_color),
-                                    )
+                                    .on_hover_text(&secret.name);
+                                },
+                            );
+                            if let Some(primary) = summary.primary {
+                                ui.label(RichText::new(primary).size(10.0).color(metadata_color))
                                     .on_hover_text(primary);
-                                }
-                                if summary.additional_count > 0 {
-                                    ui.label(
-                                        RichText::new(format!("+{}", summary.additional_count))
-                                            .size(10.0)
-                                            .strong()
-                                            .color(metadata_color),
-                                    )
-                                    .on_hover_text(&summary.additional_hover);
-                                }
-                            });
-                        });
-                    let response = ui.interact(
-                        row.response.rect,
-                        ui.make_persistent_id(("secret-row", secret.id.to_string())),
-                        egui::Sense::click(),
+                            }
+                            if summary.additional_count > 0 {
+                                ui.label(
+                                    RichText::new(format!("+{}", summary.additional_count))
+                                        .size(10.0)
+                                        .strong()
+                                        .color(metadata_color),
+                                )
+                                .on_hover_text(&summary.additional_hover);
+                            }
+                        },
                     );
                     if response.clicked() {
                         self.request_navigation(NavigationTarget::Secret(secret.id));
@@ -1006,6 +1027,148 @@ impl LadonDesktop {
                     ui.add_space(4.0);
                 }
             });
+    }
+
+    #[cfg(unix)]
+    fn clear_agent_grants(&mut self) {
+        self.agent_grants.clear();
+        self.agent_grants_session = None;
+        self.agent_grants_error_shown = false;
+    }
+
+    #[cfg(unix)]
+    fn refresh_agent_grants(&mut self) {
+        if self.desktop_lock != DesktopLockState::Active {
+            self.clear_agent_grants();
+            return;
+        }
+        let result = (|| {
+            let session = self.vault_session_id()?;
+            if self.agent_grants_session != Some(session) {
+                self.clear_agent_grants();
+                self.agent_grants_session = Some(session);
+            }
+            self.broker
+                .as_ref()
+                .ok_or(LadonError::EndpointUnavailable)
+                .and_then(|broker| broker.agent_grants(&self.controller))
+        })();
+        match result {
+            Ok(grants) => {
+                self.agent_grants = grants;
+                self.agent_grants_error_shown = false;
+            }
+            Err(LadonError::VaultLocked) => self.clear_agent_grants(),
+            Err(error) if !self.agent_grants_error_shown => {
+                self.notice_from(Err(error), "");
+                self.agent_grants_error_shown = true;
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[cfg(unix)]
+    fn revoke_agent_grant(&mut self, session: uuid::Uuid, secret: SecretId) {
+        let result = self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(|broker| broker.revoke_grant(session, secret));
+        let revoked = result.is_ok();
+        self.notice_from(result, "Agent access revoked");
+        if revoked {
+            self.refresh_agent_grants();
+        }
+    }
+
+    #[cfg(unix)]
+    fn revoke_all_agent_grants(&mut self) {
+        let result = self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(LocalBrokerHandle::revoke_grants);
+        if result.is_ok() {
+            self.clear_agent_grants();
+        }
+        self.notice_from(result, "Agent access revoked");
+    }
+
+    #[cfg(unix)]
+    fn show_agent_access(&mut self, ui: &mut egui::Ui) {
+        if self.agent_grants.is_empty() {
+            return;
+        }
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(format!("Agent access · {}", self.agent_grants.len()))
+                .size(12.0)
+                .color(Color32::WHITE),
+        );
+        let mut revoke = None;
+        egui::ScrollArea::vertical()
+            .id_salt("agent-access")
+            .max_height(AGENT_ACCESS_MAX_HEIGHT)
+            .show(ui, |ui| {
+                for grant in &self.agent_grants {
+                    let label = sanitize_untrusted(grant.client_label());
+                    let name = sanitize_untrusted(grant.secret_name());
+                    let id = grant.client_session_id();
+                    ui.push_id((id, grant.secret_id().to_string()), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&label).size(11.0).color(Color32::WHITE),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(format!("{label} (reported)\nSession: {id}"));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("(reported)")
+                                    .size(10.0)
+                                    .color(Color32::LIGHT_GRAY),
+                            );
+                            ui.label(
+                                RichText::new(short_session_id(id))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(Color32::LIGHT_GRAY),
+                            )
+                            .on_hover_text(id.to_string());
+                        });
+                        ui.add(
+                            egui::Label::new(RichText::new(&name).size(12.0).color(Color32::WHITE))
+                                .truncate(),
+                        )
+                        .on_hover_text(&name);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format_grant_remaining(grant.remaining()))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(Color32::LIGHT_GRAY),
+                            );
+                            if grant.running() {
+                                ui.label(
+                                    RichText::new("Running")
+                                        .size(10.0)
+                                        .color(Color32::LIGHT_GRAY),
+                                );
+                            }
+                            if ui.small_button("Revoke").clicked() {
+                                revoke = Some((id, grant.secret_id()));
+                            }
+                        });
+                        ui.add_space(6.0);
+                    });
+                }
+            });
+        if let Some((session, secret)) = revoke {
+            self.revoke_agent_grant(session, secret);
+        }
+        if ui.small_button("Revoke all").clicked() {
+            self.revoke_all_agent_grants();
+        }
     }
 
     fn selected_metadata(&self) -> Option<SecretMetadata> {
@@ -1765,6 +1928,8 @@ impl LadonDesktop {
     }
 
     fn clear_for_app_lock(&mut self) {
+        #[cfg(unix)]
+        self.clear_agent_grants();
         self.clear_clipboard();
         self.clear_unlock_fields();
         self.session_pin.clear();
@@ -2258,6 +2423,8 @@ impl eframe::App for LadonDesktop {
         let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
             .unwrap_or(VaultUiPhase::Locked);
         self.synchronize_phase(phase);
+        #[cfg(unix)]
+        self.refresh_agent_grants();
         self.synchronize_window_size(
             context,
             phase == VaultUiPhase::Unlocked
@@ -2318,6 +2485,47 @@ impl eframe::App for LadonDesktop {
         });
         self.clear_sensitive_state();
     }
+}
+
+fn status_dot_geometry(rect: egui::Rect) -> (egui::Pos2, f32) {
+    (
+        rect.center(),
+        3.0_f32.min(rect.width() / 2.0).min(rect.height() / 2.0),
+    )
+}
+
+#[cfg(any(unix, test))]
+fn short_session_id(id: uuid::Uuid) -> String {
+    id.to_string()[..8].to_owned()
+}
+
+#[cfg(any(unix, test))]
+fn format_grant_remaining(remaining: Duration) -> String {
+    let seconds = remaining.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn secret_navigation_row(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    selected: bool,
+    height: f32,
+    contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    ui.painter()
+        .rect_filled(rect, 6.0, secret_row_fill(selected));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(id)
+            .max_rect(rect.shrink2(egui::vec2(SECRET_ROW_LEADING_INSET, 0.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+        contents,
+    );
+    response
 }
 
 fn with_controller<T>(
@@ -2538,6 +2746,271 @@ fn default_vault_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn agent_access_formatting_is_stable_and_compact() {
+        let id = Uuid::parse_str("a31f92c4-1111-2222-3333-444444444444").unwrap();
+        assert_eq!(short_session_id(id), "a31f92c4");
+        assert_eq!(format_grant_remaining(Duration::from_secs(1421)), "23:41");
+        assert_eq!(format_grant_remaining(Duration::ZERO), "00:00");
+        assert_eq!(format_grant_remaining(Duration::from_secs(5)), "00:05");
+        assert_eq!(SECRET_ROW_TEXT_SIZE, NEW_SECRET_TEXT_SIZE);
+        assert_eq!(SECRET_ROW_HEIGHT, NEW_SECRET_ROW_HEIGHT);
+    }
+
+    #[test]
+    fn status_marker_is_a_centered_circle() {
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(10.0, 20.0));
+        let (center, radius) = status_dot_geometry(rect);
+        assert_eq!(center, egui::pos2(25.0, 40.0));
+        assert!(radius > 0.0 && radius <= 5.0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secret_rail_names_share_the_new_secret_leading_edge() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        let mut draft = AddSecretDraft::new();
+        draft.set_name("A");
+        draft.fields_mut()[0].value_mut().push_str("unused");
+        app.controller
+            .lock()
+            .unwrap()
+            .add_secret(&mut draft)
+            .unwrap();
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            app.show_secret_rail(context)
+        });
+        assert_eq!(
+            text_position(&output.shapes, "A").x,
+            text_position(&output.shapes, "+ New secret").x
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Circle(circle) if circle.fill == COBALT)));
+    }
+
+    #[cfg(unix)]
+    fn grant_desktop_access(app: &LadonDesktop, endpoint: &std::path::Path, id: Uuid, label: &str) {
+        use ladon_core::{BindingTarget, RpcMethod, RpcRequest, RpcResult, SecretBindingRequest};
+        let request = RpcRequest {
+            version: 2,
+            request_id: Uuid::new_v4(),
+            client_session_id: id,
+            client_label: label.to_owned(),
+            method: RpcMethod::Run {
+                executable: "/bin/echo".to_owned(),
+                arguments: vec![],
+                working_directory: "/tmp".to_owned(),
+                bindings: app
+                    .controller
+                    .lock()
+                    .unwrap()
+                    .secrets()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, secret)| SecretBindingRequest {
+                        secret_ref: secret.name,
+                        field: "value".to_owned(),
+                        target: BindingTarget::Environment {
+                            name: format!("TOKEN_{index}"),
+                        },
+                    })
+                    .collect(),
+                timeout_ms: 5_000,
+                output_limit_bytes: 1024,
+            },
+        };
+        let client = crate::LocalClient::new(endpoint);
+        let running = std::thread::spawn(move || client.call(&request));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pending) = app.broker.as_ref().unwrap().pending_approval().unwrap() {
+                app.broker.as_ref().unwrap().approve(pending.id()).unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            running.join().unwrap().unwrap().result(),
+            Some(RpcResult::Run { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_access_cache_preserves_rows_on_errors_and_revokes_only_the_requested_pair() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        grant_desktop_access(&app, &endpoint, second, "same label");
+        grant_desktop_access(&app, &endpoint, first, "same label");
+        app.refresh_agent_grants();
+        assert_eq!(app.agent_grants.len(), 2);
+        assert_eq!(app.agent_grants[0].client_session_id(), first);
+        let secret = app.agent_grants[0].secret_id();
+        let broker = app.broker.take();
+        app.refresh_agent_grants();
+        assert_eq!(app.agent_grants.len(), 2);
+        assert!(app.notice.as_ref().unwrap().danger);
+        app.notice = None;
+        app.refresh_agent_grants();
+        assert!(
+            app.notice.is_none(),
+            "repeat refresh errors must be suppressed"
+        );
+        app.revoke_agent_grant(first, secret);
+        assert_eq!(app.agent_grants.len(), 2);
+        assert!(app.notice.as_ref().unwrap().danger);
+        app.revoke_all_agent_grants();
+        assert_eq!(app.agent_grants.len(), 2);
+        assert!(app.notice.as_ref().unwrap().danger);
+        app.broker = broker;
+        app.refresh_agent_grants();
+        assert!(!app.agent_grants_error_shown);
+        app.revoke_agent_grant(first, secret);
+        assert_eq!(app.agent_grants.len(), 1);
+        assert_eq!(app.agent_grants[0].client_session_id(), second);
+        app.revoke_all_agent_grants();
+        assert!(app.agent_grants.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_access_view_preserves_broker_label_uuid_and_secret_name_order() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let mut draft = AddSecretDraft::new();
+        draft.set_name("A");
+        draft.fields_mut()[0].value_mut().push_str("unused");
+        app.controller
+            .lock()
+            .unwrap()
+            .add_secret(&mut draft)
+            .unwrap();
+        // Equal short IDs must still be ordered by the full UUID.
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let third = Uuid::from_u128(3);
+        grant_desktop_access(&app, &endpoint, second, "repeated");
+        grant_desktop_access(&app, &endpoint, first, "repeated");
+        grant_desktop_access(&app, &endpoint, third, "Alpha");
+        app.refresh_agent_grants();
+        let observed: Vec<_> = app
+            .agent_grants
+            .iter()
+            .map(|grant| {
+                (
+                    grant.client_label(),
+                    grant.client_session_id(),
+                    grant.secret_name(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("Alpha", third, "A"),
+                ("Alpha", third, "external-lock-target"),
+                ("repeated", first, "A"),
+                ("repeated", first, "external-lock-target"),
+                ("repeated", second, "A"),
+                ("repeated", second, "external-lock-target"),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_access_cache_clears_on_lock_and_vault_session_changes() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        grant_desktop_access(&app, &endpoint, Uuid::from_u128(1), "client");
+        app.refresh_agent_grants();
+        let saved = app.agent_grants.clone();
+        assert_eq!(saved.len(), 1);
+        app.clear_for_app_lock();
+        assert!(app.agent_grants.is_empty());
+        app.agent_grants = saved.clone();
+        app.clear_sensitive_state();
+        assert!(app.agent_grants.is_empty());
+        app.refresh_agent_grants();
+        app.agent_grants = saved;
+        app.controller.lock().unwrap().lock();
+        app.controller
+            .lock()
+            .unwrap()
+            .unlock(&SensitiveText::from("correct horse"))
+            .unwrap();
+        let broker = app.broker.take();
+        app.refresh_agent_grants();
+        assert!(app.agent_grants.is_empty());
+        app.broker = broker;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_access_controller_failure_keeps_the_previous_snapshot_and_surfaces_once() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        grant_desktop_access(&app, &endpoint, Uuid::from_u128(1), "client");
+        app.refresh_agent_grants();
+        let controller = Arc::clone(&app.controller);
+        let _ = std::thread::spawn(move || {
+            let _guard = controller.lock().unwrap();
+            panic!("poison controller for snapshot failure regression");
+        })
+        .join();
+        app.refresh_agent_grants();
+        assert_eq!(app.agent_grants.len(), 1);
+        assert!(app.notice.as_ref().unwrap().danger);
+        app.notice = None;
+        app.refresh_agent_grants();
+        assert!(app.notice.is_none());
+        eframe::App::on_exit(&mut app, None);
+        assert!(app.agent_grants.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_access_panel_sanitizes_reported_labels_and_contains_no_fields_or_values() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let id = Uuid::parse_str("a31f92c4-1111-2222-3333-444444444444").unwrap();
+        grant_desktop_access(&app, &endpoint, id, "client\n\u{202e}evil");
+        app.refresh_agent_grants();
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| app.show_agent_access(ui));
+        });
+        for expected in [
+            "Agent access · 1",
+            "client\\u{a}\\u{202e}evil",
+            "(reported)",
+            "a31f92c4",
+            "external-lock-target",
+            "Revoke",
+            "Revoke all",
+        ] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(&shape.shape, expected)),
+                "missing {expected}"
+            );
+        }
+        for forbidden in [
+            "client\n\u{202e}evil",
+            "value",
+            "fake-external-lock-secret",
+            "Running",
+        ] {
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(&shape.shape, forbidden)),
+                "rendered {forbidden}"
+            );
+        }
+    }
 
     #[test]
     fn selected_action_rows_keep_delete_with_the_primary_actions() {
@@ -2766,6 +3239,9 @@ mod tests {
                 _instance_lock: InstanceLock::acquire(&path).unwrap(),
                 controller,
                 broker: Some(broker),
+                agent_grants: Vec::new(),
+                agent_grants_session: None,
+                agent_grants_error_shown: false,
                 passphrase: SensitiveText::default(),
                 confirmation: SensitiveText::default(),
                 session_pin: SensitiveText::default(),
@@ -3855,6 +4331,12 @@ mod tests {
             controller: Arc::clone(&controller),
             #[cfg(unix)]
             broker: None,
+            #[cfg(unix)]
+            agent_grants: Vec::new(),
+            #[cfg(unix)]
+            agent_grants_session: None,
+            #[cfg(unix)]
+            agent_grants_error_shown: false,
             passphrase: SensitiveText::default(),
             confirmation: SensitiveText::default(),
             session_pin: SensitiveText::from("123456"),
@@ -3925,6 +4407,12 @@ mod tests {
             controller,
             #[cfg(unix)]
             broker: None,
+            #[cfg(unix)]
+            agent_grants: Vec::new(),
+            #[cfg(unix)]
+            agent_grants_session: None,
+            #[cfg(unix)]
+            agent_grants_error_shown: false,
             passphrase: SensitiveText::from("fake-passphrase"),
             confirmation: SensitiveText::from("fake-passphrase"),
             session_pin: SensitiveText::from("123456"),

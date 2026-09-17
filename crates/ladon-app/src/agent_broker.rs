@@ -34,10 +34,6 @@ pub struct LocalBrokerHandle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for desktop active-access UI in Task 7")
-)]
 pub(crate) struct AgentGrantView {
     client_session_id: Uuid,
     client_label: String,
@@ -47,10 +43,6 @@ pub(crate) struct AgentGrantView {
     running: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for desktop active-access UI in Task 7")
-)]
 impl AgentGrantView {
     pub(crate) const fn client_session_id(&self) -> Uuid {
         self.client_session_id
@@ -702,10 +694,6 @@ impl LocalBrokerHandle {
         self.approval.revoke_all()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for desktop active-access UI in Task 7")
-    )]
     pub(crate) fn agent_grants(
         &self,
         controller: &Arc<Mutex<VaultController>>,
@@ -743,10 +731,6 @@ impl LocalBrokerHandle {
         Ok(views)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for desktop active-access UI in Task 7")
-    )]
     pub(crate) fn revoke_grant(
         &self,
         client_session_id: Uuid,

@@ -1,21 +1,27 @@
+#[cfg(any(feature = "gui", test))]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, TryRecvError},
 };
 
+#[cfg(any(feature = "gui", test))]
 use ladon_core::LadonError;
 
+#[cfg(any(feature = "gui", test))]
 const APP_UNLOCK_REASON: &str = "Unlock Ladon on this device";
 
 pub struct TouchIdAuthenticator;
 
+#[cfg(any(feature = "gui", test))]
 pub(crate) struct TouchIdAttempt {
     result: Receiver<Result<(), LadonError>>,
     cancelled: Arc<AtomicBool>,
 }
 
+#[cfg(any(feature = "gui", test))]
 impl TouchIdAttempt {
+    #[cfg(feature = "gui")]
     fn start(reason: String) -> Result<Self, LadonError> {
         if reason.is_empty() {
             return Err(LadonError::InvalidRequest);
@@ -47,6 +53,7 @@ impl TouchIdAttempt {
     }
 }
 
+#[cfg(any(feature = "gui", test))]
 impl Drop for TouchIdAttempt {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
@@ -59,6 +66,7 @@ impl TouchIdAuthenticator {
         platform::is_available()
     }
 
+    #[cfg(feature = "gui")]
     pub(crate) fn authenticate_secret(secret_name: &str) -> Result<TouchIdAttempt, LadonError> {
         let escaped_name = crate::ui::sanitize_untrusted(secret_name);
         TouchIdAttempt::start(format!(
@@ -66,12 +74,14 @@ impl TouchIdAuthenticator {
         ))
     }
 
+    #[cfg(feature = "gui")]
     pub(crate) fn authenticate_agent_session() -> Result<TouchIdAttempt, LadonError> {
         TouchIdAttempt::start(
             "Allow this agent session to use the displayed Ladon secrets for 30 minutes".to_owned(),
         )
     }
 
+    #[cfg(feature = "gui")]
     pub(crate) fn authenticate_app() -> Result<TouchIdAttempt, LadonError> {
         TouchIdAttempt::start(APP_UNLOCK_REASON.to_owned())
     }
@@ -79,6 +89,7 @@ impl TouchIdAuthenticator {
 
 #[cfg(target_os = "macos")]
 mod platform {
+    #[cfg(feature = "gui")]
     use std::{
         sync::{
             Arc,
@@ -88,12 +99,17 @@ mod platform {
         time::{Duration, Instant},
     };
 
+    #[cfg(feature = "gui")]
     use block2::RcBlock;
+    #[cfg(feature = "gui")]
     use ladon_core::LadonError;
+    #[cfg(feature = "gui")]
     use objc2::runtime::Bool;
+    #[cfg(feature = "gui")]
     use objc2_foundation::{NSError, NSString};
     use objc2_local_authentication::{LAContext, LAPolicy};
 
+    #[cfg(feature = "gui")]
     const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub fn is_available() -> bool {
@@ -105,6 +121,7 @@ mod platform {
         }
     }
 
+    #[cfg(feature = "gui")]
     pub fn authenticate(reason: &str, cancelled: &Arc<AtomicBool>) -> Result<(), LadonError> {
         if reason.is_empty() {
             return Err(LadonError::InvalidRequest);
@@ -218,14 +235,17 @@ mod tests {
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
+    #[cfg(feature = "gui")]
     use std::sync::{Arc, atomic::AtomicBool};
 
+    #[cfg(feature = "gui")]
     use ladon_core::LadonError;
 
     pub const fn is_available() -> bool {
         false
     }
 
+    #[cfg(feature = "gui")]
     pub fn authenticate(_reason: &str, _cancelled: &Arc<AtomicBool>) -> Result<(), LadonError> {
         Err(LadonError::TouchIdUnavailable)
     }

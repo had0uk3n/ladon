@@ -104,7 +104,7 @@ fn active_grants_report_untrusted_labels_without_secret_values() {
     let secret = SecretId::new();
     approve_request(
         &coordinator,
-        request_with_label(client, "Codex — deploy", &[(secret, "prod")]),
+        request_with_label(client, "Codex — deploy", &[(secret, "fake-state-secret")]),
     );
 
     clock.advance(Duration::from_secs(15));
@@ -116,6 +116,77 @@ fn active_grants_report_untrusted_labels_without_secret_values() {
     assert_eq!(active[0].client_label(), "Codex — deploy");
     assert_eq!(active[0].remaining(), Duration::from_secs(45));
     assert!(!format!("{active:?}").contains("fake-state-secret"));
+}
+
+#[test]
+fn exact_revoke_cancels_only_matching_pending_requests_including_mixed_requests() {
+    #[derive(Clone, Copy)]
+    enum RevokeTarget {
+        PendingPair,
+        DifferentClient,
+        UnrelatedSecret,
+        AlreadyGrantedPartOfMixedRequest,
+    }
+
+    for (target, should_cancel, should_revoke_grant) in [
+        (RevokeTarget::PendingPair, true, false),
+        (RevokeTarget::DifferentClient, false, false),
+        (RevokeTarget::UnrelatedSecret, false, false),
+        (RevokeTarget::AlreadyGrantedPartOfMixedRequest, true, true),
+    ] {
+        let coordinator = Arc::new(ApprovalCoordinator::new(
+            FakeClock::new(),
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        ));
+        let client = Uuid::new_v4();
+        let other_client = Uuid::new_v4();
+        let already_granted = SecretId::new();
+        let pending_secret = SecretId::new();
+        let unrelated = SecretId::new();
+        let mixed = matches!(target, RevokeTarget::AlreadyGrantedPartOfMixedRequest);
+        if mixed {
+            approve_request(
+                &coordinator,
+                request(client, &[(already_granted, "already-granted")]),
+            );
+        }
+        let requested = if mixed {
+            vec![
+                (already_granted, "already-granted"),
+                (pending_secret, "pending"),
+            ]
+        } else {
+            vec![(pending_secret, "pending")]
+        };
+        let waiting = {
+            let coordinator = Arc::clone(&coordinator);
+            thread::spawn(move || {
+                coordinator.authorize(request(client, &requested), &RunCancellation::new())
+            })
+        };
+        let pending = wait_for_pending(&coordinator);
+        let (revoke_client, revoke_secret) = match target {
+            RevokeTarget::PendingPair => (client, pending_secret),
+            RevokeTarget::DifferentClient => (other_client, pending_secret),
+            RevokeTarget::UnrelatedSecret => (client, unrelated),
+            RevokeTarget::AlreadyGrantedPartOfMixedRequest => (client, already_granted),
+        };
+
+        assert_eq!(
+            coordinator
+                .revoke_pair(revoke_client, revoke_secret)
+                .unwrap(),
+            should_revoke_grant
+        );
+        if should_cancel {
+            assert_eq!(waiting.join().unwrap(), Err(LadonError::ApprovalCancelled));
+        } else {
+            assert_eq!(coordinator.pending().unwrap().unwrap().id(), pending.id());
+            coordinator.deny(pending.id()).unwrap();
+            assert_eq!(waiting.join().unwrap(), Err(LadonError::ApprovalDenied));
+        }
+    }
 }
 
 #[test]

@@ -70,7 +70,9 @@ grant, cancels and waits for a matching active run, and preserves other grants.
 Active-grant snapshots and targeted revocation are GUI-only and never cross
 RPC or MCP; protocol v2 still has only the four methods above. Revocation
 cannot erase bytes already consumed, retained, or transmitted by an authorized
-child.
+child. If the last grant expires before its command finishes, the GUI hides the
+empty list but retains an **Agent command running** indicator and **Revoke all**
+until that command exits or is cancelled.
 
 Saving or deleting a secret in the GUI also invalidates every grant for that
 immutable secret ID. This does not add a protocol method: the local selected-

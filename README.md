@@ -83,10 +83,11 @@ Revealed text and text being edited are readable. Use the explicit **Copy**
 button to copy a text field; binary fields cannot be copied this way. Ladon
 attempts to clear the copy after 30 seconds only if the clipboard still contains
 the copied text, preserving newer, different clipboard content. App lock, vault
-lock, and exit also attempt this conditional cleanup. Clipboard access can fail;
-this is best-effort cleanup, not a guarantee of erasure. Clipboard managers and
-OS history may retain copies outside Ladon's control. Keyboard Copy/Cut in
-sensitive fields is disabled so copies use the managed **Copy** button.
+lock, and exit also start this conditional cleanup without waiting for clipboard
+I/O. Clipboard access can fail; this is best-effort cleanup, not a guarantee of
+erasure. Clipboard managers and OS history may retain copies outside Ladon's
+control. Keyboard Copy/Cut in sensitive fields is disabled so copies use the
+managed **Copy** button.
 
 Edits are prepared and validated before a single atomic vault update, preserving
 the secret ID. Existing binary fields are preserved but cannot be edited inline.
@@ -174,7 +175,9 @@ grants. **Revoke all** clears every grant and cancels the active run. These
 active-grant views and targeted revoke controls are GUI-only; neither is
 exposed over RPC or MCP. A one-shot `ladon run` invocation has a fresh client
 identity, so it asks each time. Revocation cannot erase bytes a child has
-already consumed, retained, or transmitted.
+already consumed, retained, or transmitted. If a grant expires while its
+authorized command is still finishing, the empty grant list stays hidden but
+the GUI keeps an **Agent command running** indicator and **Revoke all** control.
 
 **Lock app** is a soft UI lock. It revokes grants, cancels the active run,
 closes agent admission, and makes `list` and `run` return `vault_locked`; it

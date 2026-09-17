@@ -28,7 +28,9 @@ The desktop app shows every unexpired agent grant with:
 
 The full client-session UUID is available only as hover text. The existing
 `Revoke all` action remains available. Empty and expired access lists disappear
-without leaving an empty panel.
+without leaving an empty panel. If the last grant expires while its authorized
+command is still running, a value-free `Agent command running` indicator and
+`Revoke all` remain until the command finishes.
 
 The selected-secret workspace also changes as follows:
 
@@ -131,7 +133,9 @@ therefore records metadata for its single reserved run:
 The lease is reserved before approval as today. Once the approval plan resolves
 the immutable IDs, the lease receives its client/secret context. It changes to
 `running` only immediately before the supervisor starts the child. Dropping the
-lease clears all metadata after child cleanup.
+lease clears all metadata after child cleanup. Cancellation and that launch
+transition share one gate: cancellation that wins the gate prevents the spawn;
+a launch that wins first is subsequently cancelled and awaited by revocation.
 
 The GUI sets `Running` only when the coordinator phase is running and the row's
 client/secret pair is in that run. A pending approval remains represented by
@@ -195,10 +199,12 @@ openai-test
 
 The vector status circle is aligned to the status text baseline. Agent access
 has a bounded-height vertical scroll region so it cannot consume the secret
-list. Full labels, names, and UUIDs are available as hover text. The section is
-absent when there are no grants. While grants exist, the UI requests a repaint
-at most once per second for countdown updates rather than repainting
-continuously.
+list. Its height is budgeted from the current rail height, and secret navigation
+has its own scroll region. Full labels, names, and UUIDs are available as hover
+text. The grant section is absent when there are no grants; the standalone
+active-command cancellation control above is the only exception. While grants
+exist, the UI requests a repaint at most once per second for countdown updates
+rather than repainting continuously.
 
 Secret navigation rows reserve the same leading inset and use one text style.
 Their text is left-aligned even when the selection background spans the rail.

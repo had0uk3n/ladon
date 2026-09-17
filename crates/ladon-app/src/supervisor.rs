@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -29,8 +29,14 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const TERMINATION_CONFIRMATION: Duration = Duration::from_secs(2);
 
+#[derive(Default)]
+struct RunCancellationState {
+    cancelled: AtomicBool,
+    launch_gate: Mutex<()>,
+}
+
 #[derive(Clone, Default)]
-pub struct RunCancellation(Arc<AtomicBool>);
+pub struct RunCancellation(Arc<RunCancellationState>);
 
 impl RunCancellation {
     #[must_use]
@@ -39,11 +45,31 @@ impl RunCancellation {
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        let _launch = self
+            .0
+            .launch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.0.cancelled.store(true, Ordering::Release);
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn launch<T>(
+        &self,
+        launch: impl FnOnce() -> Result<T, LadonError>,
+    ) -> Result<T, LadonError> {
+        let _launch = self
+            .0
+            .launch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_cancelled() {
+            return Err(LadonError::ApprovalCancelled);
+        }
+        launch()
     }
 }
 
@@ -100,11 +126,28 @@ impl Supervisor {
     where
         F: FnOnce(&[ValidatedSecretBinding]) -> Result<Vec<ResolvedSecretBinding>, LadonError>,
     {
+        let launch_cancellation = cancellation.clone();
+        self.run_guarded(request, cancellation, resolve, move |command| {
+            launch_cancellation.launch(|| command.spawn().map_err(|_| LadonError::ProcessFailure))
+        })
+    }
+
+    pub(crate) fn run_guarded<F, L>(
+        &self,
+        request: ValidatedRunRequest,
+        cancellation: RunCancellation,
+        resolve: F,
+        launch: L,
+    ) -> Result<RunResult, LadonError>
+    where
+        F: FnOnce(&[ValidatedSecretBinding]) -> Result<Vec<ResolvedSecretBinding>, LadonError>,
+        L: FnOnce(&mut Command) -> Result<Child, LadonError>,
+    {
         let _guard = RunningGuard::acquire(&self.running)?;
         validate_filesystem(&request)?;
         let resolved = resolve(request.bindings())?;
         let run = request.resolve(resolved)?;
-        execute(run, cancellation)
+        execute(run, cancellation, launch)
     }
 }
 
@@ -145,7 +188,14 @@ fn validate_filesystem(run: &ValidatedRunRequest) -> Result<(), LadonError> {
     Ok(())
 }
 
-fn execute(run: PreparedRun, cancellation: RunCancellation) -> Result<RunResult, LadonError> {
+fn execute<L>(
+    run: PreparedRun,
+    cancellation: RunCancellation,
+    launch: L,
+) -> Result<RunResult, LadonError>
+where
+    L: FnOnce(&mut Command) -> Result<Child, LadonError>,
+{
     let started = Instant::now();
     let mut temporary_directory: Option<TempDir> = None;
     let stdout_redactor = make_redactor(run.bindings(), run.output_limit_bytes())?;
@@ -189,7 +239,7 @@ fn execute(run: PreparedRun, cancellation: RunCancellation) -> Result<RunResult,
     }
 
     configure_process_group(&mut command);
-    let mut child = command.spawn().map_err(|_| LadonError::ProcessFailure)?;
+    let mut child = launch(&mut command)?;
     drop(command);
     let process_tree = match PlatformProcessTree::attach(&mut child) {
         Ok(process_tree) => process_tree,

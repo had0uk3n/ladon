@@ -47,6 +47,10 @@ const NEW_SECRET_TEXT_SIZE: f32 = SECRET_ROW_TEXT_SIZE;
 const NEW_SECRET_ROW_HEIGHT: f32 = SECRET_ROW_HEIGHT;
 #[cfg(unix)]
 const AGENT_ACCESS_MAX_HEIGHT: f32 = 160.0;
+#[cfg(unix)]
+const AGENT_ACCESS_CHROME_HEIGHT: f32 = 58.0;
+#[cfg(unix)]
+const SECRET_NAVIGATION_MIN_HEIGHT: f32 = 126.0;
 const WORKSPACE_CARD_WIDTH: f32 = 380.0;
 const AUTH_FORM_WIDTH: f32 = 340.0;
 const SENSITIVE_FIELD_HEIGHT: f32 = 34.0;
@@ -92,6 +96,8 @@ struct LadonDesktop {
     broker: Option<LocalBrokerHandle>,
     #[cfg(unix)]
     agent_grants: Vec<AgentGrantView>,
+    #[cfg(unix)]
+    agent_command_active: bool,
     #[cfg(unix)]
     agent_grants_session: Option<uuid::Uuid>,
     #[cfg(unix)]
@@ -307,6 +313,8 @@ impl LadonDesktop {
             broker,
             #[cfg(unix)]
             agent_grants: Vec::new(),
+            #[cfg(unix)]
+            agent_command_active: false,
             #[cfg(unix)]
             agent_grants_session: None,
             #[cfg(unix)]
@@ -947,91 +955,96 @@ impl LadonDesktop {
                         .color(Color32::from_rgb(173, 187, 214)),
                 );
                 #[cfg(unix)]
-                self.show_agent_access(ui);
+                self.show_agent_access(ui, agent_access_list_height(ui.available_height()));
                 ui.add_space(18.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("secret-navigation")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.show_secret_navigation(ui));
+            });
+    }
+
+    fn show_secret_navigation(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("Secrets")
+                .size(12.0)
+                .color(Color32::from_rgb(158, 176, 211)),
+        );
+        ui.add_space(8.0);
+
+        let new_secret =
+            secret_navigation_row(ui, "new-secret", false, NEW_SECRET_ROW_HEIGHT, |ui| {
                 ui.label(
-                    RichText::new("Secrets")
-                        .size(12.0)
-                        .color(Color32::from_rgb(158, 176, 211)),
+                    RichText::new("+ New secret")
+                        .size(NEW_SECRET_TEXT_SIZE)
+                        .color(Color32::WHITE),
                 );
-                ui.add_space(8.0);
+            });
+        if new_secret.clicked() {
+            self.request_navigation(NavigationTarget::Add);
+        }
+        ui.add_space(4.0);
 
-                let new_secret =
-                    secret_navigation_row(ui, "new-secret", false, NEW_SECRET_ROW_HEIGHT, |ui| {
-                        ui.label(
-                            RichText::new("+ New secret")
-                                .size(NEW_SECRET_TEXT_SIZE)
-                                .color(Color32::WHITE),
-                        );
-                    });
-                if new_secret.clicked() {
-                    self.request_navigation(NavigationTarget::Add);
-                }
-                ui.add_space(4.0);
-
-                let secrets =
-                    with_controller(&self.controller, |controller| Ok(controller.secrets()))
-                        .unwrap_or_default();
-                if secrets.is_empty() {
-                    ui.label(
-                        RichText::new("No secrets yet").color(Color32::from_rgb(173, 187, 214)),
-                    );
-                }
-                for secret in &secrets {
-                    let selected = self.detail.selected() == Some(secret.id);
-                    let summary = summarize_field_names(&secret.field_names);
-                    let metadata_color = if selected {
-                        Color32::from_rgb(226, 234, 255)
-                    } else {
-                        Color32::from_rgb(173, 187, 214)
-                    };
-                    let response = secret_navigation_row(
-                        ui,
-                        ("secret-row", secret.id.to_string()),
-                        selected,
-                        SECRET_ROW_HEIGHT,
+        let secrets = with_controller(&self.controller, |controller| Ok(controller.secrets()))
+            .unwrap_or_default();
+        if secrets.is_empty() {
+            ui.label(RichText::new("No secrets yet").color(Color32::from_rgb(173, 187, 214)));
+        }
+        for secret in &secrets {
+            let selected = self.detail.selected() == Some(secret.id);
+            let summary = summarize_field_names(&secret.field_names);
+            let metadata_color = if selected {
+                Color32::from_rgb(226, 234, 255)
+            } else {
+                Color32::from_rgb(173, 187, 214)
+            };
+            let response = secret_navigation_row(
+                ui,
+                ("secret-row", secret.id.to_string()),
+                selected,
+                SECRET_ROW_HEIGHT,
+                |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(74.0, 22.0),
+                        Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(74.0, 22.0),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&secret.name)
-                                                .size(SECRET_ROW_TEXT_SIZE)
-                                                .color(Color32::WHITE),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(&secret.name);
-                                },
-                            );
-                            if let Some(primary) = summary.primary {
-                                ui.label(RichText::new(primary).size(10.0).color(metadata_color))
-                                    .on_hover_text(primary);
-                            }
-                            if summary.additional_count > 0 {
-                                ui.label(
-                                    RichText::new(format!("+{}", summary.additional_count))
-                                        .size(10.0)
-                                        .strong()
-                                        .color(metadata_color),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&secret.name)
+                                        .size(SECRET_ROW_TEXT_SIZE)
+                                        .color(Color32::WHITE),
                                 )
-                                .on_hover_text(&summary.additional_hover);
-                            }
+                                .truncate(),
+                            )
+                            .on_hover_text(&secret.name);
                         },
                     );
-                    if response.clicked() {
-                        self.request_navigation(NavigationTarget::Secret(secret.id));
+                    if let Some(primary) = summary.primary {
+                        ui.label(RichText::new(primary).size(10.0).color(metadata_color))
+                            .on_hover_text(primary);
                     }
-                    ui.add_space(4.0);
-                }
-            });
+                    if summary.additional_count > 0 {
+                        ui.label(
+                            RichText::new(format!("+{}", summary.additional_count))
+                                .size(10.0)
+                                .strong()
+                                .color(metadata_color),
+                        )
+                        .on_hover_text(&summary.additional_hover);
+                    }
+                },
+            );
+            if response.clicked() {
+                self.request_navigation(NavigationTarget::Secret(secret.id));
+            }
+            ui.add_space(4.0);
+        }
     }
 
     #[cfg(unix)]
     fn clear_agent_grants(&mut self) {
         self.agent_grants.clear();
+        self.agent_command_active = false;
         self.agent_grants_session = None;
         self.agent_grants_error_shown = false;
     }
@@ -1051,11 +1064,17 @@ impl LadonDesktop {
             self.broker
                 .as_ref()
                 .ok_or(LadonError::EndpointUnavailable)
-                .and_then(|broker| broker.agent_grants(&self.controller))
+                .and_then(|broker| {
+                    Ok((
+                        broker.agent_grants(&self.controller)?,
+                        broker.agent_run_active()?,
+                    ))
+                })
         })();
         match result {
-            Ok(grants) => {
+            Ok((grants, command_active)) => {
                 self.agent_grants = grants;
+                self.agent_command_active = command_active;
                 self.agent_grants_error_shown = false;
             }
             Err(LadonError::VaultLocked) => self.clear_agent_grants(),
@@ -1095,74 +1114,86 @@ impl LadonDesktop {
     }
 
     #[cfg(unix)]
-    fn show_agent_access(&mut self, ui: &mut egui::Ui) {
-        if self.agent_grants.is_empty() {
+    fn show_agent_access(&mut self, ui: &mut egui::Ui, list_height: f32) {
+        if self.agent_grants.is_empty() && !self.agent_command_active {
             return;
         }
         ui.add_space(10.0);
-        ui.label(
-            RichText::new(format!("Agent access · {}", self.agent_grants.len()))
-                .size(12.0)
-                .color(Color32::WHITE),
-        );
+        if self.agent_grants.is_empty() {
+            ui.label(
+                RichText::new("Agent command running")
+                    .size(12.0)
+                    .color(Color32::WHITE),
+            );
+        } else {
+            ui.label(
+                RichText::new(format!("Agent access · {}", self.agent_grants.len()))
+                    .size(12.0)
+                    .color(Color32::WHITE),
+            );
+        }
         let mut revoke = None;
-        egui::ScrollArea::vertical()
-            .id_salt("agent-access")
-            .max_height(AGENT_ACCESS_MAX_HEIGHT)
-            .show(ui, |ui| {
-                for grant in &self.agent_grants {
-                    let label = sanitize_untrusted(grant.client_label());
-                    let name = sanitize_untrusted(grant.secret_name());
-                    let id = grant.client_session_id();
-                    ui.push_id((id, grant.secret_id().to_string()), |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&label).size(11.0).color(Color32::WHITE),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(format!("{label} (reported)\nSession: {id}"));
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("(reported)")
-                                    .size(10.0)
-                                    .color(Color32::LIGHT_GRAY),
-                            );
-                            ui.label(
-                                RichText::new(short_session_id(id))
-                                    .monospace()
-                                    .size(10.0)
-                                    .color(Color32::LIGHT_GRAY),
-                            )
-                            .on_hover_text(id.to_string());
-                        });
-                        ui.add(
-                            egui::Label::new(RichText::new(&name).size(12.0).color(Color32::WHITE))
+        if !self.agent_grants.is_empty() {
+            egui::ScrollArea::vertical()
+                .id_salt("agent-access")
+                .max_height(list_height)
+                .show(ui, |ui| {
+                    for grant in &self.agent_grants {
+                        let label = sanitize_untrusted(grant.client_label());
+                        let name = sanitize_untrusted(grant.secret_name());
+                        let id = grant.client_session_id();
+                        ui.push_id((id, grant.secret_id().to_string()), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&label).size(11.0).color(Color32::WHITE),
+                                )
                                 .truncate(),
-                        )
-                        .on_hover_text(&name);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format_grant_remaining(grant.remaining()))
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(Color32::LIGHT_GRAY),
-                            );
-                            if grant.running() {
+                            )
+                            .on_hover_text(format!("{label} (reported)\nSession: {id}"));
+                            ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new("Running")
+                                    RichText::new("(reported)")
                                         .size(10.0)
                                         .color(Color32::LIGHT_GRAY),
                                 );
-                            }
-                            if ui.small_button("Revoke").clicked() {
-                                revoke = Some((id, grant.secret_id()));
-                            }
+                                ui.label(
+                                    RichText::new(short_session_id(id))
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .on_hover_text(id.to_string());
+                            });
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&name).size(12.0).color(Color32::WHITE),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&name);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format_grant_remaining(grant.remaining()))
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(Color32::LIGHT_GRAY),
+                                );
+                                if grant.running() {
+                                    ui.label(
+                                        RichText::new("Running")
+                                            .size(10.0)
+                                            .color(Color32::LIGHT_GRAY),
+                                    );
+                                }
+                                if ui.small_button("Revoke").clicked() {
+                                    revoke = Some((id, grant.secret_id()));
+                                }
+                            });
+                            ui.add_space(6.0);
                         });
-                        ui.add_space(6.0);
-                    });
-                }
-            });
+                    }
+                });
+        }
         if let Some((session, secret)) = revoke {
             self.revoke_agent_grant(session, secret);
         }
@@ -1966,7 +1997,11 @@ impl LadonDesktop {
     }
 
     fn poll_clipboard(&mut self) {
-        if self.clipboard.poll_clear(self.ui_clock_millis()).is_err() {
+        if self
+            .clipboard
+            .poll_clear_in_background(self.ui_clock_millis())
+            .is_err()
+        {
             if !self.clipboard_clear_notice_shown {
                 set_clipboard_notice(
                     &mut self.notice,
@@ -1980,9 +2015,9 @@ impl LadonDesktop {
     }
 
     fn clear_clipboard(&mut self) {
-        // Drop the lease even if the OS clipboard cannot be read or cleared at lock/exit.
-        let mut clipboard = std::mem::take(&mut self.clipboard);
-        let _ = clipboard.clear_if_owned();
+        // The GUI drops its sensitive lease immediately. A fresh clipboard connection performs
+        // the ownership check off-thread so an unavailable platform clipboard cannot delay lock.
+        self.clipboard.clear_in_background();
         self.clipboard_clear_notice_shown = false;
     }
 
@@ -2397,7 +2432,6 @@ fn unlock_instance_file(file: &File) {
 
 impl eframe::App for LadonDesktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_clipboard();
         #[cfg(unix)]
         self.process_external_lock();
 
@@ -2418,6 +2452,7 @@ impl eframe::App for LadonDesktop {
         })
         .unwrap_or(false);
         self.finish_auto_lock(auto_locked);
+        self.poll_clipboard();
         context.request_repaint_after(Duration::from_secs(1));
 
         #[cfg(unix)]
@@ -2504,6 +2539,12 @@ fn status_dot_geometry(rect: egui::Rect) -> (egui::Pos2, f32) {
         rect.center(),
         3.0_f32.min(rect.width() / 2.0).min(rect.height() / 2.0),
     )
+}
+
+#[cfg(unix)]
+fn agent_access_list_height(available_height: f32) -> f32 {
+    (available_height - SECRET_NAVIGATION_MIN_HEIGHT - AGENT_ACCESS_CHROME_HEIGHT)
+        .clamp(0.0, AGENT_ACCESS_MAX_HEIGHT)
 }
 
 #[cfg(any(unix, test))]
@@ -2801,6 +2842,45 @@ mod tests {
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Circle(circle) if circle.fill == COBALT)));
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn secret_navigation_remains_visible_with_two_grants_at_supported_window_heights() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        let secret = app.controller.lock().unwrap().secrets().remove(0);
+        app.agent_grants = [Uuid::from_u128(1), Uuid::from_u128(2)]
+            .into_iter()
+            .map(|client_session_id| {
+                AgentGrantView::for_test(
+                    client_session_id,
+                    "Codex — compact rail",
+                    secret.id,
+                    secret.name.clone(),
+                    Duration::from_secs(29 * 60),
+                    false,
+                )
+            })
+            .collect();
+
+        for height in [MANAGER_WINDOW_SIZE[1], WINDOW_MIN_SIZE[1]] {
+            let context = egui::Context::default();
+            configure_style(&context);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(MANAGER_WINDOW_SIZE[0], height),
+                )),
+                ..Default::default()
+            };
+            let output = context.run(input, |context| app.show_secret_rail(context));
+            for expected in ["+ New secret", secret.name.as_str()] {
+                assert!(
+                    clipped_text_is_visible(&output.shapes, expected),
+                    "{expected} must remain reachable in a {height}-point rail"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn grant_desktop_access(app: &LadonDesktop, endpoint: &std::path::Path, id: Uuid, label: &str) {
         use ladon_core::{BindingTarget, RpcMethod, RpcRequest, RpcResult, SecretBindingRequest};
@@ -3033,7 +3113,9 @@ mod tests {
         app.refresh_agent_grants();
         let context = egui::Context::default();
         let output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| app.show_agent_access(ui));
+            egui::CentralPanel::default().show(context, |ui| {
+                app.show_agent_access(ui, AGENT_ACCESS_MAX_HEIGHT)
+            });
         });
         for expected in [
             "Agent access · 1",
@@ -3066,6 +3148,37 @@ mod tests {
                 "rendered {forbidden}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn expired_grants_keep_revoke_all_available_while_the_command_is_active() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.agent_grants.clear();
+        app.agent_command_active = true;
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                app.show_agent_access(ui, AGENT_ACCESS_MAX_HEIGHT)
+            });
+        });
+
+        for expected in ["Agent command running", "Revoke all"] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(&shape.shape, expected)),
+                "missing {expected}"
+            );
+        }
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, "Agent access · 0")),
+            "an empty grant list must remain absent"
+        );
     }
 
     #[test]
@@ -3127,6 +3240,24 @@ mod tests {
                 .any(|shape| shape_contains_text(shape, expected)),
             _ => false,
         }
+    }
+
+    fn clipped_text_is_visible(shapes: &[egui::epaint::ClippedShape], expected: &str) -> bool {
+        fn visible(shape: &egui::epaint::Shape, clip: egui::Rect, expected: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    text.galley.job.text == expected && clip.intersects(text.visual_bounding_rect())
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().any(|shape| visible(shape, clip, expected))
+                }
+                _ => false,
+            }
+        }
+
+        shapes
+            .iter()
+            .any(|shape| visible(&shape.shape, shape.clip_rect, expected))
     }
 
     fn text_position(shapes: &[egui::epaint::ClippedShape], expected: &str) -> egui::Pos2 {
@@ -3296,6 +3427,7 @@ mod tests {
                 controller,
                 broker: Some(broker),
                 agent_grants: Vec::new(),
+                agent_command_active: false,
                 agent_grants_session: None,
                 agent_grants_error_shown: false,
                 passphrase: SensitiveText::default(),
@@ -4390,6 +4522,8 @@ mod tests {
             #[cfg(unix)]
             agent_grants: Vec::new(),
             #[cfg(unix)]
+            agent_command_active: false,
+            #[cfg(unix)]
             agent_grants_session: None,
             #[cfg(unix)]
             agent_grants_error_shown: false,
@@ -4465,6 +4599,8 @@ mod tests {
             broker: None,
             #[cfg(unix)]
             agent_grants: Vec::new(),
+            #[cfg(unix)]
+            agent_command_active: false,
             #[cfg(unix)]
             agent_grants_session: None,
             #[cfg(unix)]

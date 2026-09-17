@@ -1,14 +1,18 @@
 use std::{
-    collections::{HashMap, HashSet},
     path::Path,
+    process::{Child, Command},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, TryRecvError},
     },
     thread,
     time::Duration,
 };
+
+#[cfg(any(feature = "gui", test))]
+use std::collections::{HashMap, HashSet};
+#[cfg(any(feature = "gui", test))]
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use ladon_core::{
     LadonError, RpcMethod, RpcRequest, RpcResponse, RpcResult, RunCaller, RunRequest,
@@ -33,6 +37,7 @@ pub struct LocalBrokerHandle {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(any(feature = "gui", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AgentGrantView {
     client_session_id: Uuid,
@@ -43,7 +48,27 @@ pub(crate) struct AgentGrantView {
     running: bool,
 }
 
+#[cfg(any(feature = "gui", test))]
 impl AgentGrantView {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        client_session_id: Uuid,
+        client_label: impl Into<String>,
+        secret_id: SecretId,
+        secret_name: impl Into<String>,
+        remaining: Duration,
+        running: bool,
+    ) -> Self {
+        Self {
+            client_session_id,
+            client_label: client_label.into(),
+            secret_id,
+            secret_name: secret_name.into(),
+            remaining,
+            running,
+        }
+    }
+
     pub(crate) const fn client_session_id(&self) -> Uuid {
         self.client_session_id
     }
@@ -83,6 +108,7 @@ struct RunCoordinatorState {
 
 struct ActiveRun {
     cancellation: RunCancellation,
+    #[cfg(any(feature = "gui", test))]
     client_session_id: Uuid,
     secret_ids: Option<Vec<SecretId>>,
     running: bool,
@@ -115,11 +141,13 @@ struct UiLocalOperation {
     coordinator: Arc<UiLockCoordinator>,
 }
 
+#[cfg(any(feature = "gui", test))]
 pub(crate) struct AppLockAttempt {
     epoch: u64,
     result: Receiver<Result<(), LadonError>>,
 }
 
+#[cfg(any(feature = "gui", test))]
 impl AppLockAttempt {
     pub(crate) const fn epoch(&self) -> u64 {
         self.epoch
@@ -135,6 +163,7 @@ impl AppLockAttempt {
 }
 
 impl UiLockCoordinator {
+    #[cfg(any(feature = "gui", test))]
     fn new(wake_ui: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             state: Mutex::new(UiLockState {
@@ -205,6 +234,7 @@ impl UiLockCoordinator {
         }
     }
 
+    #[cfg(any(feature = "gui", test))]
     fn pending_request(&self) -> Result<Option<u64>, LadonError> {
         let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
         Ok(
@@ -213,11 +243,13 @@ impl UiLockCoordinator {
         )
     }
 
+    #[cfg(any(feature = "gui", test))]
     fn request_in_progress(&self) -> Result<bool, LadonError> {
         let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
         Ok(state.requested > state.acknowledged)
     }
 
+    #[cfg(any(feature = "gui", test))]
     fn acknowledge(&self, request_id: u64) -> Result<(), LadonError> {
         let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
         if request_id != state.requested
@@ -253,7 +285,7 @@ impl RunCoordinator {
     fn try_start(
         self: &Arc<Self>,
         cancellation: RunCancellation,
-        client_session_id: Uuid,
+        _client_session_id: Uuid,
     ) -> Result<RunLease, LadonError> {
         let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
         if state.block_new || state.active.is_some() {
@@ -261,7 +293,8 @@ impl RunCoordinator {
         }
         state.active = Some(ActiveRun {
             cancellation,
-            client_session_id,
+            #[cfg(any(feature = "gui", test))]
+            client_session_id: _client_session_id,
             secret_ids: None,
             running: false,
         });
@@ -312,6 +345,7 @@ impl RunCoordinator {
         }))
     }
 
+    #[cfg(any(feature = "gui", test))]
     fn running_pairs(&self) -> Result<HashSet<(Uuid, SecretId)>, LadonError> {
         let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
         Ok(state
@@ -329,6 +363,13 @@ impl RunCoordinator {
             .collect())
     }
 
+    #[cfg(any(feature = "gui", test))]
+    fn has_active_run(&self) -> Result<bool, LadonError> {
+        let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        Ok(state.active.is_some())
+    }
+
+    #[cfg(any(feature = "gui", test))]
     fn block_for_revoke(
         self: &Arc<Self>,
         client_session_id: Uuid,
@@ -382,7 +423,7 @@ impl RunLease {
         Ok(())
     }
 
-    fn mark_running(&self) -> Result<(), LadonError> {
+    fn spawn_child(&self, command: &mut Command) -> Result<Child, LadonError> {
         let mut state = self
             .coordinator
             .state
@@ -392,11 +433,11 @@ impl RunLease {
         if active.secret_ids.is_none() {
             return Err(LadonError::InvalidRequest);
         }
-        if active.cancellation.is_cancelled() {
-            return Err(LadonError::ApprovalCancelled);
-        }
+        let child = active
+            .cancellation
+            .launch(|| command.spawn().map_err(|_| LadonError::ProcessFailure))?;
         active.running = true;
-        Ok(())
+        Ok(child)
     }
 }
 
@@ -483,6 +524,7 @@ impl LocalBrokerHandle {
         Self::start_at(controller, default_endpoint_path())
     }
 
+    #[cfg(feature = "gui")]
     pub(crate) fn start_for_desktop(
         controller: Arc<Mutex<VaultController>>,
         wake_ui: Arc<dyn Fn() + Send + Sync>,
@@ -573,12 +615,14 @@ impl LocalBrokerHandle {
         })
     }
 
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn pending_external_lock(&self) -> Result<Option<u64>, LadonError> {
         self.ui_locks
             .as_ref()
             .map_or(Ok(None), |ui_locks| ui_locks.pending_request())
     }
 
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn acknowledge_external_lock(&self, request_id: u64) -> Result<(), LadonError> {
         self.ui_locks
             .as_ref()
@@ -586,6 +630,7 @@ impl LocalBrokerHandle {
             .acknowledge(request_id)
     }
 
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn external_lock_in_progress(&self) -> Result<bool, LadonError> {
         self.ui_locks
             .as_ref()
@@ -596,6 +641,7 @@ impl LocalBrokerHandle {
         self.coordinator.cancel_active();
     }
 
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn begin_app_lock(&self) -> Result<AppLockAttempt, LadonError> {
         let ui_locks = self.ui_locks.as_ref().ok_or(LadonError::InvalidRequest)?;
         let local_operation = ui_locks
@@ -623,6 +669,7 @@ impl LocalBrokerHandle {
         Ok(AppLockAttempt { epoch, result })
     }
 
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn unlock_app(&self, epoch: u64) -> Result<(), LadonError> {
         self.approval.unlock_app(epoch)
     }
@@ -694,6 +741,7 @@ impl LocalBrokerHandle {
         self.approval.revoke_all()
     }
 
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn agent_grants(
         &self,
         controller: &Arc<Mutex<VaultController>>,
@@ -731,6 +779,12 @@ impl LocalBrokerHandle {
         Ok(views)
     }
 
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn agent_run_active(&self) -> Result<bool, LadonError> {
+        self.coordinator.has_active_run()
+    }
+
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn revoke_grant(
         &self,
         client_session_id: Uuid,
@@ -962,23 +1016,29 @@ impl AgentBroker {
                         &cancellation,
                     )?;
                     let binding_secret_ids = approval_plan.binding_secret_ids;
-                    run_lease.mark_running()?;
-                    let result = self.supervisor.run(validated, cancellation, |bindings| {
-                        self.approval.with_valid_grant(&ticket, || {
-                            self.controller()?
-                                .resolve_bindings_for_ids(bindings, &binding_secret_ids)
-                        })
-                    });
+                    let result = self.supervisor.run_guarded(
+                        validated,
+                        cancellation,
+                        |bindings| {
+                            self.approval.with_valid_grant(&ticket, || {
+                                self.controller()?
+                                    .resolve_bindings_for_ids(bindings, &binding_secret_ids)
+                            })
+                        },
+                        |command| run_lease.spawn_child(command),
+                    );
                     if let Ok(mut controller) = self.controller.lock() {
                         controller.record_secret_activity();
                     }
                     return run_result(result);
                 }
                 run_lease.set_secret_context(Vec::new())?;
-                run_lease.mark_running()?;
-                let result = self.supervisor.run(validated, cancellation, |bindings| {
-                    self.controller()?.resolve_bindings(bindings)
-                });
+                let result = self.supervisor.run_guarded(
+                    validated,
+                    cancellation,
+                    |bindings| self.controller()?.resolve_bindings(bindings),
+                    |command| run_lease.spawn_child(command),
+                );
                 if let Ok(mut controller) = self.controller.lock() {
                     controller.record_secret_activity();
                 }
@@ -1040,6 +1100,13 @@ mod tests {
     use ladon_core::{BindingTarget, SecretBindingRequest};
     use std::time::Instant;
 
+    fn mark_running_for_test(lease: &RunLease) {
+        let mut state = lease.coordinator.state.lock().unwrap();
+        let active = state.active.as_mut().unwrap();
+        assert!(active.secret_ids.is_some());
+        active.running = true;
+    }
+
     #[test]
     fn running_snapshot_marks_only_bound_secret_pairs() {
         let coordinator = Arc::new(RunCoordinator::default());
@@ -1052,7 +1119,7 @@ mod tests {
         assert!(coordinator.running_pairs().unwrap().is_empty());
         lease.set_secret_context(vec![first]).unwrap();
         assert!(coordinator.running_pairs().unwrap().is_empty());
-        lease.mark_running().unwrap();
+        mark_running_for_test(&lease);
 
         let running = coordinator.running_pairs().unwrap();
         assert_eq!(running.len(), 1);
@@ -1112,7 +1179,7 @@ mod tests {
         let cancellation = RunCancellation::new();
         let lease = coordinator.try_start(cancellation.clone(), client).unwrap();
         lease.set_secret_context(vec![bound]).unwrap();
-        lease.mark_running().unwrap();
+        mark_running_for_test(&lease);
 
         let block = coordinator.block_for_revoke(client, requested).unwrap();
         assert!(!cancellation.is_cancelled());
@@ -1129,7 +1196,7 @@ mod tests {
         let cancellation = RunCancellation::new();
         let lease = coordinator.try_start(cancellation.clone(), client).unwrap();
         lease.set_secret_context(vec![secret]).unwrap();
-        lease.mark_running().unwrap();
+        mark_running_for_test(&lease);
         let (blocked_tx, blocked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocking = {
@@ -1170,13 +1237,18 @@ mod tests {
         let lease = coordinator
             .try_start(RunCancellation::new(), client)
             .unwrap();
-        assert_eq!(lease.mark_running(), Err(LadonError::InvalidRequest));
+        let mut command = Command::new("/usr/bin/true");
+        assert!(matches!(
+            lease.spawn_child(&mut command),
+            Err(LadonError::InvalidRequest)
+        ));
         lease.set_secret_context(Vec::new()).unwrap();
         assert_eq!(
             lease.set_secret_context(vec![SecretId::new()]),
             Err(LadonError::InvalidRequest)
         );
-        lease.mark_running().unwrap();
+        let mut child = lease.spawn_child(&mut command).unwrap();
+        child.wait().unwrap();
         assert!(coordinator.running_pairs().unwrap().is_empty());
         let block = coordinator
             .block_for_revoke(client, SecretId::new())
@@ -1343,7 +1415,7 @@ mod tests {
         let cancellation = RunCancellation::new();
         let lease = coordinator.try_start(cancellation.clone(), client).unwrap();
         lease.set_secret_context(vec![first_id]).unwrap();
-        lease.mark_running().unwrap();
+        mark_running_for_test(&lease);
         let grants = handle.agent_grants(&controller).unwrap();
         assert_eq!(grants.len(), 3);
         assert_eq!(grants[0].client_session_id(), other_client);
@@ -1510,6 +1582,80 @@ mod tests {
         assert_eq!(result, Err(LadonError::ApprovalCancelled));
         assert!(approval.active_grants().unwrap().is_empty());
         assert!(coordinator.running_pairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoking_during_resolution_wins_before_the_child_can_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("child-started");
+        let validated = validate_run_request(
+            RunRequest {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), "printf started > child-started".to_owned()],
+                working_directory: directory.path().to_string_lossy().into_owned(),
+                bindings: vec![],
+                timeout_ms: 5_000,
+                output_limit_bytes: 1_024,
+            },
+            RunCaller::Cli,
+        )
+        .unwrap();
+        let coordinator = Arc::new(RunCoordinator::default());
+        let client = Uuid::new_v4();
+        let secret = SecretId::new();
+        let cancellation = RunCancellation::new();
+        let lease = coordinator.try_start(cancellation.clone(), client).unwrap();
+        lease.set_secret_context(vec![secret]).unwrap();
+        let (resolving_tx, resolving_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            Supervisor::new().run_guarded(
+                validated,
+                cancellation,
+                |_| {
+                    resolving_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    Ok(vec![])
+                },
+                |command| lease.spawn_child(command),
+            )
+        });
+
+        resolving_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (revoked_tx, revoked_rx) = mpsc::channel();
+        let revoking = {
+            let coordinator = Arc::clone(&coordinator);
+            thread::spawn(move || {
+                let block = coordinator.block_for_revoke(client, secret).unwrap();
+                revoked_tx.send(()).unwrap();
+                drop(block);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if coordinator
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .as_ref()
+                .is_some_and(|active| active.cancellation.is_cancelled())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "revoke did not cancel preparation"
+            );
+            thread::yield_now();
+        }
+        assert!(revoked_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        resume_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap(), Err(LadonError::ApprovalCancelled));
+        revoked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        revoking.join().unwrap();
+        assert!(!marker.exists(), "cancelled preparation launched a child");
     }
 
     #[test]

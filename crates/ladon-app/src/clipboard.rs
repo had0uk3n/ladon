@@ -1,4 +1,10 @@
-use std::fmt;
+use std::{
+    fmt,
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+};
 
 use ladon_core::SensitiveBytes;
 use zeroize::Zeroizing;
@@ -46,10 +52,20 @@ impl ClipboardBackend for SystemClipboard {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct SecretClipboard<B = SystemClipboard> {
     backend: B,
     lease: Option<ClipboardLease>,
+    pending_clear: Option<Receiver<ConditionalClearResult>>,
+}
+
+impl<B: Default> Default for SecretClipboard<B> {
+    fn default() -> Self {
+        Self {
+            backend: B::default(),
+            lease: None,
+            pending_clear: None,
+        }
+    }
 }
 
 impl<B: ClipboardBackend> SecretClipboard<B> {
@@ -67,6 +83,7 @@ impl<B: ClipboardBackend> SecretClipboard<B> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn poll_clear(&mut self, now_millis: u64) -> Result<(), ClipboardError> {
         let Some(lease) = self.lease.as_ref() else {
             return Ok(());
@@ -78,6 +95,7 @@ impl<B: ClipboardBackend> SecretClipboard<B> {
         self.clear_if_owned()
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_if_owned(&mut self) -> Result<(), ClipboardError> {
         let Some(lease) = self.lease.as_ref() else {
             return Ok(());
@@ -98,12 +116,116 @@ impl<B: ClipboardBackend> SecretClipboard<B> {
         Self {
             backend,
             lease: None,
+            pending_clear: None,
         }
+    }
+}
+
+type ConditionalClearResult = Result<(), (ClipboardError, ClipboardLease)>;
+
+fn clear_lease_if_owned<B: ClipboardBackend>(
+    lease: ClipboardLease,
+    backend: &mut B,
+) -> ConditionalClearResult {
+    let clipboard_text = match backend.get_text() {
+        Ok(text) => Zeroizing::new(text),
+        Err(error) => return Err((error, lease)),
+    };
+    let still_owned = lease.matches(clipboard_text.as_bytes());
+    drop(clipboard_text);
+    if still_owned && let Err(error) = backend.set_text("") {
+        return Err((error, lease));
+    }
+    Ok(())
+}
+
+fn spawn_conditional_clear<B, F>(
+    lease: ClipboardLease,
+    make_backend: F,
+) -> Result<Receiver<ConditionalClearResult>, (ClipboardError, ClipboardLease)>
+where
+    B: ClipboardBackend + 'static,
+    F: FnOnce() -> B + Send + 'static,
+{
+    let (sender, result) = mpsc::sync_channel(1);
+    let lease = Arc::new(Mutex::new(Some(lease)));
+    let worker_lease = Arc::clone(&lease);
+    let spawned = std::thread::Builder::new()
+        .name("ladon-clipboard-clear".to_owned())
+        .spawn(move || {
+            let lease = worker_lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let Some(lease) = lease else {
+                return;
+            };
+            let mut backend = make_backend();
+            let _ = sender.send(clear_lease_if_owned(lease, &mut backend));
+        });
+    if spawned.is_err() {
+        let lease = lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("clipboard worker did not start");
+        return Err((ClipboardError, lease));
+    }
+    Ok(result)
+}
+
+impl SecretClipboard<SystemClipboard> {
+    pub(crate) fn poll_clear_in_background(
+        &mut self,
+        now_millis: u64,
+    ) -> Result<(), ClipboardError> {
+        if let Some(pending) = self.pending_clear.as_ref() {
+            match pending.try_recv() {
+                Ok(Ok(())) => self.pending_clear = None,
+                Ok(Err((error, lease))) => {
+                    self.pending_clear = None;
+                    if self.lease.is_none() {
+                        self.lease = Some(lease);
+                    }
+                    return Err(error);
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    self.pending_clear = None;
+                    return Err(ClipboardError);
+                }
+            }
+        }
+
+        let expired = self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.is_expired(now_millis));
+        if expired {
+            let lease = self.lease.take().ok_or(ClipboardError)?;
+            match spawn_conditional_clear(lease, SystemClipboard::default) {
+                Ok(pending) => self.pending_clear = Some(pending),
+                Err((error, lease)) => {
+                    self.lease = Some(lease);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_in_background(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = spawn_conditional_clear(lease, SystemClipboard::default);
+        }
+        self.pending_clear = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::mpsc, time::Duration};
+
     use zeroize::Zeroizing;
 
     use super::{ClipboardBackend, ClipboardError, SecretClipboard};
@@ -295,5 +417,51 @@ mod tests {
         clipboard.allow_writes_for_test();
         clipboard.clear_if_owned().unwrap();
         assert_eq!(clipboard.test_text(), "");
+    }
+
+    #[test]
+    fn conditional_clear_worker_never_blocks_the_locking_thread() {
+        struct StalledClipboard {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl ClipboardBackend for StalledClipboard {
+            fn set_text(&mut self, _text: &str) -> Result<(), ClipboardError> {
+                Ok(())
+            }
+
+            fn get_text(&mut self) -> Result<String, ClipboardError> {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok("fake-copy-value".to_owned())
+            }
+        }
+
+        let lease = crate::ClipboardLease::new(
+            SensitiveText::from("fake-copy-value").to_sensitive_bytes(),
+            1_000,
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let completion = super::spawn_conditional_clear(lease, move || StalledClipboard {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .unwrap();
+
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            completion.try_recv().is_err(),
+            "stalled OS I/O must continue outside the locking thread"
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            completion
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
     }
 }

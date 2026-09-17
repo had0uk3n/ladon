@@ -111,3 +111,41 @@ fn revoke_secret_removes_only_that_secret_across_clients() {
     assert!(grants.missing(first_client, [untouched]).is_empty());
     assert_eq!(grants.missing(second_client, [changed]), [changed]);
 }
+
+#[test]
+fn active_entries_purge_expired_pairs_and_report_remaining_time() {
+    let clock = FakeClock::new();
+    let mut grants = GrantStore::new(clock.clone(), Duration::from_secs(60));
+    let client = Uuid::new_v4();
+    let first = SecretId::new();
+    let second = SecretId::new();
+    grants.grant(client, [first]);
+    clock.advance(Duration::from_secs(30));
+    grants.grant(client, [second]);
+
+    clock.advance(Duration::from_secs(30));
+    let entries = grants.active();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].client_session_id(), client);
+    assert_eq!(entries[0].secret_id(), second);
+    assert_eq!(entries[0].remaining(), Duration::from_secs(30));
+}
+
+#[test]
+fn revoke_pair_removes_only_the_exact_client_and_secret() {
+    let clock = FakeClock::new();
+    let mut grants = GrantStore::new(clock, Duration::from_secs(60));
+    let first_client = Uuid::new_v4();
+    let second_client = Uuid::new_v4();
+    let first = SecretId::new();
+    let second = SecretId::new();
+    grants.grant(first_client, [first, second]);
+    grants.grant(second_client, [first]);
+
+    assert!(grants.revoke_pair(first_client, first));
+    assert!(!grants.revoke_pair(first_client, first));
+    assert!(grants.missing(first_client, [first]).contains(&first));
+    assert!(grants.missing(first_client, [second]).is_empty());
+    assert!(grants.missing(second_client, [first]).is_empty());
+}

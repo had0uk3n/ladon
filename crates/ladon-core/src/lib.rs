@@ -18,7 +18,7 @@ pub use broker::{
 pub use codec::{MAX_VAULT_PAYLOAD_BYTES, VaultPayload, decode_payload, encode_payload};
 pub use crypto::{MAX_VAULT_FILE_BYTES, UnlockedVault, create_vault, unlock_vault};
 pub use error::LadonError;
-pub use grants::{GrantStore, SystemMonotonicClock};
+pub use grants::{GrantEntry, GrantStore, SystemMonotonicClock};
 pub use model::{
     FieldName, MAX_FIELD_BYTES, MAX_FIELDS_PER_RECORD, SecretField, SecretId, SecretName,
     SecretRecord, SecretRef, TextHint,

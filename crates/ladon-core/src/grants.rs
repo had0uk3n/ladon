@@ -13,6 +13,27 @@ pub struct GrantStore<C> {
     deadlines: HashMap<(Uuid, SecretId), u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GrantEntry {
+    client_session_id: Uuid,
+    secret_id: SecretId,
+    remaining: Duration,
+}
+
+impl GrantEntry {
+    pub const fn client_session_id(&self) -> Uuid {
+        self.client_session_id
+    }
+
+    pub const fn secret_id(&self) -> SecretId {
+        self.secret_id
+    }
+
+    pub const fn remaining(&self) -> Duration {
+        self.remaining
+    }
+}
+
 impl<C: MonotonicClock> GrantStore<C> {
     #[must_use]
     pub fn new(clock: C, lifetime: Duration) -> Self {
@@ -68,6 +89,24 @@ impl<C: MonotonicClock> GrantStore<C> {
     pub fn revoke_secret(&mut self, secret_id: SecretId) {
         self.deadlines
             .retain(|(_, granted_secret_id), _| *granted_secret_id != secret_id);
+    }
+
+    pub fn active(&mut self) -> Vec<GrantEntry> {
+        self.purge_expired();
+        let now = self.clock.now_millis();
+        self.deadlines
+            .iter()
+            .map(|((client_session_id, secret_id), deadline)| GrantEntry {
+                client_session_id: *client_session_id,
+                secret_id: *secret_id,
+                remaining: Duration::from_millis(deadline.saturating_sub(now)),
+            })
+            .collect()
+    }
+
+    pub fn revoke_pair(&mut self, client_session_id: Uuid, secret_id: SecretId) -> bool {
+        self.purge_expired();
+        self.deadlines.remove(&(client_session_id, secret_id)).is_some()
     }
 
     #[must_use]

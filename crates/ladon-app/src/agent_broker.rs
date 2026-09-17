@@ -400,6 +400,9 @@ impl RunLease {
         if active.secret_ids.is_none() {
             return Err(LadonError::InvalidRequest);
         }
+        if active.cancellation.is_cancelled() {
+            return Err(LadonError::ApprovalCancelled);
+        }
         active.running = true;
         Ok(())
     }
@@ -1424,6 +1427,105 @@ mod tests {
         handle.ui_locks.as_ref().unwrap().begin_request().unwrap();
         assert_eq!(handle.revoke_grant(client, secret), Err(LadonError::Busy));
         assert_eq!(approval.active_grants().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revoking_a_pre_context_existing_grant_prevents_child_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let passphrase = SensitiveText::from("correct horse");
+        let mut vault = VaultController::new(directory.path().join("vault.ladon"));
+        vault.create(&passphrase, &passphrase).unwrap();
+        let mut secret = AddSecretDraft::new();
+        secret.set_name("app-lock-token");
+        secret.fields_mut()[0].value_mut().push_str("fake-secret");
+        let secret_id = vault.add_secret(&mut secret).unwrap();
+        let vault_session_id = vault.session_id().unwrap();
+        let controller = Arc::new(Mutex::new(vault));
+        let coordinator = Arc::new(RunCoordinator::default());
+        let approval = Arc::new(ApprovalCoordinator::session_defaults());
+        let handle = Arc::new(desktop_handle(
+            Arc::clone(&coordinator),
+            Arc::clone(&approval),
+        ));
+        let client = Uuid::new_v4();
+        grant_access(
+            &handle,
+            vault_session_id,
+            client,
+            "test client",
+            vec![ApprovalSecret::new(secret_id, "app-lock-token", ["value"])],
+        );
+        let broker = AgentBroker::new(
+            Arc::clone(&controller),
+            Arc::clone(&coordinator),
+            Arc::clone(&approval),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let mut method = secret_run(directory.path());
+        let RpcMethod::Run { arguments, .. } = &mut method else {
+            unreachable!("secret_run builds a run request");
+        };
+        *arguments = vec!["-c".to_owned(), "printf started > child-started".to_owned()];
+        let marker = directory.path().join("child-started");
+        let cancellation = RunCancellation::new();
+        let run_cancellation = cancellation.clone();
+        // Prevent approval_plan from attaching secret context after the reservation is made.
+        let preparation_pause = controller.lock().unwrap();
+        let (run_tx, run_rx) = mpsc::channel();
+        let running = thread::spawn(move || {
+            run_tx
+                .send(broker.handle_method(
+                    client,
+                    "test client".to_owned(),
+                    method,
+                    run_cancellation,
+                ))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(active) = coordinator.state.lock().unwrap().active.as_ref() {
+                assert_eq!(active.client_session_id, client);
+                assert!(active.secret_ids.is_none());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "run was not reserved before preparation"
+            );
+            thread::yield_now();
+        }
+        let revoking_handle = Arc::clone(&handle);
+        let (revoke_tx, revoke_rx) = mpsc::channel();
+        let revoking = thread::spawn(move || {
+            revoke_tx
+                .send(revoking_handle.revoke_grant(client, secret_id))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !cancellation.is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "targeted revoke did not cancel preparation"
+            );
+            thread::yield_now();
+        }
+        assert!(revoke_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        assert_eq!(approval.active_grants().unwrap().len(), 1);
+        drop(preparation_pause);
+
+        let result = run_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        revoke_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        running.join().unwrap();
+        revoking.join().unwrap();
+        assert!(!marker.exists(), "cancelled preparation launched a child");
+        assert_eq!(result, Err(LadonError::ApprovalCancelled));
+        assert!(approval.active_grants().unwrap().is_empty());
+        assert!(coordinator.running_pairs().unwrap().is_empty());
     }
 
     #[test]

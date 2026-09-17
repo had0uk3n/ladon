@@ -71,6 +71,18 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
     assert!(!marker.exists(), "child process started before approval");
     assert_eq!(approval.secrets()[0].name(), "test-token");
     assert_eq!(approval.secrets()[0].fields(), &["value"]);
+    for (method, label) in [
+        (RpcMethod::Status, "status label"),
+        (RpcMethod::List, "list label"),
+    ] {
+        let mut observed = request_for(client_session_id, method);
+        observed.client_label = label.to_owned();
+        assert!(client.call(&observed).unwrap().result().is_some());
+        assert_eq!(
+            server.pending_approval().unwrap().unwrap().client_label(),
+            label
+        );
+    }
     server.approve(approval.id()).unwrap();
     let run = running.join().unwrap().unwrap();
     let Some(RpcResult::Run {

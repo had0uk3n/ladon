@@ -1930,6 +1930,11 @@ impl LadonDesktop {
     fn clear_for_app_lock(&mut self) {
         #[cfg(unix)]
         self.clear_agent_grants();
+        self.clear_sensitive_buffers();
+        self.notice = None;
+    }
+
+    fn clear_sensitive_buffers(&mut self) {
         self.clear_clipboard();
         self.clear_unlock_fields();
         self.session_pin.clear();
@@ -1944,7 +1949,6 @@ impl LadonDesktop {
         self.discard_confirmation = false;
         self.pending_delete = None;
         self.add_form_error = None;
-        self.notice = None;
     }
 
     fn clear_sensitive_state(&mut self) {
@@ -2420,9 +2424,17 @@ impl eframe::App for LadonDesktop {
         self.process_app_lock_result();
         self.process_touch_id_result();
 
-        let phase = with_controller(&self.controller, |controller| Ok(controller.phase()))
-            .unwrap_or(VaultUiPhase::Locked);
-        self.synchronize_phase(phase);
+        let phase = with_controller(&self.controller, |controller| Ok(controller.phase()));
+        match phase {
+            Ok(phase) => self.synchronize_phase(phase),
+            Err(_) => {
+                // Fail closed for rendering/authentication without turning an unreadable
+                // phase into a confirmed lock or discarding the last access snapshot.
+                self.clear_sensitive_buffers();
+                self.session_confirmation = None;
+            }
+        }
+        let phase = phase.unwrap_or(VaultUiPhase::Locked);
         #[cfg(unix)]
         self.refresh_agent_grants();
         self.synchronize_window_size(
@@ -2933,7 +2945,7 @@ mod tests {
         app.clear_sensitive_state();
         assert!(app.agent_grants.is_empty());
         app.refresh_agent_grants();
-        app.agent_grants = saved;
+        app.agent_grants = saved.clone();
         app.controller.lock().unwrap().lock();
         app.controller
             .lock()
@@ -2941,31 +2953,75 @@ mod tests {
             .unlock(&SensitiveText::from("correct horse"))
             .unwrap();
         let broker = app.broker.take();
-        app.refresh_agent_grants();
+        let context = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            eframe::App::update(&mut app, context, &mut frame);
+        });
         assert!(app.agent_grants.is_empty());
         app.broker = broker;
+        app.agent_grants = saved;
+        eframe::App::on_exit(&mut app, None);
+        assert!(app.agent_grants.is_empty());
     }
 
     #[test]
     #[cfg(unix)]
-    fn agent_access_controller_failure_keeps_the_previous_snapshot_and_surfaces_once() {
+    fn agent_access_controller_failure_during_update_preserves_cache_but_wipes_sensitive_state() {
         let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
         grant_desktop_access(&app, &endpoint, Uuid::from_u128(1), "client");
         app.refresh_agent_grants();
+        assert!(app.detail.has_sensitive_buffer());
+        let context = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
         let controller = Arc::clone(&app.controller);
         let _ = std::thread::spawn(move || {
             let _guard = controller.lock().unwrap();
             panic!("poison controller for snapshot failure regression");
         })
         .join();
-        app.refresh_agent_grants();
+        let output = context.run(egui::RawInput::default(), |context| {
+            eframe::App::update(&mut app, context, &mut frame);
+        });
         assert_eq!(app.agent_grants.len(), 1);
+        assert_eq!(
+            app.last_phase,
+            VaultUiPhase::Unlocked,
+            "read failure is not a confirmed phase transition"
+        );
+        assert!(!app.detail.has_sensitive_buffer());
+        assert!(app.session_confirmation.is_none());
+        assert!(!app.manager_window_active);
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, "fake-external-lock-secret"))
+        );
         assert!(app.notice.as_ref().unwrap().danger);
         app.notice = None;
-        app.refresh_agent_grants();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            eframe::App::update(&mut app, context, &mut frame);
+        });
+        assert_eq!(app.agent_grants.len(), 1);
         assert!(app.notice.is_none());
-        eframe::App::on_exit(&mut app, None);
+
+        // A successful frame resets error suppression without restoring authorization.
+        app.controller.clear_poison();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            eframe::App::update(&mut app, context, &mut frame);
+        });
+        assert_eq!(app.agent_grants.len(), 1);
+        assert!(!app.agent_grants_error_shown);
+        assert!(app.session_confirmation.is_none());
+
+        // A confirmed lock must still clear the previously retained snapshot.
+        app.controller.lock().unwrap().lock();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            eframe::App::update(&mut app, context, &mut frame);
+        });
         assert!(app.agent_grants.is_empty());
+        assert_eq!(app.last_phase, VaultUiPhase::Locked);
     }
 
     #[test]

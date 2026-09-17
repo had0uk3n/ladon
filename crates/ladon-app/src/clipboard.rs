@@ -113,6 +113,8 @@ mod tests {
     struct FakeClipboard {
         text: Zeroizing<String>,
         fail_writes: bool,
+        fail_reads: bool,
+        read_count: usize,
     }
 
     impl ClipboardBackend for FakeClipboard {
@@ -125,6 +127,10 @@ mod tests {
         }
 
         fn get_text(&mut self) -> Result<String, ClipboardError> {
+            self.read_count += 1;
+            if self.fail_reads {
+                return Err(ClipboardError);
+            }
             Ok(self.text.to_string())
         }
     }
@@ -144,6 +150,18 @@ mod tests {
 
         fn allow_writes_for_test(&mut self) {
             self.backend.fail_writes = false;
+        }
+
+        fn fail_reads_for_test(&mut self) {
+            self.backend.fail_reads = true;
+        }
+
+        fn allow_reads_for_test(&mut self) {
+            self.backend.fail_reads = false;
+        }
+
+        fn read_count_for_test(&self) -> usize {
+            self.backend.read_count
         }
     }
 
@@ -211,6 +229,68 @@ mod tests {
         clipboard.fail_writes_for_test();
 
         assert!(clipboard.clear_if_owned().is_err());
+
+        clipboard.allow_writes_for_test();
+        clipboard.clear_if_owned().unwrap();
+        assert_eq!(clipboard.test_text(), "");
+    }
+
+    #[test]
+    fn failed_read_keeps_the_lease_for_a_later_retry() {
+        let backend = FakeClipboard::default();
+        let mut clipboard = SecretClipboard::with_backend(backend);
+        clipboard
+            .copy(
+                SensitiveText::from("fake-copy-value").to_sensitive_bytes(),
+                1_000,
+            )
+            .unwrap();
+        clipboard.fail_reads_for_test();
+
+        assert!(clipboard.clear_if_owned().is_err());
+
+        clipboard.allow_reads_for_test();
+        clipboard.clear_if_owned().unwrap();
+        assert_eq!(clipboard.test_text(), "");
+    }
+
+    #[test]
+    fn failed_copy_does_not_install_or_replace_a_lease() {
+        let backend = FakeClipboard::default();
+        let mut clipboard = SecretClipboard::with_backend(backend);
+        clipboard.replace_for_test("user-newer-value");
+        clipboard.fail_writes_for_test();
+
+        assert!(
+            clipboard
+                .copy(
+                    SensitiveText::from("failed-fresh-copy").to_sensitive_bytes(),
+                    1_000,
+                )
+                .is_err()
+        );
+
+        clipboard.allow_writes_for_test();
+        clipboard.clear_if_owned().unwrap();
+        assert_eq!(clipboard.test_text(), "user-newer-value");
+        assert_eq!(clipboard.read_count_for_test(), 0);
+
+        clipboard
+            .copy(
+                SensitiveText::from("first-copy-value").to_sensitive_bytes(),
+                2_000,
+            )
+            .unwrap();
+        clipboard.fail_writes_for_test();
+
+        assert!(
+            clipboard
+                .copy(
+                    SensitiveText::from("failed-replacement-copy").to_sensitive_bytes(),
+                    3_000,
+                )
+                .is_err()
+        );
 
         clipboard.allow_writes_for_test();
         clipboard.clear_if_owned().unwrap();

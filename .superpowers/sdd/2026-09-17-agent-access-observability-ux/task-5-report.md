@@ -84,3 +84,57 @@ initialization, ownership equality before clearing, zeroized readback, fixed
 safe errors, and absence of RPC/protocol changes. No Task 5 implementation
 concerns remain. The unrelated workspace-test and formatting findings above are
 recorded for follow-up and are not included in this commit.
+
+## Fix Round 1
+
+### Added coverage
+
+`crates/ladon-app/src/clipboard.rs` now adds these fake-backend tests:
+
+- `failed_read_keeps_the_lease_for_a_later_retry`: a failed `get_text` leaves
+  the lease intact; restoring reads lets the next clear remove Ladon's value.
+- `failed_copy_does_not_install_or_replace_a_lease`: a failed first copy causes
+  no cleanup read or lease, while a failed replacement preserves the old lease
+  so it still conditionally clears the original value.
+
+### RED/GREEN evidence
+
+RED was captured after adding the tests and before extending fake-backend test
+support:
+
+```text
+cargo test -p ladon-app --all-features \
+  clipboard::tests::failed_read_keeps_the_lease_for_a_later_retry -- --exact
+error[E0599]: no method named `fail_reads_for_test`
+error[E0599]: no method named `allow_reads_for_test`
+error[E0599]: no method named `read_count_for_test`
+```
+
+Only the test fake was then extended with read-failure toggles and a read
+counter; production clipboard behavior did not change. GREEN evidence:
+
+```text
+cargo test -p ladon-app --all-features \
+  clipboard::tests::failed_read_keeps_the_lease_for_a_later_retry -- --exact
+1 passed; 0 failed
+
+cargo test -p ladon-app --all-features \
+  clipboard::tests::failed_copy_does_not_install_or_replace_a_lease -- --exact
+1 passed; 0 failed
+
+cargo test -p ladon-app --all-features clipboard
+5 passed; 0 failed
+
+cargo test -p ladon-app --test ui_state clipboard
+1 passed; 0 failed
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+Finished successfully
+
+rustfmt --edition 2024 --check crates/ladon-app/src/clipboard.rs
+Finished successfully
+
+git diff --check -- crates/ladon-app/src/clipboard.rs \
+  .superpowers/sdd/2026-09-17-agent-access-observability-ux/task-5-report.md
+Finished successfully
+```

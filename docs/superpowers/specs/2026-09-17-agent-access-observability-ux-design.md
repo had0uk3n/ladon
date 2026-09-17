@@ -78,9 +78,11 @@ every label as untrusted display metadata and sanitizes it before rendering.
 
 The GUI always displays `(reported)` with a supplied name and always displays
 the UUID prefix. A later valid rename by the same MCP process updates the
-display name of that process's active rows. It does not change the grant key,
-deadline, or authorization. A different process has a different random UUID and
-therefore cannot rename those rows through ordinary MCP use.
+display name of that process's active rows on its next broker request, including
+a status request. The broker observes that label as display metadata only; it
+does not change the grant key, deadline, or authorization. A different process
+has a different random UUID and therefore cannot rename those rows through
+ordinary MCP use.
 
 ## In-memory grant snapshot
 
@@ -92,9 +94,9 @@ duration; it never returns secret values or display labels.
 
 `ApprovalCoordinator` owns the untrusted session-label map because names are an
 application concern, not a core grant concern. It updates a session label on a
-valid request and removes labels that are no longer referenced by any grant,
-pending request, or active run. Vault lock, app lock, shutdown, and full revoke
-clear both grants and associated labels.
+valid request and removes labels that are no longer referenced by any grant or
+pending request. Vault lock, app lock, shutdown, and full revoke clear both
+grants and associated labels.
 
 `LocalBrokerHandle` exposes a GUI-only snapshot that combines:
 
@@ -122,8 +124,8 @@ contain no secret field values by construction.
 Grant existence and command execution are separate states. `RunCoordinator`
 therefore records metadata for its single reserved run:
 
-- client-session UUID;
-- resolved immutable secret IDs; and
+- client-session UUID, recorded when the lease is reserved;
+- resolved immutable secret IDs, attached after the approval plan is built; and
 - phase: preparing or running.
 
 The lease is reserved before approval as today. Once the approval plan resolves
@@ -146,8 +148,9 @@ It follows the existing lock order used for full revocation:
 3. Inspect the one reserved run while admission remains blocked.
 4. If its metadata matches the requested client/secret pair, cancel the run and
    wait for child cleanup and lease release.
-5. If the reserved run is still in the pre-context phase, cancel it fail-closed
-   because a safe non-match cannot yet be proven.
+5. If a run from the same client is still in the pre-secret-context phase,
+   cancel it fail-closed because a safe secret non-match cannot yet be proven.
+   A pre-context run from another client is provably unrelated and continues.
 6. Cancel a matching pending approval; a multi-secret pending request is
    cancelled as a whole.
 7. Revoke only the requested `(client_session_id, secret_id)` grant.

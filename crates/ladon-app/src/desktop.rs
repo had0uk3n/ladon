@@ -2391,6 +2391,22 @@ fn sensitive_text_edit(
     width: f32,
     password: bool,
 ) -> egui::Response {
+    // Only the explicit Copy button may export a secret, through SecretClipboard.
+    // Hide Copy/Cut while this widget handles input, then restore their original
+    // positions so shortcuts still work in other (non-sensitive) widgets.
+    let clipboard_events = ui.input_mut(|input| {
+        let mut clipboard_events = Vec::new();
+        let mut index = 0;
+        input.events.retain(|event| {
+            let clipboard_event = matches!(event, egui::Event::Copy | egui::Event::Cut);
+            if clipboard_event {
+                clipboard_events.push((index, event.clone()));
+            }
+            index += 1;
+            !clipboard_event
+        });
+        clipboard_events
+    });
     let response = ui.add_sized(
         [width, SENSITIVE_FIELD_HEIGHT],
         TextEdit::singleline(value)
@@ -2398,6 +2414,11 @@ fn sensitive_text_edit(
             .hint_text(hint)
             .desired_width(width),
     );
+    ui.input_mut(|input| {
+        for (index, event) in clipboard_events {
+            input.events.insert(index.min(input.events.len()), event);
+        }
+    });
     // egui stores ordinary Strings for undo. Password mode blocks copy/accessibility output,
     // and clearing the undoer immediately prevents those copies surviving in widget state.
     if let Some(mut state) = TextEdit::load_state(ui.ctx(), response.id) {
@@ -3541,6 +3562,88 @@ mod tests {
 
         assert!(!state.undoer().has_undo(&current));
         assert!(!state.undoer().is_in_flux());
+    }
+
+    fn keyboard_clipboard_output(
+        event: egui::Event,
+        sensitive_focused: bool,
+    ) -> (egui::FullOutput, SensitiveText, String) {
+        let context = egui::Context::default();
+        let mut secret = SensitiveText::from("fake-selected-secret");
+        let mut name = "ordinary-name".to_owned();
+        let mut selected_id = None;
+        let mut render = |context: &egui::Context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let sensitive = visible_sensitive_text_field(ui, &mut secret, "Secret", 230.0);
+                let ordinary = ui.add(TextEdit::singleline(&mut name));
+                selected_id = Some(if sensitive_focused {
+                    sensitive.id
+                } else {
+                    ordinary.id
+                });
+            });
+        };
+        let _ = context.run(egui::RawInput::default(), &mut render);
+        let id = selected_id.unwrap();
+        let mut state = TextEdit::load_state(&context, id).unwrap();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(if sensitive_focused { 20 } else { 13 }),
+            )));
+        state.store(&context, id);
+        context.memory_mut(|memory| memory.request_focus(id));
+        let output = context.run(
+            egui::RawInput {
+                events: vec![event],
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    visible_sensitive_text_field(ui, &mut secret, "Secret", 230.0);
+                    ui.add(TextEdit::singleline(&mut name));
+                });
+            },
+        );
+        (output, secret, name)
+    }
+
+    #[test]
+    fn visible_sensitive_keyboard_copy_does_not_emit_unmanaged_clipboard_output() {
+        let (output, secret, _) = keyboard_clipboard_output(egui::Event::Copy, true);
+        assert!(
+            output.platform_output.commands.is_empty(),
+            "sensitive Copy must not reach the OS clipboard"
+        );
+        assert_eq!(secret.as_str(), "fake-selected-secret");
+    }
+
+    #[test]
+    fn visible_sensitive_keyboard_cut_does_not_emit_clipboard_output_or_remove_text() {
+        let (output, secret, _) = keyboard_clipboard_output(egui::Event::Cut, true);
+        assert!(
+            output.platform_output.commands.is_empty(),
+            "sensitive Cut must not reach the OS clipboard"
+        );
+        assert_eq!(
+            secret.as_str(),
+            "fake-selected-secret",
+            "suppressed Cut must not remove the selected secret"
+        );
+    }
+
+    #[test]
+    fn ordinary_keyboard_copy_and_cut_work_next_to_sensitive_input() {
+        for event in [egui::Event::Copy, egui::Event::Cut] {
+            let cut = matches!(event, egui::Event::Cut);
+            let (output, secret, name) = keyboard_clipboard_output(event, false);
+            assert!(
+                matches!(output.platform_output.commands.as_slice(), [egui::OutputCommand::CopyText(text)] if text == "ordinary-name")
+            );
+            assert_eq!(name, if cut { "" } else { "ordinary-name" });
+            assert_eq!(secret.as_str(), "fake-selected-secret");
+        }
     }
 
     #[test]

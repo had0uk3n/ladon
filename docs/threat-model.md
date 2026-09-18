@@ -68,12 +68,10 @@ existing binary fields are retained but cannot be replaced inline.
 
 Revealed and editable text is readable on screen. The explicit **Copy** button
 exports text fields to the OS clipboard; binary fields cannot be copied this
-way, and keyboard Copy/Cut in sensitive fields is disabled. Ladon retains a
-zeroizing copy for comparison and attempts to clear the clipboard after 30
-seconds only if it still contains the copied text. Newer, different content is
-preserved. App lock, vault lock, and exit also attempt conditional cleanup.
-Clipboard access failures, a crash, or retained clipboard history can leave
-copies behind; this is best-effort cleanup rather than guaranteed erasure.
+way, and keyboard Copy/Cut in sensitive fields is disabled. Ladon performs one
+explicit clipboard write and does not subsequently read, time, or clear that
+content. It remains available until the user or operating system replaces or
+clears it. Clipboard managers and OS history may retain additional copies.
 
 The operating system, cryptographic libraries, Rust toolchain, and Ladon binary
 are trusted. Repository source is assumed public; no protection depends on code
@@ -134,8 +132,8 @@ secrecy.
     value-free.
 12. Active-grant snapshots and targeted revoke remain GUI-only. Reported names
     confer no authority and cannot renew grants or change their scope.
-13. Managed text-copy cleanup only clears clipboard contents equal to the
-    copied text; it does not erase clipboard-manager or OS history.
+13. Explicit text copy writes only the selected value and creates no Ladon
+    clipboard lifecycle; clipboard-manager and OS history remain out of scope.
 
 ## Review gates before stable v1
 

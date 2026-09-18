@@ -1123,6 +1123,13 @@ impl LadonDesktop {
                     .size(12.0)
                     .color(Color32::WHITE),
             );
+            if self.agent_command_active && !self.agent_grants.iter().any(AgentGrantView::running) {
+                ui.label(
+                    RichText::new("Agent command running")
+                        .size(11.0)
+                        .color(Color32::LIGHT_GRAY),
+                );
+            }
         }
         let mut revoke = None;
         if !self.agent_grants.is_empty() {
@@ -3112,7 +3119,14 @@ mod tests {
     #[cfg(unix)]
     fn expired_grants_keep_revoke_all_available_while_the_command_is_active() {
         let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
-        app.agent_grants.clear();
+        app.agent_grants = vec![AgentGrantView::for_test(
+            Uuid::new_v4(),
+            "unrelated client",
+            SecretId::new(),
+            "unrelated secret",
+            Duration::from_secs(60),
+            false,
+        )];
         app.agent_command_active = true;
         let context = egui::Context::default();
         let output = context.run(egui::RawInput::default(), |context| {
@@ -3131,11 +3145,10 @@ mod tests {
             );
         }
         assert!(
-            !output
+            output
                 .shapes
                 .iter()
-                .any(|shape| shape_contains_text(&shape.shape, "Agent access · 0")),
-            "an empty grant list must remain absent"
+                .any(|shape| shape_contains_text(&shape.shape, "Agent access · 1"))
         );
     }
 

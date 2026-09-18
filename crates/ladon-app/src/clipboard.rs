@@ -76,6 +76,7 @@ mod tests {
     struct FakeClipboard {
         text: Zeroizing<String>,
         fail_writes: bool,
+        write_count: usize,
     }
 
     impl ClipboardBackend for FakeClipboard {
@@ -83,6 +84,7 @@ mod tests {
             if self.fail_writes {
                 return Err(ClipboardError);
             }
+            self.write_count += 1;
             self.text = Zeroizing::new(text.to_owned());
             Ok(())
         }
@@ -91,6 +93,10 @@ mod tests {
     impl SecretClipboard<FakeClipboard> {
         fn test_text(&self) -> &str {
             self.backend.text.as_str()
+        }
+
+        fn write_count(&self) -> usize {
+            self.backend.write_count
         }
     }
 
@@ -104,6 +110,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(clipboard.test_text(), "fake-copy-value");
+        assert_eq!(clipboard.write_count(), 1);
     }
 
     #[test]

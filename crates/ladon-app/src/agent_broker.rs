@@ -1241,8 +1241,17 @@ mod tests {
 
         assert!(!coordinator.has_active_run().unwrap());
 
-        mark_running_for_test(&lease);
+        let mut missing = Command::new("/ladon-test/missing-executable");
+        assert!(lease.spawn_child(&mut missing).is_err());
+        assert!(!coordinator.has_active_run().unwrap());
+
+        let mut command = Command::new("/usr/bin/true");
+        let mut child = lease.spawn_child(&mut command).unwrap();
         assert!(coordinator.has_active_run().unwrap());
+        child.wait().unwrap();
+
+        drop(lease);
+        assert!(!coordinator.has_active_run().unwrap());
     }
 
     #[test]

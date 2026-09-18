@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::Instant;
 
 use eframe::egui::{
@@ -16,6 +16,8 @@ use eframe::egui::{
 use ladon_core::{LadonError, SecretId, SecretMetadata, SensitiveBytes};
 
 #[cfg(unix)]
+use crate::PendingRequestView;
+#[cfg(unix)]
 use crate::agent_broker::{AgentGrantView, AppLockAttempt, LocalBrokerHandle};
 use crate::clipboard::SecretClipboard;
 use crate::touch_id::TouchIdAttempt;
@@ -23,8 +25,8 @@ use crate::touch_id::TouchIdAttempt;
 use crate::ui::sanitize_untrusted;
 use crate::{
     AddSecretDraft, DetailMode, LocalAuthAttempt, NavigationResult, NavigationTarget,
-    PendingRequestView, PinVerification, SecretDetailState, SensitiveText, SessionConfirmation,
-    SessionPin, Supervisor, TouchIdAuthenticator, VaultController, VaultUiPhase,
+    PinVerification, SecretDetailState, SensitiveText, SessionConfirmation, SessionPin, Supervisor,
+    TouchIdAuthenticator, VaultController, VaultUiPhase,
 };
 use crate::{
     EditableValue,
@@ -130,6 +132,7 @@ struct LadonDesktop {
     manager_window_active: bool,
 }
 
+#[cfg(unix)]
 enum ApprovalAction {
     Approve(ConfirmationAction),
     Deny,
@@ -855,9 +858,10 @@ impl LadonDesktop {
                             });
                             ui.add_space(10.0);
                         }
-                        if let Some(index) = remove_index
-                            && draft.remove_field(index)
-                        {
+                        let removed = remove_index
+                            .map(|index| draft.remove_field(index))
+                            .unwrap_or(false);
+                        if removed {
                             *dirty = true;
                         }
                         ui.horizontal(|ui| {
@@ -2281,10 +2285,10 @@ impl LadonDesktop {
             .as_ref()
             .ok_or(LadonError::EndpointUnavailable)
             .and_then(|broker| broker.approve(captured_id));
-        if result.is_ok()
-            && touch_id_succeeded
-            && let Some(confirmation) = &mut self.session_confirmation
-        {
+        if let (true, Some(confirmation)) = (
+            result.is_ok() && touch_id_succeeded,
+            &mut self.session_confirmation,
+        ) {
             confirmation.record_touch_id_success();
         }
         self.local_pin.clear();
@@ -2674,10 +2678,12 @@ fn copy_value_button(
     value: &EditableValue,
     request: &mut Option<SensitiveBytes>,
 ) {
-    if let Some(text) = copyable_text(value)
-        && ui
-            .add_sized([52.0, SENSITIVE_FIELD_HEIGHT], egui::Button::new("Copy"))
-            .clicked()
+    let Some(text) = copyable_text(value) else {
+        return;
+    };
+    if ui
+        .add_sized([52.0, SENSITIVE_FIELD_HEIGHT], egui::Button::new("Copy"))
+        .clicked()
     {
         *request = Some(SensitiveBytes::new(text.as_bytes().to_vec()));
     }
@@ -2728,6 +2734,7 @@ fn format_remaining(remaining: Duration) -> String {
     format!("locks in {:02}:{:02}", seconds / 60, seconds % 60)
 }
 
+#[cfg(any(unix, test))]
 fn update_focused_approval(
     focused: &mut Option<uuid::Uuid>,
     approval_pin: &mut SensitiveText,
@@ -3203,6 +3210,7 @@ mod tests {
         assert_eq!(notice.unwrap().text, "Clipboard is unavailable");
     }
 
+    #[cfg(unix)]
     fn shape_contains_text(shape: &egui::epaint::Shape, expected: &str) -> bool {
         match shape {
             egui::epaint::Shape::Text(text) => text.galley.job.text == expected,
@@ -3213,6 +3221,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn clipped_text_is_visible(shapes: &[egui::epaint::ClippedShape], expected: &str) -> bool {
         fn visible(shape: &egui::epaint::Shape, clip: egui::Rect, expected: &str) -> bool {
             match shape {
@@ -3231,6 +3240,7 @@ mod tests {
             .any(|shape| visible(&shape.shape, shape.clip_rect, expected))
     }
 
+    #[cfg(unix)]
     fn text_position(shapes: &[egui::epaint::ClippedShape], expected: &str) -> egui::Pos2 {
         shapes
             .iter()

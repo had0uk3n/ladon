@@ -5,9 +5,22 @@ use ladon::{IntegrationTarget, apply_integration_config, integration_preview};
 #[test]
 fn previews_contain_only_an_absolute_local_command() {
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let expected = executable.to_str().unwrap();
     for target in [IntegrationTarget::Codex, IntegrationTarget::Claude] {
         let preview = integration_preview(target, &executable).unwrap();
-        assert!(preview.contains(executable.to_str().unwrap()));
+        match target {
+            IntegrationTarget::Codex => {
+                let document = preview.parse::<toml_edit::DocumentMut>().unwrap();
+                assert_eq!(
+                    document["mcp_servers"]["ladon"]["command"].as_str(),
+                    Some(expected)
+                );
+            }
+            IntegrationTarget::Claude => {
+                let document: serde_json::Value = serde_json::from_str(&preview).unwrap();
+                assert_eq!(document["mcpServers"]["ladon"]["command"], expected);
+            }
+        }
         assert!(preview.contains("mcp"));
         assert!(!preview.contains("fake-plaintext-value"));
         assert!(!preview.contains("remote"));

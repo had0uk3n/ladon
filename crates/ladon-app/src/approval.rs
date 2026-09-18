@@ -341,8 +341,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         });
         if owns_active_grant || has_pending_request {
             let client_label = client_label.to_owned();
-            if let Some(pending) = state.pending.as_mut()
-                && pending.request.client_session_id == client_session_id
+            if let Some(pending) = state
+                .pending
+                .as_mut()
+                .filter(|pending| pending.request.client_session_id == client_session_id)
             {
                 pending.request.client_label = client_label.clone();
             }
@@ -474,10 +476,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         secret_id: SecretId,
     ) -> Result<bool, LadonError> {
         let mut state = self.lock_state()?;
-        if let Some(pending) = state.pending.as_mut()
-            && pending.request.client_session_id == client_session_id
-            && pending.requested_secret_ids.contains(&secret_id)
-        {
+        if let Some(pending) = state.pending.as_mut().filter(|pending| {
+            pending.request.client_session_id == client_session_id
+                && pending.requested_secret_ids.contains(&secret_id)
+        }) {
             pending.decision = Some(ApprovalDecision::Cancel);
         }
         let revoked = state.grants.revoke_pair(client_session_id, secret_id);
@@ -494,8 +496,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
     ) -> Result<T, LadonError> {
         let mut state = self.lock_state()?;
         let prepared = prepare()?;
-        if let Some(pending) = state.pending.as_mut()
-            && pending.requested_secret_ids.contains(&secret_id)
+        if let Some(pending) = state
+            .pending
+            .as_mut()
+            .filter(|pending| pending.requested_secret_ids.contains(&secret_id))
         {
             pending.decision = Some(ApprovalDecision::Cancel);
             self.changed.notify_all();

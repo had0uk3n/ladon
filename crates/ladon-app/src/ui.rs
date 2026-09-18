@@ -14,6 +14,7 @@ use ladon_core::{
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(unix)]
 use crate::ApprovalSecret;
 use crate::EditSecretDraft;
 
@@ -365,6 +366,7 @@ pub struct VaultController {
     session_id: Option<uuid::Uuid>,
 }
 
+#[cfg(unix)]
 pub(crate) struct ApprovalPlan {
     pub(crate) vault_session_id: uuid::Uuid,
     pub(crate) secrets: Vec<ApprovalSecret>,
@@ -663,6 +665,7 @@ impl VaultController {
             .collect()
     }
 
+    #[cfg(unix)]
     pub(crate) fn approval_plan(
         &self,
         bindings: &[ValidatedSecretBinding],
@@ -746,14 +749,18 @@ impl VaultController {
     }
 
     pub fn auto_lock_if_idle(&mut self) -> bool {
+        self.auto_lock_if_idle_at(Instant::now())
+    }
+
+    fn auto_lock_if_idle_at(&mut self, now: Instant) -> bool {
         let should_lock = matches!(
             &self.state,
             ManagedVault::Unlocked(session)
-                if session.activity().last.elapsed() >= DEFAULT_IDLE_TIMEOUT
+                if now.saturating_duration_since(session.activity().last) >= DEFAULT_IDLE_TIMEOUT
         ) || matches!(
             &self.state,
             ManagedVault::RecoveryRequired { activity, .. }
-                if activity.last.elapsed() >= DEFAULT_IDLE_TIMEOUT
+                if now.saturating_duration_since(activity.last) >= DEFAULT_IDLE_TIMEOUT
         );
         if should_lock {
             self.lock();
@@ -1210,19 +1217,20 @@ mod tests {
         let password = SensitiveBytes::new(b"correct horse".to_vec());
         let payload = VaultPayload::new(SecretId::new(), 1, Vec::new()).unwrap();
         let (backup, _) = create_vault(payload, &password).unwrap();
+        let last_activity = Instant::now();
         let mut controller = VaultController {
             store: VaultStore::new(directory.path().join("vault.ladon")),
             state: ManagedVault::RecoveryRequired {
                 primary: None,
                 backup,
                 activity: SessionActivity {
-                    last: Instant::now() - DEFAULT_IDLE_TIMEOUT,
+                    last: last_activity,
                 },
             },
             session_id: None,
         };
 
-        assert!(controller.auto_lock_if_idle());
+        assert!(controller.auto_lock_if_idle_at(last_activity + DEFAULT_IDLE_TIMEOUT));
         assert_eq!(controller.phase(), VaultUiPhase::Locked);
         assert!(controller.remaining_unlocked().is_none());
     }

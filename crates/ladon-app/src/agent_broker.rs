@@ -479,10 +479,9 @@ fn lock_controller_and_runs(
             first_error = Some(error);
         }
     }
-    if let Err(error) = approval.revoke_all()
-        && first_error.is_none()
-    {
-        first_error = Some(error);
+    let revoke_error = approval.revoke_all().err();
+    if first_error.is_none() {
+        first_error = revoke_error;
     }
     let _block = match coordinator.block_new_runs() {
         Ok(block) => Some(block),
@@ -504,17 +503,17 @@ fn lock_controller_and_runs(
         }
         Err(_) => false,
     };
-    if controller_locked
-        && let Err(error) = approval.reset_after_vault_lock()
-        && first_error.is_none()
-    {
-        first_error = Some(error);
+    if controller_locked {
+        let reset_error = approval.reset_after_vault_lock().err();
+        if first_error.is_none() {
+            first_error = reset_error;
+        }
     }
-    if let (Some(ui_locks), Some(request_id)) = (ui_locks, ui_request)
-        && let Err(error) = ui_locks.finish_request(request_id)
-        && first_error.is_none()
-    {
-        first_error = Some(error);
+    if let (Some(ui_locks), Some(request_id)) = (ui_locks, ui_request) {
+        let finish_error = ui_locks.finish_request(request_id).err();
+        if first_error.is_none() {
+            first_error = finish_error;
+        }
     }
     first_error.map_or(Ok(()), Err)
 }
@@ -913,12 +912,11 @@ impl AgentBroker {
         method: RpcMethod,
         connection_cancellation: RunCancellation,
     ) -> Result<RpcResult, LadonError> {
-        if let Err(error) = self
+        let observation = self
             .approval
-            .observe_client(client_session_id, &client_label)
-            && !matches!(&method, RpcMethod::Lock)
-        {
-            return Err(error);
+            .observe_client(client_session_id, &client_label);
+        if !matches!(&method, RpcMethod::Lock) {
+            observation?;
         }
         // Hard lock must still attempt vault cleanup when approval coordination has failed.
         match method {

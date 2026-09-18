@@ -16,7 +16,7 @@ gui = ["dep:arboard", "dep:eframe"]
 
 [dependencies]
 argon2.workspace = true
-arboard = { version = "3.6.1", optional = true }
+arboard = { version = "3.6.1", optional = true, default-features = false }
 eframe = { version = "=0.32.3", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 getrandom.workspace = true
 ladon-core = { path = "../ladon-core" }

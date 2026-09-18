@@ -533,6 +533,8 @@ mod tests {
 
     #[test]
     fn complete_v1_file_matches_fixed_vector() {
+        use std::fmt::Write as _;
+
         let payload = VaultPayload::new(
             SecretId::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
             0,
@@ -543,10 +545,10 @@ mod tests {
         let mut random = CounterRandom(0);
 
         let (_, file) = create_vault_with_random(payload, &passphrase, &mut random).unwrap();
-        let actual = file
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let mut actual = String::with_capacity(file.len() * 2);
+        for byte in file {
+            write!(&mut actual, "{byte:02x}").unwrap();
+        }
 
         assert_eq!(
             actual,

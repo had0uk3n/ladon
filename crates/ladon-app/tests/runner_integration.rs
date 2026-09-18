@@ -20,6 +20,15 @@ const ENV_VALUE: &[u8] = b"environment-secret";
 const STDIN_VALUE: &[u8] = b"standard-input-secret";
 const FILE_VALUE: &[u8] = b"temporary-file-secret";
 
+fn inherited_parent_environment_marker_is_set() -> bool {
+    #[cfg(unix)]
+    let marker = "PWD";
+    #[cfg(windows)]
+    let marker = "USERNAME";
+
+    env::var_os(marker).is_some()
+}
+
 fn fixture_arguments(name: &str) -> Vec<String> {
     vec![
         "--ignored".to_owned(),
@@ -72,7 +81,7 @@ fn validated(
 
 #[test]
 fn injects_env_stdin_and_temp_file_without_inheriting_parent_environment() {
-    assert!(env::var_os("PWD").is_some());
+    assert!(inherited_parent_environment_marker_is_set());
     let bindings = vec![
         binding(
             "env-secret",
@@ -312,7 +321,7 @@ fn fixture_injection() {
     println!("env-ok={environment}");
     println!("stdin-ok={}", stdin == STDIN_VALUE);
     println!("file-ok={}", file == FILE_VALUE);
-    println!("inherited={}", env::var_os("PWD").is_some());
+    println!("inherited={}", inherited_parent_environment_marker_is_set());
     println!("temp-path={file_path}");
 }
 

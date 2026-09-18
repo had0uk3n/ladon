@@ -74,7 +74,7 @@ impl TouchIdAuthenticator {
         ))
     }
 
-    #[cfg(feature = "gui")]
+    #[cfg(all(feature = "gui", unix))]
     pub(crate) fn authenticate_agent_session() -> Result<TouchIdAttempt, LadonError> {
         TouchIdAttempt::start(
             "Allow this agent session to use the displayed Ladon secrets for 30 minutes".to_owned(),
@@ -183,7 +183,6 @@ mod tests {
 
     #[test]
     fn app_unlock_reason_is_static_and_contains_no_contextual_data() {
-        assert!(!APP_UNLOCK_REASON.is_empty());
         assert_eq!(APP_UNLOCK_REASON, "Unlock Ladon on this device");
     }
 

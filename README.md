@@ -212,17 +212,33 @@ On macOS the **Ladon** menu provides **Open Ladon**, **Lock app**,
 it, discarding visible values and unsaved edits. **Quit** fully locks and exits.
 PIN/Touch ID are session-only; restarting still requires the master password.
 
-**Find exposed secrets…** opens a local folder audit. Enter an absolute folder
-path and choose **Analyze folder**. Results show the number of likely plaintext
-credential assignments/private keys, file paths and line numbers; values and
-source snippets are never shown or uploaded. It does not check internet leaks
-or validate whether credentials work. Counts represent candidate occurrences,
-so copies count separately and false positives/negatives are possible.
+**Find unencrypted secrets** starts an automatic local audit with one click.
+It checks your home folder (including hidden files and projects), plus
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR` when configured. Known Codex/Claude login
+files, MCP configuration, shell profiles and common developer credential files
+are checked first across all these locations. The coverage panel lists the
+attempted roots; files elsewhere on the system are outside this scan.
 
-Scans run in a cancellable background worker with 2 MiB per-file, 100 MiB total,
-20,000 text-file, 100,000 directory-entry, 32-level, 30-second and 1,000-finding
-limits. Symlinks, binary files and common build/vendor/VCS directories are
-excluded. Partial coverage is labeled; zero findings is not proof of no secrets.
+Detection reads file contents, including `.env`, `.env.*` and files excluded
+by a project's `.gitignore`. It recognizes common dotenv, JSON, TOML and YAML
+scalar assignments, short passwords, escaped JSON strings, multiline scalar
+values, HTTP authorization headers, token formats, connection URLs containing
+passwords and private-key headers. It does not execute configuration, expand
+environment references, decrypt credential stores or contact services.
+
+Results contain only candidate counts, file paths, line numbers and reasons;
+values and source snippets are never shown or uploaded. High-entropy values
+without stronger evidence appear separately as requiring review. Overlapping
+rules and overlapping scan roots do not multiply a finding. Separate copies
+of a secret still count separately. These are heuristic candidates, not
+verified working credentials or proof of public internet exposure; false
+positives and false negatives remain possible.
+
+Scans run in a cancellable background worker with 8 MiB per-file, 512 MiB total,
+100,000 text-file, 500,000 directory-entry, 32-level, 120-second and 5,000-finding
+limits. Symlinks, non-UTF-8/binary files and common build/vendor/VCS directories
+are excluded. Unreadable paths, cancellation and exhausted limits produce a
+partial-scan notice; zero findings is not proof of no secrets.
 
 ## Security boundary
 

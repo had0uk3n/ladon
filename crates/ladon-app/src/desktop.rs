@@ -140,7 +140,6 @@ struct DesktopUtilities {
     tray: Option<crate::tray::Tray>,
     quitting: bool,
     scan_open: bool,
-    scan_path: String,
     scan_task: Option<ScanTask>,
     scan_report: Option<crate::exposure_scan::ScanReport>,
     scan_error: bool,
@@ -412,12 +411,10 @@ impl LadonDesktop {
 
     fn show_exposure_scan(&mut self, context: &egui::Context) {
         egui::TopBottomPanel::bottom("local-audit-button").show(context, |ui| {
-            if quiet_button(ui, "Find exposed secrets…").clicked() {
+            if quiet_button(ui, "Find unencrypted secrets").clicked() {
                 self.utilities.scan_open = true;
-                if self.utilities.scan_path.is_empty() {
-                    self.utilities.scan_path = env::var("HOME")
-                        .or_else(|_| env::var("USERPROFILE"))
-                        .unwrap_or_default();
+                if self.utilities.scan_task.is_none() {
+                    self.start_exposure_scan(context);
                 }
             }
         });
@@ -441,13 +438,12 @@ impl LadonDesktop {
             return;
         }
         let mut open = true;
-        egui::Window::new("Exposed secrets on this device")
+        egui::Window::new("Unencrypted secrets on this device")
             .open(&mut open).default_width(540.0).resizable(true)
             .vscroll(true).max_height((context.screen_rect().height() - 40.0).max(180.0))
             .show(context, |ui| {
-                ui.label("Scan a local folder for likely plaintext credentials. Nothing is uploaded.");
+                ui.label("Checks your home folder, hidden files, projects and configured Codex/Claude folders. Nothing is uploaded.");
                 ui.label("Values are never shown. Findings are candidates, not verified active credentials.");
-                ui.add_enabled(self.utilities.scan_task.is_none(), TextEdit::singleline(&mut self.utilities.scan_path).desired_width(f32::INFINITY).hint_text("Absolute folder path"));
                 if self.utilities.scan_task.is_some() {
                     ui.horizontal(|ui| {
                         ui.spinner(); ui.label("Scanning…");
@@ -455,20 +451,26 @@ impl LadonDesktop {
                             if let Some(task) = &self.utilities.scan_task { task.cancel.store(true, std::sync::atomic::Ordering::Relaxed); }
                         }
                     });
-                } else if primary_button(ui, "Analyze folder").clicked() {
-                    self.start_exposure_scan(context);
                 }
-                if self.utilities.scan_error { ui.colored_label(DANGER, "Could not scan this folder. Check its path and read permissions."); }
+                if self.utilities.scan_error { ui.colored_label(DANGER, "Could not start the scan. Your home folder must exist and be readable."); }
                 if let Some(report) = &self.utilities.scan_report {
-                    ui.heading(format!("{} likely exposed secrets", report.findings.len()));
+                    let uncertain = report.findings.iter().filter(|finding| finding.rule == crate::exposure_scan::ExposureRule::HighEntropyValue).count();
+                    ui.heading(format!("{} likely unencrypted secrets", report.findings.len() - uncertain));
+                    if uncertain > 0 { ui.label(format!("{uncertain} additional unusual values need review")); }
                     ui.label(format!("{} text files checked · {} files skipped", report.files_scanned, report.skipped_files));
                     if report.incomplete { ui.colored_label(AMBER, "Partial scan: cancelled, unreadable paths or a scan limit reached."); }
-                    ui.label("Build/vendor folders, symlinks, binary and large files are excluded. A zero count does not prove there are no secrets.");
+                    ui.collapsing("Scan coverage", |ui| {
+                        for root in &report.roots { ui.label(sanitize_untrusted(&root.to_string_lossy())); }
+                        ui.label("Only these locations are checked. Build/vendor/VCS folders, symlinks, binary and large files are excluded. Encrypted credential stores are not decrypted. A zero count does not prove there are no secrets.");
+                    });
                     egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
                         for finding in &report.findings {
                             let rule = match finding.rule {
                                 crate::exposure_scan::ExposureRule::CredentialAssignment => "Credential assignment",
                                 crate::exposure_scan::ExposureRule::PrivateKeyHeader => "Private key",
+                                crate::exposure_scan::ExposureRule::TokenPattern => "Token format",
+                                crate::exposure_scan::ExposureRule::ConnectionString => "Connection password",
+                                crate::exposure_scan::ExposureRule::HighEntropyValue => "Unusual value — review needed",
                             };
                             ui.label(format!("{}:{} — {}", sanitize_untrusted(&finding.path.to_string_lossy()), finding.line, rule));
                         }
@@ -482,13 +484,20 @@ impl LadonDesktop {
     }
 
     fn start_exposure_scan(&mut self, context: &egui::Context) {
-        let path = PathBuf::from(self.utilities.scan_path.trim());
+        let path = env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
         self.utilities.scan_report = None;
         self.utilities.scan_error = false;
-        if !path.is_absolute() {
+        let Some(path) = path.filter(|path| path.is_absolute()) else {
             self.utilities.scan_error = true;
             return;
-        }
+        };
+        let extra_roots: Vec<PathBuf> = ["CODEX_HOME", "CLAUDE_CONFIG_DIR"]
+            .into_iter()
+            .filter_map(env::var_os)
+            .map(PathBuf::from)
+            .collect();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, result) = std::sync::mpsc::sync_channel(1);
@@ -496,8 +505,9 @@ impl LadonDesktop {
         let worker = std::thread::Builder::new()
             .name("ladon-exposure-scan".to_owned())
             .spawn(move || {
-                let report = crate::exposure_scan::scan_directory(
+                let report = crate::exposure_scan::scan_user_files(
                     &path,
+                    &extra_roots,
                     &worker_cancel,
                     &crate::exposure_scan::ScanLimits::default(),
                 );

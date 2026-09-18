@@ -19,8 +19,12 @@ remain unfinished.
 
 Ordinary idle locking retains the vault key in process memory for PIN/Touch ID
 unlock. Use **Lock vault completely** or **Quit** to erase that session. Local
-file audits report heuristic candidate locations, not verified leaks, and do
-not transmit file contents.
+file audits cover the user's home and configured assistant folders, report
+heuristic candidate locations rather than verified leaks, and do not transmit
+file contents. Configuration is read as data; helpers, imports and environment
+expansion are not executed. Counts exclude ambiguous high-entropy values,
+which are shown separately for review. Scan coverage and partial results are
+explicit; this is not a guarantee that all plaintext secrets were found.
 
 ## Reporting a vulnerability
 

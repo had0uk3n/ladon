@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -5,10 +6,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+mod detection;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExposureRule {
     CredentialAssignment,
     PrivateKeyHeader,
+    TokenPattern,
+    ConnectionString,
+    HighEntropyValue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +30,7 @@ pub(crate) struct ScanReport {
     pub(crate) files_scanned: usize,
     pub(crate) skipped_files: usize,
     pub(crate) incomplete: bool,
+    pub(crate) roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,27 +47,30 @@ pub(crate) struct ScanLimits {
 impl Default for ScanLimits {
     fn default() -> Self {
         Self {
-            max_file_bytes: 2 * 1024 * 1024,
-            max_total_bytes: 100 * 1024 * 1024,
-            max_files: 20_000,
-            max_entries: 100_000,
+            max_file_bytes: 8 * 1024 * 1024,
+            max_total_bytes: 512 * 1024 * 1024,
+            max_files: 100_000,
+            max_entries: 500_000,
             max_depth: 32,
-            max_duration: Duration::from_secs(30),
-            max_findings: 1_000,
+            max_duration: Duration::from_secs(120),
+            max_findings: 5_000,
         }
     }
 }
 
 struct Scanner<'a> {
-    root: &'a Path,
+    display_root: Option<&'a Path>,
     cancel: &'a AtomicBool,
     limits: &'a ScanLimits,
     started: Instant,
     entries_seen: usize,
     total_bytes: u64,
     report: ScanReport,
+    seen_files: HashSet<PathBuf>,
+    seen_directories: HashSet<PathBuf>,
 }
 
+#[cfg(test)]
 pub(crate) fn scan_directory(
     root: &Path,
     cancel: &AtomicBool,
@@ -74,27 +84,129 @@ pub(crate) fn scan_directory(
         ));
     }
 
-    let mut scanner = Scanner {
-        root,
-        cancel,
-        limits,
-        started: Instant::now(),
-        entries_seen: 0,
-        total_bytes: 0,
-        report: ScanReport {
-            findings: Vec::new(),
-            files_scanned: 0,
-            skipped_files: 0,
-            incomplete: false,
-        },
-    };
+    let mut scanner = Scanner::new(Some(root), cancel, limits);
+    scanner.report.roots.push(root.to_owned());
     scanner.walk(root, 0);
     Ok(scanner.report)
 }
 
+pub(crate) fn scan_user_files(
+    home: &Path,
+    extra_roots: &[PathBuf],
+    cancel: &AtomicBool,
+    limits: &ScanLimits,
+) -> io::Result<ScanReport> {
+    if !home.is_absolute() || !fs::symlink_metadata(home)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "home must be an absolute directory",
+        ));
+    }
+    let mut scanner = Scanner::new(None, cancel, limits);
+    let mut roots = vec![home.to_path_buf()];
+    for root in extra_roots {
+        if !roots.contains(root) {
+            roots.push(root.clone());
+        }
+    }
+    scanner.report.roots = roots.clone();
+    // Check credential files across ALL roots before traversing any large tree.
+    for root in &roots {
+        if !root.is_absolute() {
+            scanner.report.incomplete = true;
+            continue;
+        }
+        scanner.priority_files(root);
+    }
+    for root in &roots {
+        if root.is_absolute() {
+            scanner.walk(root, 0);
+        }
+    }
+    Ok(scanner.report)
+}
+
 impl Scanner<'_> {
+    fn new<'a>(
+        display_root: Option<&'a Path>,
+        cancel: &'a AtomicBool,
+        limits: &'a ScanLimits,
+    ) -> Scanner<'a> {
+        Scanner {
+            display_root,
+            cancel,
+            limits,
+            started: Instant::now(),
+            entries_seen: 0,
+            total_bytes: 0,
+            report: ScanReport {
+                findings: Vec::new(),
+                files_scanned: 0,
+                skipped_files: 0,
+                incomplete: false,
+                roots: Vec::new(),
+            },
+            seen_files: HashSet::new(),
+            seen_directories: HashSet::new(),
+        }
+    }
+
+    fn priority_files(&mut self, root: &Path) {
+        const PRIORITY: &[&str] = &[
+            ".codex/auth.json",
+            ".codex/config.toml",
+            ".codex/.credentials.json",
+            ".claude/.credentials.json",
+            ".claude/settings.json",
+            ".claude.json",
+            "auth.json",
+            "config.toml",
+            ".credentials.json",
+            "settings.json",
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".mcp.json",
+            ".npmrc",
+            ".pypirc",
+            ".netrc",
+            ".git-credentials",
+            ".aws/credentials",
+            ".config/gcloud/application_default_credentials.json",
+            ".docker/config.json",
+            "Library/Application Support/Claude/claude_desktop_config.json",
+            ".zshrc",
+            ".zprofile",
+            ".bashrc",
+            ".bash_profile",
+            ".profile",
+        ];
+        for relative in PRIORITY {
+            if self.stopped() {
+                return;
+            }
+            let mut candidate = root.to_path_buf();
+            // Explicit priority paths must not bypass the traversal's symlink rule.
+            let mut safe = fs::symlink_metadata(root).is_ok_and(|meta| meta.is_dir());
+            for part in Path::new(relative).components() {
+                candidate.push(part);
+                if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    safe = false;
+                    break;
+                }
+            }
+            if safe && candidate.is_file() {
+                self.scan_file(&candidate);
+            }
+        }
+    }
+
     fn stopped(&mut self) -> bool {
-        if self.cancel.load(Ordering::Relaxed) || self.started.elapsed() >= self.limits.max_duration
+        if self.cancel.load(Ordering::Relaxed)
+            || self.started.elapsed() >= self.limits.max_duration
+            || self.report.files_scanned >= self.limits.max_files
+            || self.report.findings.len() >= self.limits.max_findings
         {
             self.report.incomplete = true;
             true
@@ -104,6 +216,9 @@ impl Scanner<'_> {
     }
 
     fn walk(&mut self, directory: &Path, depth: usize) {
+        if self.seen_directories.contains(directory) {
+            return;
+        }
         if self.stopped() {
             return;
         }
@@ -118,6 +233,7 @@ impl Scanner<'_> {
                 return;
             }
         }
+        self.seen_directories.insert(directory.to_path_buf());
 
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
@@ -169,6 +285,9 @@ impl Scanner<'_> {
     }
 
     fn scan_file(&mut self, path: &Path) {
+        if !self.seen_files.insert(path.to_path_buf()) {
+            return;
+        }
         if self.report.files_scanned >= self.limits.max_files {
             self.report.incomplete = true;
             self.report.skipped_files += 1;
@@ -235,22 +354,32 @@ impl Scanner<'_> {
             }
         };
         self.report.files_scanned += 1;
-        let relative = path.strip_prefix(self.root).unwrap_or(path).to_path_buf();
-        for (index, line) in text.lines().enumerate() {
-            if self.stopped() {
-                return;
-            }
-            let Some(rule) = classify_line(line) else {
-                continue;
-            };
-            if self.report.findings.len() >= self.limits.max_findings {
-                self.report.incomplete = true;
-                return;
-            }
+        let relative = self
+            .display_root
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .to_path_buf();
+        let remaining = self
+            .limits
+            .max_findings
+            .saturating_sub(self.report.findings.len());
+        let (detections, incomplete) = detection::detect(text, remaining, &mut || {
+            self.cancel.load(Ordering::Relaxed)
+                || self.started.elapsed() >= self.limits.max_duration
+        });
+        self.report.incomplete |= incomplete;
+        let mut previous_offset = 0;
+        let mut line = 1;
+        for found in detections {
+            line += text[previous_offset..found.range.start]
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count();
+            previous_offset = found.range.start;
             self.report.findings.push(ScanFinding {
                 path: relative.clone(),
-                line: index + 1,
-                rule,
+                line,
+                rule: found.rule,
             });
         }
     }
@@ -288,83 +417,6 @@ fn ignored_directory(name: &std::ffi::OsStr) -> bool {
                 | "build"
         )
     )
-}
-
-fn classify_line(line: &str) -> Option<ExposureRule> {
-    let trimmed = line.trim();
-    if trimmed == "-----BEGIN ENCRYPTED PRIVATE KEY-----" {
-        return None;
-    }
-    if trimmed.starts_with("-----BEGIN ") && trimmed.ends_with("PRIVATE KEY-----") {
-        return Some(ExposureRule::PrivateKeyHeader);
-    }
-
-    let separator = trimmed.find('=').or_else(|| trimmed.find(':'))?;
-    let key = trimmed[..separator]
-        .trim()
-        .trim_matches(|character: char| character == '"' || character == '\'')
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    if !credential_key(&key) {
-        return None;
-    }
-    let value = trimmed[separator + 1..]
-        .trim()
-        .trim_end_matches(',')
-        .trim()
-        .trim_matches(|character: char| character == '"' || character == '\'')
-        .trim();
-    if plausible_value(value) {
-        Some(ExposureRule::CredentialAssignment)
-    } else {
-        None
-    }
-}
-
-fn credential_key(key: &str) -> bool {
-    key == "password"
-        || key == "passwd"
-        || key.ends_with("_password")
-        || key.ends_with("_passwd")
-        || key == "secret"
-        || key.ends_with("_secret")
-        || key == "token"
-        || key.ends_with("_token")
-        || key == "api_key"
-        || key.ends_with("_api_key")
-        || key.ends_with("apikey")
-        || key == "access_key"
-        || key.ends_with("_access_key")
-        || key.ends_with("accesstoken")
-        || key.ends_with("clientsecret")
-        || key.ends_with("authtoken")
-        || key == "private_key"
-        || key.ends_with("_private_key")
-}
-
-fn plausible_value(value: &str) -> bool {
-    if value.len() < 12 || value.len() > 16 * 1024 || value.chars().any(char::is_control) {
-        return false;
-    }
-    let lower = Zeroizing::new(value.to_ascii_lowercase());
-    let placeholder = lower.contains("${")
-        || lower.contains("{{")
-        || (lower.starts_with('<') && lower.ends_with('>'))
-        || lower.contains("your_")
-        || lower.contains("your-")
-        || lower.contains("your ")
-        || lower.contains("changeme")
-        || lower.contains("change_me")
-        || lower.contains("placeholder")
-        || lower.contains("replace_me")
-        || lower.contains("insert_")
-        || lower.contains("example")
-        || lower.contains("dummy")
-        || lower.contains("redacted")
-        || lower
-            .chars()
-            .all(|character| matches!(character, 'x' | '*' | '-'));
-    !placeholder && value.chars().any(char::is_alphanumeric)
 }
 
 #[cfg(test)]
@@ -459,6 +511,333 @@ mod tests {
                 .iter()
                 .all(|finding| finding.rule == ExposureRule::CredentialAssignment)
         );
+    }
+
+    #[test]
+    fn reads_hidden_dotenv_files_including_ignored_project_secrets() {
+        let root = TestDir::new("dotenv");
+        fs::create_dir_all(root.0.join("project/.config")).unwrap();
+        fs::write(root.0.join("project/.gitignore"), ".env*\n.config/\n").unwrap();
+        fs::write(root.0.join("project/.env"), "DB_PASSWORD=p4ss!\n").unwrap();
+        fs::write(
+            root.0.join("project/.env.local"),
+            "export DATABASE_URL='postgres://alice:s3cr3t@localhost/app'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("project/.config/.env.production"),
+            "UNUSUAL_NAME=ghp_1234567890abcdefghijklmnopqrstuvwxyz\n",
+        )
+        .unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 3);
+        for name in [
+            "project/.env",
+            "project/.env.local",
+            "project/.config/.env.production",
+        ] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.path == Path::new(name)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_multiple_credentials_on_one_line_of_assistant_json() {
+        let root = TestDir::new("assistant-json");
+        fs::write(root.0.join("auth.json"),
+            "{\"tokens\":{\"access_token\":\"first-token-value==\",\"refresh_token\":\"second-token-value==\"}}\n").unwrap();
+        fs::write(root.0.join(".mcp.json"),
+            "{\"mcpServers\":{\"db\":{\"env\":{\"DB_PASSWORD\":\"short!\"},\"headers\":{\"Authorization\":\"Bearer third-token-value\"}}}}\n").unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 4);
+        assert!(report.findings.iter().all(|finding| finding.line == 1));
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.path == Path::new("auth.json"))
+                .count(),
+            2
+        );
+        let debug = format!("{report:?}");
+        for secret in [
+            "first-token-value",
+            "second-token-value",
+            "short!",
+            "third-token-value",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn reads_toml_yaml_npmrc_and_escaped_json_values() {
+        let root = TestDir::new("config-formats");
+        fs::write(
+            root.0.join("config.toml"),
+            "[mcp_servers.demo.env]\nPASSWORD = 'short!'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("secrets.yaml"),
+            "service:\n  password: \"short!\"\n  clientSecret: 'abc=123'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.0.join(".npmrc"),
+            "//registry.npmjs.org/:_authToken=npm_1234567890abcdefghijklmnopqrstuvwxyz\n",
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("settings.json"),
+            r#"{"api\u004bey":"abc\u003d123"}"#,
+        )
+        .unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 5);
+    }
+
+    #[test]
+    fn detects_token_formats_and_connection_passwords_without_helpful_names() {
+        let root = TestDir::new("value-formats");
+        fs::write(
+            root.0.join("notes.txt"),
+            "unrelated: ghp_1234567890abcdefghijklmnopqrstuvwxyz\n\
+             connect to postgres://alice:p4ss@db.local/app\n\
+             curl -H 'Authorization: Bearer abcDEF1234567890' https://host.invalid\n",
+        )
+        .unwrap();
+        assert_eq!(scan(&root.0).findings.len(), 3);
+    }
+
+    #[test]
+    fn rejects_references_empty_values_and_public_connection_urls() {
+        let root = TestDir::new("non-secrets");
+        fs::write(
+            root.0.join(".env.example"),
+            "TOKEN=${REAL_TOKEN}\nTOKEN=$REAL_TOKEN\nPASSWORD=\"\"\nPASSWORD=null\n\
+             API_KEY=your_api_key_here\nPASSWORD={{secrets.DB_PASSWORD}}\n\
+             ENDPOINT=https://public.example/path\nDATABASE_URL=postgres://user@db.local/app\n\
+             DATABASE_URL=postgres://user:${PASSWORD}@db.local/app\n",
+        )
+        .unwrap();
+        assert!(scan(&root.0).findings.is_empty());
+    }
+
+    #[test]
+    fn finds_opaque_values_without_counting_checksums_and_identifiers() {
+        let root = TestDir::new("opaque-values");
+        fs::write(
+            root.0.join(".env"),
+            "MYSTERY=aZ8!kP2@vQ6#rN4$xT9%wB3&yL7*\n\
+             COMMIT=0123456789abcdef0123456789abcdef01234567\n\
+             ID=550e8400-e29b-41d4-a716-446655440000\n",
+        )
+        .unwrap();
+        assert_eq!(scan(&root.0).findings.len(), 1);
+    }
+
+    #[test]
+    fn encrypted_pem_and_multiple_rules_do_not_inflate_the_count() {
+        let root = TestDir::new("deduplication");
+        fs::write(
+            root.0.join(".env"),
+            "GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz\n",
+        )
+        .unwrap();
+        fs::write(root.0.join("encrypted.pem"),
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,123456\n\nYWJj\n-----END RSA PRIVATE KEY-----\n").unwrap();
+        assert_eq!(scan(&root.0).findings.len(), 1);
+    }
+
+    #[test]
+    fn automatic_scan_covers_external_assistant_roots_without_duplicate_files() {
+        let home = TestDir::new("home");
+        let external = TestDir::new("external-codex");
+        fs::create_dir(home.0.join(".claude")).unwrap();
+        fs::write(
+            home.0.join(".claude/.credentials.json"),
+            "{\"accessToken\":\"local-token\"}",
+        )
+        .unwrap();
+        fs::write(
+            external.0.join("auth.json"),
+            "{\"tokens\":{\"refresh_token\":\"remote-token\"}}",
+        )
+        .unwrap();
+        let report = scan_user_files(
+            &home.0,
+            &[
+                home.0.join(".claude"),
+                external.0.clone(),
+                external.0.clone(),
+            ],
+            &AtomicBool::new(false),
+            &ScanLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(report.findings.len(), 2);
+        assert_eq!(report.files_scanned, 2);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.path.is_absolute())
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.path == external.0.join("auth.json"))
+        );
+        assert!(!report.incomplete);
+    }
+
+    #[test]
+    fn automatic_scan_prioritizes_credentials_before_general_home_contents() {
+        let home = TestDir::new("priority");
+        fs::create_dir(home.0.join(".codex")).unwrap();
+        for number in 0..30 {
+            fs::write(home.0.join(format!("notes-{number}.txt")), "ordinary text").unwrap();
+        }
+        fs::write(
+            home.0.join(".codex/auth.json"),
+            "{\"OPENAI_API_KEY\":\"local-token\"}",
+        )
+        .unwrap();
+        let limits = ScanLimits {
+            max_files: 1,
+            ..ScanLimits::default()
+        };
+        let report = scan_user_files(&home.0, &[], &AtomicBool::new(false), &limits).unwrap();
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].path, home.0.join(".codex/auth.json"));
+        assert!(report.incomplete);
+    }
+
+    #[test]
+    fn automatic_scan_reports_missing_explicit_roots_as_partial() {
+        let home = TestDir::new("missing-root");
+        let report = scan_user_files(
+            &home.0,
+            &[home.0.join("does-not-exist")],
+            &AtomicBool::new(false),
+            &ScanLimits::default(),
+        )
+        .unwrap();
+        assert!(report.incomplete);
+    }
+
+    #[test]
+    fn reads_multiline_scalars_without_counting_format_markers() {
+        let root = TestDir::new("multiline");
+        fs::write(
+            root.0.join("secrets.yaml"),
+            "password: |\n  first-line\n  second-line\nclient_secret: short!\n",
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("config.toml"),
+            "password = \"\"\"\nmultiline-password\n\"\"\"\n",
+        )
+        .unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 3);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.path == Path::new("secrets.yaml") && f.line == 4)
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.path == Path::new("config.toml"))
+        );
+    }
+
+    #[test]
+    fn empty_assignments_with_comments_are_not_secrets() {
+        let root = TestDir::new("comment-values");
+        fs::write(
+            root.0.join(".env"),
+            "API_KEY= # paste API key here\nPASSWORD=\"#\"\n",
+        )
+        .unwrap();
+        fs::write(root.0.join("config.yaml"), "password: # from environment\n").unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].path, Path::new(".env"));
+        assert_eq!(report.findings[0].line, 2);
+    }
+
+    #[test]
+    fn literal_dollar_passwords_are_not_environment_references() {
+        let root = TestDir::new("dollar-passwords");
+        fs::write(
+            root.0.join("settings.json"),
+            r#"{"password":"$3cr3t!","token":"$REAL_TOKEN"}"#,
+        )
+        .unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 1);
+    }
+
+    #[test]
+    fn decodes_pem_strings_before_classifying_encryption() {
+        let root = TestDir::new("escaped-pem");
+        fs::write(root.0.join("encrypted.json"),
+            r#"{"private_key":"-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,123456\n\nYWJj\n-----END RSA PRIVATE KEY-----\n"}"#).unwrap();
+        fs::write(
+            root.0.join("plain.json"),
+            r#"{"material":"-----BEGIN PRIVATE KEY-----\nYWJj\n-----END PRIVATE KEY-----\n"}"#,
+        )
+        .unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].path, Path::new("plain.json"));
+    }
+
+    #[test]
+    fn encrypted_openssh_keys_are_not_plaintext_findings() {
+        let root = TestDir::new("openssh-encryption");
+        // Synthetic OpenSSH magic + cipher name, sufficient for classifying
+        // storage encryption. These are not usable private keys.
+        fs::write(root.0.join("encrypted"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHI=\n-----END OPENSSH PRIVATE KEY-----\n").unwrap();
+        fs::write(root.0.join("plain"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----\n").unwrap();
+        let report = scan(&root.0);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].path, Path::new("plain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn priority_locations_do_not_follow_symlinked_assistant_folders() {
+        let home = TestDir::new("linked-assistant");
+        let outside = TestDir::new("outside-assistant");
+        fs::write(
+            outside.0.join("auth.json"),
+            "{\"access_token\":\"outside-token\"}",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside.0, home.0.join(".codex")).unwrap();
+        let report = scan_user_files(
+            &home.0,
+            &[],
+            &AtomicBool::new(false),
+            &ScanLimits::default(),
+        )
+        .unwrap();
+        assert!(report.findings.is_empty());
+        assert_eq!(report.skipped_files, 1);
     }
 
     #[test]

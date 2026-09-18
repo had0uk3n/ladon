@@ -246,24 +246,17 @@ button nor an editable text control.
 
 Copying uses the system clipboard through `arboard`, which is already in the
 compiled dependency graph through `eframe`; declaring it directly introduces
-no separately installed runtime requirement. A copied text value is held in a
-`ClipboardLease` as sensitive bytes. After 30 seconds, Ladon reads the current
-clipboard and clears it only if it still equals that leased value. Temporary
-clipboard strings used for comparison are zeroized after use. If the user has
-copied something else, Ladon leaves the newer clipboard untouched and drops its
-lease.
+no separately installed runtime requirement. The explicit action writes the
+current text value and performs no subsequent clipboard reads, timers, or
+cleanup.
 
 The copy button in edit mode copies the current draft value, including unsaved
-changes. Cancelling the edit does not immediately clear the clipboard; the
-same 30-second lease applies. A subsequent secret copy replaces the previous
-lease and clipboard content. Clipboard managers, OS history, swap, and bytes
-already read by another process remain outside Ladon's security boundary and
-are documented accordingly.
+changes. A subsequent copy replaces the previous clipboard content. Clipboard
+managers, OS history, swap, and bytes already read by another process remain
+outside Ladon's security boundary and are documented accordingly.
 
-Clipboard initialization, read, or write failures produce a safe GUI error and
-never include the value. App/vault lock drops Ladon's in-memory lease; it also
-attempts the same conditional clipboard clear without delaying lock completion
-if the platform clipboard is unavailable.
+Clipboard initialization or write failures produce a safe GUI error and never
+include the value. App/vault lock does not modify the system clipboard.
 
 ## Error handling and cleanup
 
@@ -338,8 +331,8 @@ All behavior changes follow red-green-refactor.
   hide/edit/delete states without depending on field count.
 - Visible sensitive edits continue to clear egui undo state.
 - Copy uses revealed or current draft text and never exposes binary data.
-- Conditional clipboard clearing preserves a newer clipboard value.
-- Lock cleanup drops clipboard and access-view state.
+- Copy performs one clipboard write without installing background cleanup.
+- Lock cleanup drops Ladon's sensitive UI and access-view state.
 - Pure layout constants keep remove controls at text-row height and secret-row
   typography consistent.
 
@@ -350,7 +343,7 @@ All behavior changes follow red-green-refactor.
 - `cargo test --workspace --all-features`
 - `scripts/smoke-test.sh`
 - `cargo build --workspace --all-features --release`
-- Manual macOS verification of copy/clear, Touch ID approval, countdown,
+- Manual macOS verification of copy, Touch ID approval, countdown,
   scrolling, alignment, and targeted revoke against a real MCP client.
 
 ## Acceptance criteria
@@ -359,7 +352,7 @@ The work is complete when a user can see every active in-memory grant, distingui
 reported MCP processes, see exact remaining access time and actual execution,
 revoke one pair without disturbing unrelated access, and revoke everything at
 once. Text secrets can be copied after reveal and remain visible while editing,
-with conditional 30-second clipboard clearing. All requested action, sizing,
-alignment, typography, and unlocked-indicator defects are corrected without
-adding plaintext APIs, persistent history, trusted-chat claims, or new runtime
-installation requirements.
+with one explicit system-clipboard write and no background clipboard lifecycle.
+All requested action, sizing, alignment, typography, and unlocked-indicator
+defects are corrected without adding plaintext APIs, persistent history,
+trusted-chat claims, or new runtime installation requirements.

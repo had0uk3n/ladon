@@ -80,11 +80,10 @@ secret view/edit flow is GUI-only, requires a fresh PIN or Touch ID confirmation
 and rejects a stale Touch ID completion after the selection or vault session
 changes. CLI, MCP, and local IPC remain value-free.
 
-The GUI's explicit **Copy** action supports text fields only. It attempts to
-clear the clipboard after 30 seconds, or on app lock, vault lock, or exit, only
-when its contents still equal the copied text. Newer, different contents are
-preserved. Cleanup is best-effort if the clipboard is unavailable and cannot
-clear clipboard managers or OS history. Clipboard values never enter RPC/MCP.
+The GUI's explicit **Copy** action supports text fields only and writes the
+current value to the system clipboard. Ladon does not subsequently read, time,
+or clear that clipboard content. Clipboard managers and OS history remain
+outside Ladon's control. Clipboard values never enter RPC/MCP.
 
 ## MCP
 

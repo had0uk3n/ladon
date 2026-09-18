@@ -3,8 +3,11 @@ use std::{
     fs::{self, File, OpenOptions},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(test)]
+use std::time::Instant;
 
 use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
@@ -119,8 +122,6 @@ struct LadonDesktop {
     add_form_error: Option<AddDraftValidationError>,
     notice: Option<Notice>,
     clipboard: SecretClipboard,
-    ui_clock_started: Instant,
-    clipboard_clear_notice_shown: bool,
     detail: SecretDetailState,
     unlock_confirmation: bool,
     discard_confirmation: bool,
@@ -336,8 +337,6 @@ impl LadonDesktop {
             add_form_error: None,
             notice: None,
             clipboard: SecretClipboard::default(),
-            ui_clock_started: Instant::now(),
-            clipboard_clear_notice_shown: false,
             detail: SecretDetailState::default(),
             unlock_confirmation: false,
             discard_confirmation: false,
@@ -880,15 +879,8 @@ impl LadonDesktop {
             });
 
         if let Some(value) = copy_request {
-            let now = self.ui_clock_millis();
-            match self.clipboard.copy(value, now) {
-                Ok(()) => {
-                    self.clipboard_clear_notice_shown = false;
-                    set_clipboard_notice(
-                        &mut self.notice,
-                        "Copied; Ladon will clear it after 30 seconds if unchanged",
-                    );
-                }
+            match self.clipboard.copy(value) {
+                Ok(()) => set_clipboard_notice(&mut self.notice, "Copied"),
                 Err(_) => set_clipboard_notice(&mut self.notice, "Clipboard is unavailable"),
             }
         }
@@ -1610,7 +1602,6 @@ impl LadonDesktop {
     }
 
     fn lock_immediately(&mut self) {
-        self.clear_clipboard();
         #[cfg(unix)]
         let result = if let Some(broker) = &self.broker {
             broker.cancel_active_run_and_lock(&self.controller)
@@ -1633,7 +1624,6 @@ impl LadonDesktop {
     }
 
     fn lock_app_with_touch_id_availability(&mut self, touch_id_available: bool) {
-        self.clear_clipboard();
         let can_unlock = touch_id_available
             || self
                 .session_confirmation
@@ -1966,7 +1956,6 @@ impl LadonDesktop {
     }
 
     fn clear_sensitive_buffers(&mut self) {
-        self.clear_clipboard();
         self.clear_unlock_fields();
         self.session_pin.clear();
         self.session_pin_confirmation.clear();
@@ -1990,35 +1979,6 @@ impl LadonDesktop {
             self.pending_app_lock = None;
         }
         self.desktop_lock = DesktopLockState::Active;
-    }
-
-    fn ui_clock_millis(&self) -> u64 {
-        u64::try_from(self.ui_clock_started.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    fn poll_clipboard(&mut self) {
-        if self
-            .clipboard
-            .poll_clear_in_background(self.ui_clock_millis())
-            .is_err()
-        {
-            if !self.clipboard_clear_notice_shown {
-                set_clipboard_notice(
-                    &mut self.notice,
-                    "Clipboard could not be cleared; Ladon will retry",
-                );
-                self.clipboard_clear_notice_shown = true;
-            }
-        } else {
-            self.clipboard_clear_notice_shown = false;
-        }
-    }
-
-    fn clear_clipboard(&mut self) {
-        // The GUI drops its sensitive lease immediately. A fresh clipboard connection performs
-        // the ownership check off-thread so an unavailable platform clipboard cannot delay lock.
-        self.clipboard.clear_in_background();
-        self.clipboard_clear_notice_shown = false;
     }
 
     fn synchronize_phase(&mut self, phase: VaultUiPhase) {
@@ -2452,7 +2412,6 @@ impl eframe::App for LadonDesktop {
         })
         .unwrap_or(false);
         self.finish_auto_lock(auto_locked);
-        self.poll_clipboard();
         context.request_repaint_after(Duration::from_secs(1));
 
         #[cfg(unix)]
@@ -2512,7 +2471,6 @@ impl eframe::App for LadonDesktop {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.clear_clipboard();
         #[cfg(unix)]
         self.process_external_lock();
 
@@ -3446,8 +3404,6 @@ mod tests {
                 add_form_error: None,
                 notice: None,
                 clipboard: SecretClipboard::default(),
-                ui_clock_started: Instant::now(),
-                clipboard_clear_notice_shown: false,
                 detail,
                 unlock_confirmation: false,
                 discard_confirmation: editing,
@@ -4551,8 +4507,6 @@ mod tests {
             notice: None,
             detail,
             clipboard: SecretClipboard::default(),
-            ui_clock_started: Instant::now(),
-            clipboard_clear_notice_shown: false,
             unlock_confirmation: true,
             discard_confirmation: true,
             pending_delete: None,
@@ -4628,8 +4582,6 @@ mod tests {
             add_form_error: None,
             notice: None,
             clipboard: SecretClipboard::default(),
-            ui_clock_started: Instant::now(),
-            clipboard_clear_notice_shown: false,
             detail: SecretDetailState::default(),
             unlock_confirmation: true,
             discard_confirmation: true,

@@ -80,14 +80,12 @@ close the app; a selection requires authentication again after you leave and
 return.
 
 Revealed text and text being edited are readable. Use the explicit **Copy**
-button to copy a text field; binary fields cannot be copied this way. Ladon
-attempts to clear the copy after 30 seconds only if the clipboard still contains
-the copied text, preserving newer, different clipboard content. App lock, vault
-lock, and exit also start this conditional cleanup without waiting for clipboard
-I/O. Clipboard access can fail; this is best-effort cleanup, not a guarantee of
-erasure. Clipboard managers and OS history may retain copies outside Ladon's
-control. Keyboard Copy/Cut in sensitive fields is disabled so copies use the
-managed **Copy** button.
+button to place the current text field value in the system clipboard; binary
+fields cannot be copied this way. Ladon does not read, time, or clear clipboard
+content after a copy. The value remains there until you or the operating system
+replace or clear it, and clipboard managers or OS history may retain it outside
+Ladon's control. Keyboard Copy/Cut in sensitive fields is disabled so copies use
+the explicit **Copy** button.
 
 Edits are prepared and validated before a single atomic vault update, preserving
 the secret ID. Existing binary fields are preserved but cannot be edited inline.

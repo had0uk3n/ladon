@@ -50,7 +50,7 @@ pub(crate) struct AgentGrantView {
 
 #[cfg(any(feature = "gui", test))]
 impl AgentGrantView {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "gui"))]
     pub(crate) fn for_test(
         client_session_id: Uuid,
         client_label: impl Into<String>,
@@ -366,7 +366,7 @@ impl RunCoordinator {
     #[cfg(any(feature = "gui", test))]
     fn has_active_run(&self) -> Result<bool, LadonError> {
         let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
-        Ok(state.active.is_some())
+        Ok(state.active.as_ref().is_some_and(|active| active.running))
     }
 
     #[cfg(any(feature = "gui", test))]
@@ -630,7 +630,7 @@ impl LocalBrokerHandle {
             .acknowledge(request_id)
     }
 
-    #[cfg(any(feature = "gui", test))]
+    #[cfg(feature = "gui")]
     pub(crate) fn external_lock_in_progress(&self) -> Result<bool, LadonError> {
         self.ui_locks
             .as_ref()
@@ -779,7 +779,7 @@ impl LocalBrokerHandle {
         Ok(views)
     }
 
-    #[cfg(any(feature = "gui", test))]
+    #[cfg(feature = "gui")]
     pub(crate) fn agent_run_active(&self) -> Result<bool, LadonError> {
         self.coordinator.has_active_run()
     }
@@ -1228,6 +1228,21 @@ mod tests {
                 .try_start(RunCancellation::new(), client)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn reserved_run_is_not_active_until_the_child_reaches_spawn() {
+        let coordinator = Arc::new(RunCoordinator::default());
+        let client = Uuid::new_v4();
+        let lease = coordinator
+            .try_start(RunCancellation::new(), client)
+            .unwrap();
+        lease.set_secret_context(Vec::new()).unwrap();
+
+        assert!(!coordinator.has_active_run().unwrap());
+
+        mark_running_for_test(&lease);
+        assert!(coordinator.has_active_run().unwrap());
     }
 
     #[test]

@@ -19,7 +19,6 @@ use crate::EditSecretDraft;
 
 const MIN_PASSPHRASE_SCALARS: usize = 12;
 const MAX_PASSPHRASE_BYTES: usize = 1024;
-const CLIPBOARD_MILLIS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Default)]
@@ -1021,46 +1020,6 @@ impl SecretDetailState {
     fn drop_sensitive_mode(&mut self) {
         let discarded = std::mem::replace(&mut self.mode, DetailMode::Hidden);
         drop(discarded);
-    }
-}
-
-pub struct ClipboardLease {
-    value: SensitiveBytes,
-    deadline_millis: u64,
-}
-
-impl ClipboardLease {
-    #[must_use]
-    pub const fn new(value: SensitiveBytes, now_millis: u64) -> Self {
-        Self {
-            value,
-            deadline_millis: now_millis.saturating_add(CLIPBOARD_MILLIS),
-        }
-    }
-
-    #[must_use]
-    pub const fn is_expired(&self, now_millis: u64) -> bool {
-        now_millis >= self.deadline_millis
-    }
-
-    #[must_use]
-    pub(crate) fn matches(&self, current_clipboard: &[u8]) -> bool {
-        self.value.expose(|copied| copied == current_clipboard)
-    }
-
-    #[must_use]
-    pub fn should_clear(&self, now_millis: u64, current_clipboard: &[u8]) -> bool {
-        self.is_expired(now_millis) && self.matches(current_clipboard)
-    }
-}
-
-impl fmt::Debug for ClipboardLease {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ClipboardLease")
-            .field("value", &"[REDACTED]")
-            .field("deadline_millis", &self.deadline_millis)
-            .finish()
     }
 }
 

@@ -28,7 +28,7 @@ pub use session_auth::{PinVerification, SessionConfirmation, SessionPin};
 pub use supervisor::{RunCancellation, RunResult, RunTermination, Supervisor};
 pub use touch_id::TouchIdAuthenticator;
 pub use ui::{
-    AddSecretDraft, ClipboardLease, DetailMode, DetailStateError, DraftField, LocalAuthAttempt,
-    NavigationResult, NavigationTarget, PendingRequestView, SecretDetailState, SensitiveText,
-    VaultController, VaultUiPhase, validate_new_passphrase,
+    AddSecretDraft, DetailMode, DetailStateError, DraftField, LocalAuthAttempt, NavigationResult,
+    NavigationTarget, PendingRequestView, SecretDetailState, SensitiveText, VaultController,
+    VaultUiPhase, validate_new_passphrase,
 };

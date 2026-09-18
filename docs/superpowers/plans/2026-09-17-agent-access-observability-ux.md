@@ -1,5 +1,10 @@
 # Agent Access Observability and Secret UX Implementation Plan
 
+> Clipboard lifecycle note (2026-09-18): the product requirement was narrowed
+> to one explicit clipboard write. Task 5's lease, timer, readback, and cleanup
+> design is superseded by the final design spec and is retained below only as
+> historical implementation context.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Show and selectively revoke active agent grants, let MCP sessions report a useful display name, and correct the requested secret reveal/edit/copy and desktop alignment defects.

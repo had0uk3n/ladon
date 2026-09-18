@@ -380,13 +380,13 @@ fn tools() -> Value {
     json!([
         {
             "name": "ladon_status",
-            "description": "Read local Ladon lock/session status. No secret values are returned.",
+            "description": "Read local Ladon lock/session status without opening a prompt. If locked, call ladon_list_secrets or ladon_run to request local unlock; do not ask the user to unlock separately. No secret values are returned.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
         },
         {
             "name": "ladon_list_secrets",
-            "description": "List secret names, IDs, and field names only. Never asks for or returns secret values.",
+            "description": "List secret names, IDs, and field names only. If Ladon is locked, opens its local unlock prompt and waits; do not ask the user to unlock separately or paste secrets.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
         },
@@ -411,7 +411,7 @@ fn tools() -> Value {
         },
         {
             "name": "ladon_run",
-            "description": "Run a local non-interactive program with named secret fields injected via environment, stdin, or a temporary file. Pass references only; never pass a secret value. The command may modify external state.",
+            "description": "Run a local non-interactive program with named secret fields injected via environment, stdin, or a temporary file. Pass references only; never pass a secret value. A locked desktop opens a local unlock prompt and waits, then asks for command approval; do not ask the user to unlock separately. The command may modify external state.",
             "inputSchema": {
                 "type": "object",
                 "required": ["executable"],

@@ -217,8 +217,17 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
 
     pub fn authorize(
         &self,
+        request: PendingApproval,
+        cancellation: &RunCancellation,
+    ) -> Result<GrantTicket, LadonError> {
+        self.authorize_with_wake(request, cancellation, || {})
+    }
+
+    pub(crate) fn authorize_with_wake(
+        &self,
         mut request: PendingApproval,
         cancellation: &RunCancellation,
+        wake: impl FnOnce(),
     ) -> Result<GrantTicket, LadonError> {
         let mut state = self.lock_state()?;
         if !is_app_active(&state) {
@@ -269,6 +278,9 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         self.changed.notify_all();
 
         let deadline = Instant::now() + self.approval_timeout;
+        drop(state);
+        wake();
+        let mut state = self.lock_state()?;
         loop {
             if cancellation.is_cancelled() {
                 clear_pending(&mut state, approval_id);
@@ -602,4 +614,32 @@ fn prune_client_labels<C: MonotonicClock>(state: &mut ApprovalState<C>) {
     state
         .client_labels
         .retain(|client_session_id, _| active_clients.contains(client_session_id));
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn approval_wakes_after_publication_without_holding_the_state_mutex() {
+        let coordinator = ApprovalCoordinator::session_defaults();
+        let request = PendingApproval::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "test agent",
+            vec![ApprovalSecret::new(SecretId::new(), "test", ["value"])],
+            "/usr/bin/true",
+            [] as [&str; 0],
+            "/tmp",
+        );
+        let result = coordinator.authorize_with_wake(request, &RunCancellation::new(), || {
+            let pending = coordinator
+                .pending()
+                .unwrap()
+                .expect("published before waking");
+            coordinator.deny(pending.id()).unwrap();
+        });
+        assert_eq!(result, Err(LadonError::ApprovalDenied));
+        assert!(coordinator.pending().unwrap().is_none());
+    }
 }

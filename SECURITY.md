@@ -12,8 +12,15 @@ authentication, strict protocol bounds, direct process launch, output limits,
 and redaction are in scope.
 
 Windows agent access is not supported yet because the named-pipe transport and
-SID verification are unfinished. Quick PIN, tray persistence, screen-lock
-notifications, signed packages, and automatic updates are also unfinished.
+SID verification are unfinished. Session PIN and macOS menu-bar persistence are
+implemented. Persistent quick unlock after restart, tray support on other
+platforms, screen-lock notifications, signed packages, and automatic updates
+remain unfinished.
+
+Ordinary idle locking retains the vault key in process memory for PIN/Touch ID
+unlock. Use **Lock vault completely** or **Quit** to erase that session. Local
+file audits report heuristic candidate locations, not verified leaks, and do
+not transmit file contents.
 
 ## Reporting a vulnerability
 

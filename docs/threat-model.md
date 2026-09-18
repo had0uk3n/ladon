@@ -26,12 +26,14 @@ plaintext. A launched child is trusted for the fields deliberately injected
 into it and untrusted for all other fields.
 
 `AppLocked` is an additional trust boundary inside the unlocked process. The
-unlocked vault key and session PIN verifier remain in Ladon memory only until
-the original idle deadline; GUI values are wiped, agent admission is closed,
+unlocked vault key and session PIN verifier remain in Ladon memory until hard
+lock or exit; GUI values are wiped, secret use is closed,
 all grants are revoked, and active supervised runs are cancelled before
 completion. This improves accidental-disclosure behavior, but it does not
 improve resistance to a same-user process that can inspect or control Ladon
-memory.
+memory. Locked desktop requests can open a value-free local unlock prompt and
+wait for local authentication. A later hard lock cancels that wait. Unlocking
+does not itself grant the command permission to use secrets.
 
 Secret-bearing runs also require an unexpired in-memory grant for every
 referenced secret. A grant is scoped to a random client-session UUID and an
@@ -123,8 +125,8 @@ secrecy.
    changing an existing client configuration.
 9. Session PIN verifiers, Touch ID choice, pending approvals, and grants are
    memory-only. App lock clears pending approvals and grants but retains the
-   in-memory session confirmation only until the original idle deadline; hard
-   lock and process exit remove it. No native credential store is used.
+   in-memory session confirmation for quick unlock; idle expiry soft-locks
+   configured sessions. Hard lock and process exit remove it. No native credential store is used.
 10. Any new vault unlock lifetime invalidates grants from the preceding one;
    grant expiry or revocation is rechecked before plaintext resolution.
 11. Saving or deleting a secret invalidates every grant for that immutable
@@ -139,7 +141,7 @@ secrecy.
 
 - owner-only Windows named pipe plus server/client SID checks;
 - Unix app-death liveness signal and native Windows ACL/temp cleanup tests;
-- tray/quit lifecycle and screen-lock/suspend integration;
+- native macOS tray/quit release testing, other-platform trays, and screen-lock/suspend integration;
 - independent review of crypto, serialization, IPC, runner, memory lifetime,
   setup edits, and every agent-visible response;
 - release tests and signed artifacts on macOS, Windows, and Linux.

@@ -21,7 +21,6 @@ use crate::PendingRequestView;
 use crate::agent_broker::{AgentGrantView, AppLockAttempt, LocalBrokerHandle};
 use crate::clipboard::SecretClipboard;
 use crate::touch_id::TouchIdAttempt;
-#[cfg(unix)]
 use crate::ui::sanitize_untrusted;
 use crate::{
     AddSecretDraft, DetailMode, LocalAuthAttempt, NavigationResult, NavigationTarget,
@@ -130,6 +129,33 @@ struct LadonDesktop {
     pending_delete: Option<SecretId>,
     last_phase: VaultUiPhase,
     manager_window_active: bool,
+    utilities: DesktopUtilities,
+    #[cfg(unix)]
+    focused_unlock: Option<uuid::Uuid>,
+    focus_auth_input: bool,
+}
+
+#[derive(Default)]
+struct DesktopUtilities {
+    tray: Option<crate::tray::Tray>,
+    quitting: bool,
+    scan_open: bool,
+    scan_path: String,
+    scan_task: Option<ScanTask>,
+    scan_report: Option<crate::exposure_scan::ScanReport>,
+    scan_error: bool,
+}
+
+struct ScanTask {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    result: std::sync::mpsc::Receiver<std::io::Result<crate::exposure_scan::ScanReport>>,
+}
+
+impl Drop for ScanTask {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(unix)]
@@ -346,7 +372,143 @@ impl LadonDesktop {
             pending_delete: None,
             last_phase,
             manager_window_active: false,
+            utilities: DesktopUtilities {
+                tray: crate::tray::Tray::new(context.egui_ctx.clone()),
+                ..Default::default()
+            },
+            #[cfg(unix)]
+            focused_unlock: None,
+            focus_auth_input: false,
         })
+    }
+
+    fn process_tray(&mut self, context: &egui::Context) {
+        while let Some(action) = self
+            .utilities
+            .tray
+            .as_ref()
+            .and_then(|tray| tray.try_event())
+        {
+            match action {
+                crate::tray::TrayAction::Open => focus_window(context),
+                crate::tray::TrayAction::LockApp => self.lock_app(),
+                crate::tray::TrayAction::LockVault => self.lock_immediately(),
+                crate::tray::TrayAction::Quit => {
+                    self.lock_immediately();
+                    self.utilities.quitting = true;
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if !self.utilities.quitting
+            && self.utilities.tray.is_some()
+            && context.input(|input| input.viewport().close_requested())
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.lock_app();
+            context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    fn show_exposure_scan(&mut self, context: &egui::Context) {
+        egui::TopBottomPanel::bottom("local-audit-button").show(context, |ui| {
+            if quiet_button(ui, "Find exposed secrets…").clicked() {
+                self.utilities.scan_open = true;
+                if self.utilities.scan_path.is_empty() {
+                    self.utilities.scan_path = env::var("HOME")
+                        .or_else(|_| env::var("USERPROFILE"))
+                        .unwrap_or_default();
+                }
+            }
+        });
+        let result =
+            self.utilities
+                .scan_task
+                .as_ref()
+                .and_then(|task| match task.result.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err(std::io::Error::other("scan worker unavailable")))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(result) = result {
+            self.utilities.scan_task = None;
+            self.utilities.scan_error = result.is_err();
+            self.utilities.scan_report = result.ok();
+        }
+        if !self.utilities.scan_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Exposed secrets on this device")
+            .open(&mut open).default_width(540.0).resizable(true)
+            .vscroll(true).max_height((context.screen_rect().height() - 40.0).max(180.0))
+            .show(context, |ui| {
+                ui.label("Scan a local folder for likely plaintext credentials. Nothing is uploaded.");
+                ui.label("Values are never shown. Findings are candidates, not verified active credentials.");
+                ui.add_enabled(self.utilities.scan_task.is_none(), TextEdit::singleline(&mut self.utilities.scan_path).desired_width(f32::INFINITY).hint_text("Absolute folder path"));
+                if self.utilities.scan_task.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner(); ui.label("Scanning…");
+                        if quiet_button(ui, "Cancel").clicked() {
+                            if let Some(task) = &self.utilities.scan_task { task.cancel.store(true, std::sync::atomic::Ordering::Relaxed); }
+                        }
+                    });
+                } else if primary_button(ui, "Analyze folder").clicked() {
+                    self.start_exposure_scan(context);
+                }
+                if self.utilities.scan_error { ui.colored_label(DANGER, "Could not scan this folder. Check its path and read permissions."); }
+                if let Some(report) = &self.utilities.scan_report {
+                    ui.heading(format!("{} likely exposed secrets", report.findings.len()));
+                    ui.label(format!("{} text files checked · {} files skipped", report.files_scanned, report.skipped_files));
+                    if report.incomplete { ui.colored_label(AMBER, "Partial scan: cancelled, unreadable paths or a scan limit reached."); }
+                    ui.label("Build/vendor folders, symlinks, binary and large files are excluded. A zero count does not prove there are no secrets.");
+                    egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
+                        for finding in &report.findings {
+                            let rule = match finding.rule {
+                                crate::exposure_scan::ExposureRule::CredentialAssignment => "Credential assignment",
+                                crate::exposure_scan::ExposureRule::PrivateKeyHeader => "Private key",
+                            };
+                            ui.label(format!("{}:{} — {}", sanitize_untrusted(&finding.path.to_string_lossy()), finding.line, rule));
+                        }
+                    });
+                }
+            });
+        self.utilities.scan_open = open;
+        if !open {
+            self.utilities.scan_task = None;
+        }
+    }
+
+    fn start_exposure_scan(&mut self, context: &egui::Context) {
+        let path = PathBuf::from(self.utilities.scan_path.trim());
+        self.utilities.scan_report = None;
+        self.utilities.scan_error = false;
+        if !path.is_absolute() {
+            self.utilities.scan_error = true;
+            return;
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        let repaint = context.clone();
+        let worker = std::thread::Builder::new()
+            .name("ladon-exposure-scan".to_owned())
+            .spawn(move || {
+                let report = crate::exposure_scan::scan_directory(
+                    &path,
+                    &worker_cancel,
+                    &crate::exposure_scan::ScanLimits::default(),
+                );
+                let _ = sender.send(report);
+                repaint.request_repaint();
+            });
+        if worker.is_ok() {
+            self.utilities.scan_task = Some(ScanTask { cancel, result });
+        } else {
+            self.utilities.scan_error = true;
+        }
     }
 
     fn show_first_run(&mut self, ui: &mut egui::Ui) {
@@ -381,9 +543,14 @@ impl LadonDesktop {
         centered_column(ui, |ui| {
             ui.label(RichText::new("Vault locked").size(28.0).color(INK));
             ui.add_space(8.0);
-            ui.label(RichText::new("Unlock it for 30 minutes of secret activity.").color(MUTED));
+            ui.label(
+                RichText::new("Enter your master password to start a new session.").color(MUTED),
+            );
             ui.add_space(22.0);
-            let response = password_field(ui, &mut self.passphrase, "Passphrase");
+            let response = password_field(ui, &mut self.passphrase, "Master password");
+            if std::mem::take(&mut self.focus_auth_input) {
+                response.request_focus();
+            }
             let submit =
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             ui.add_space(18.0);
@@ -470,7 +637,7 @@ impl LadonDesktop {
                     Ok(pin) => {
                         self.session_confirmation = Some(SessionConfirmation::with_pin(pin));
                         self.notice = Some(Notice {
-                            text: "Session PIN set; it will be forgotten when the vault locks"
+                            text: "PIN set for this app session; five wrong attempts require the master password"
                                 .to_owned(),
                             danger: false,
                         });
@@ -1635,6 +1802,10 @@ impl LadonDesktop {
     }
 
     fn lock_app_with_touch_id_availability(&mut self, touch_id_available: bool) {
+        if self.desktop_lock != DesktopLockState::Active {
+            self.clear_for_app_lock();
+            return;
+        }
         let can_unlock = touch_id_available
             || self
                 .session_confirmation
@@ -1715,7 +1886,15 @@ impl LadonDesktop {
             ui.add_space(8.0);
             ui.label(RichText::new("App locked").color(MUTED));
             ui.add_space(22.0);
-            let mut focus_pin = false;
+            let mut focus_pin = std::mem::take(&mut self.focus_auth_input);
+            if !TouchIdAuthenticator::is_available()
+                && self
+                    .session_confirmation
+                    .as_ref()
+                    .is_some_and(SessionConfirmation::has_pin)
+            {
+                self.app_unlock_pin_visible = true;
+            }
             if !self.app_unlock_pin_visible && primary_button(ui, "Unlock").clicked() {
                 focus_pin = self.begin_app_unlock() == AppUnlockStart::Pin;
             }
@@ -1871,6 +2050,10 @@ impl LadonDesktop {
 
         match result {
             Ok(()) => {
+                let _ = with_controller(&self.controller, |controller| {
+                    controller.record_secret_activity();
+                    Ok(())
+                });
                 self.desktop_lock = DesktopLockState::Active;
                 self.app_unlock_pin_visible = false;
                 self.notice = Some(Notice {
@@ -1917,6 +2100,88 @@ impl LadonDesktop {
             Ok(()) => self.notice = None,
             Err(error) => self.notice_from(Err(error), ""),
         }
+    }
+
+    fn handle_idle_timeout(&mut self) {
+        if self.session_confirmation.is_some() {
+            if self.desktop_lock == DesktopLockState::Active {
+                self.lock_app();
+            }
+            return;
+        }
+        #[cfg(unix)]
+        let locked = self
+            .broker
+            .as_ref()
+            .map_or_else(
+                || {
+                    with_controller(&self.controller, |controller| {
+                        Ok(controller.auto_lock_if_idle())
+                    })
+                },
+                |broker| broker.auto_lock_controller_if_idle(&self.controller),
+            )
+            .unwrap_or(false);
+        #[cfg(not(unix))]
+        let locked = with_controller(&self.controller, |controller| {
+            Ok(controller.auto_lock_if_idle())
+        })
+        .unwrap_or(false);
+        self.finish_auto_lock(locked);
+    }
+
+    #[cfg(unix)]
+    fn show_unlock_request(&mut self, context: &egui::Context) {
+        let pending = self
+            .broker
+            .as_ref()
+            .and_then(|broker| broker.pending_unlock().ok().flatten());
+        let Some(pending) = pending else {
+            self.focused_unlock = None;
+            return;
+        };
+        if self.focused_unlock != Some(pending.id) {
+            self.focused_unlock = Some(pending.id);
+            self.utilities.scan_open = false;
+            self.focus_auth_input = true;
+            context.send_viewport_cmd(egui::ViewportCommand::InnerSize([600.0, 540.0].into()));
+            focus_window(context);
+        }
+        let ready = self.desktop_lock == DesktopLockState::Active
+            && self.session_confirmation.is_some()
+            && with_controller(&self.controller, |controller| {
+                Ok(controller.phase() == VaultUiPhase::Unlocked)
+            })
+            .unwrap_or(false);
+        if ready {
+            if let Some(broker) = &self.broker {
+                let _ = broker.resolve_unlock(pending.id, true);
+            }
+            return;
+        }
+        egui::TopBottomPanel::top("unlock-request").show(context, |ui| {
+            ui.label(
+                RichText::new("Agent is waiting for Ladon")
+                    .strong()
+                    .color(COBALT),
+            );
+            ui.label(format!(
+                "Reported client: {}",
+                sanitize_untrusted(&pending.client_label)
+            ));
+            ui.label(&pending.purpose);
+            ui.horizontal(|ui| {
+                ui.label("Unlock below to continue this request.");
+                if quiet_button(ui, "Deny request").clicked() {
+                    if let Some(broker) = &self.broker {
+                        let _ = broker.resolve_unlock(pending.id, false);
+                    }
+                    self.local_pin.clear();
+                    self.passphrase.clear();
+                    self.pending_touch_id = None;
+                }
+            });
+        });
     }
 
     fn finish_auto_lock(&mut self, auto_locked: bool) {
@@ -1967,6 +2232,9 @@ impl LadonDesktop {
     }
 
     fn clear_sensitive_buffers(&mut self) {
+        self.utilities.scan_task = None;
+        self.utilities.scan_report = None;
+        self.utilities.scan_open = false;
         self.clear_unlock_fields();
         self.session_pin.clear();
         self.session_pin_confirmation.clear();
@@ -2057,7 +2325,7 @@ impl LadonDesktop {
             &mut self.local_pin,
             Some(pending.id()),
         ) {
-            context.send_viewport_cmd(egui::ViewportCommand::Focus);
+            focus_window(context);
         }
 
         let view = PendingRequestView::from_approval(&pending, Duration::from_secs(2 * 60));
@@ -2403,26 +2671,19 @@ fn unlock_instance_file(file: &File) {
 
 impl eframe::App for LadonDesktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_tray(context);
         #[cfg(unix)]
         self.process_external_lock();
 
-        #[cfg(unix)]
-        let auto_locked = if let Some(broker) = &self.broker {
-            broker
-                .auto_lock_controller_if_idle(&self.controller)
-                .unwrap_or(false)
-        } else {
-            with_controller(&self.controller, |controller| {
-                Ok(controller.auto_lock_if_idle())
-            })
-            .unwrap_or(false)
-        };
-        #[cfg(not(unix))]
-        let auto_locked = with_controller(&self.controller, |controller| {
-            Ok(controller.auto_lock_if_idle())
+        let idle = with_controller(&self.controller, |controller| {
+            Ok(controller
+                .remaining_unlocked()
+                .is_some_and(|remaining| remaining.is_zero()))
         })
         .unwrap_or(false);
-        self.finish_auto_lock(auto_locked);
+        if idle {
+            self.handle_idle_timeout();
+        }
         context.request_repaint_after(Duration::from_secs(1));
 
         #[cfg(unix)]
@@ -2448,7 +2709,8 @@ impl eframe::App for LadonDesktop {
                 && self.desktop_lock == DesktopLockState::Active
                 && self.session_confirmation.is_some(),
         );
-        if phase == VaultUiPhase::Unlocked
+        if self.utilities.tray.is_none()
+            && phase == VaultUiPhase::Unlocked
             && self.desktop_lock == DesktopLockState::Active
             && context.input(|input| input.viewport().close_requested())
             && self.detail.request_navigation(NavigationTarget::Close)
@@ -2457,6 +2719,9 @@ impl eframe::App for LadonDesktop {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.discard_confirmation = true;
         }
+        self.show_exposure_scan(context);
+        #[cfg(unix)]
+        self.show_unlock_request(context);
         match phase {
             VaultUiPhase::FirstRun => shell(context, |ui| self.show_first_run(ui)),
             VaultUiPhase::Locked => shell(context, |ui| self.show_locked(ui)),
@@ -2572,6 +2837,13 @@ fn configure_style(context: &egui::Context) {
         FontId::new(15.0, FontFamily::Proportional),
     );
     context.set_style(style);
+}
+
+fn focus_window(context: &egui::Context) {
+    context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    context.send_viewport_cmd(egui::ViewportCommand::Focus);
+    crate::tray::focus_application();
 }
 
 fn shell(context: &egui::Context, content: impl FnOnce(&mut egui::Ui)) {
@@ -3433,6 +3705,10 @@ mod tests {
                 pending_delete: None,
                 last_phase: VaultUiPhase::Unlocked,
                 manager_window_active: true,
+                utilities: DesktopUtilities::default(),
+                #[cfg(unix)]
+                focused_unlock: None,
+                focus_auth_input: false,
             },
             endpoint,
             directory,
@@ -3950,7 +4226,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn app_lock_and_unlock_do_not_extend_the_controller_idle_deadline() {
+    fn authenticated_app_unlock_starts_a_fresh_idle_interval() {
         let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
         let before = app.controller.lock().unwrap().remaining_unlocked().unwrap();
 
@@ -3969,7 +4245,7 @@ mod tests {
         let after_unlock = app.controller.lock().unwrap().remaining_unlocked().unwrap();
 
         assert!(after_lock <= before);
-        assert!(after_unlock <= after_lock);
+        assert!(after_unlock > after_lock);
         assert!(before.saturating_sub(after_unlock) < Duration::from_secs(1));
     }
 
@@ -3989,18 +4265,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn idle_expiry_while_app_locked_clears_the_retained_confirmation() {
+    fn idle_expiry_while_app_locked_retains_quick_unlock() {
         let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
         app.desktop_lock_epoch = 4;
         app.desktop_lock = DesktopLockState::Locked { epoch: 4 };
         app.clear_for_app_lock();
-        app.controller.lock().unwrap().lock();
+        app.handle_idle_timeout();
 
-        app.finish_auto_lock(true);
+        assert_eq!(
+            app.controller.lock().unwrap().phase(),
+            VaultUiPhase::Unlocked
+        );
+        assert_eq!(app.desktop_lock, DesktopLockState::Locked { epoch: 4 });
+        assert!(app.session_confirmation.is_some());
+    }
 
-        assert_eq!(app.controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+    #[cfg(unix)]
+    #[test]
+    fn idle_lock_and_repeated_lock_keep_pin_unlock_available() {
+        let (mut app, _endpoint, _directory) = app_with_sensitive_detail(false);
+        app.handle_idle_timeout();
+        finish_pending_app_lock(&mut app);
+        let locked = app.desktop_lock;
+        app.local_pin = SensitiveText::from("1234");
+        app.begin_app_unlock_with(true, || TouchIdAttempt::spawn_with(|_| Ok(())));
+        assert!(app.pending_touch_id.is_some());
+        app.lock_app();
+        assert_eq!(app.desktop_lock, locked);
+        assert!(app.pending_touch_id.is_none());
+        assert!(app.local_pin.as_str().is_empty());
+        assert_eq!(
+            app.controller.lock().unwrap().phase(),
+            VaultUiPhase::Unlocked
+        );
+        assert!(!app.detail.has_sensitive_buffer());
+        assert!(app.session_confirmation.as_ref().unwrap().has_pin());
+        app.use_app_unlock_pin();
+        app.local_pin = SensitiveText::from("1234");
+        app.authenticate_app_pin();
         assert_eq!(app.desktop_lock, DesktopLockState::Active);
-        assert!(app.session_confirmation.is_none());
     }
 
     #[cfg(unix)]
@@ -4535,6 +4838,10 @@ mod tests {
             pending_delete: None,
             last_phase: VaultUiPhase::Unlocked,
             manager_window_active: true,
+            utilities: DesktopUtilities::default(),
+            #[cfg(unix)]
+            focused_unlock: None,
+            focus_auth_input: false,
         };
         app.desktop_lock_epoch = 5;
         app.desktop_lock = DesktopLockState::Locked { epoch: 5 };
@@ -4611,6 +4918,10 @@ mod tests {
             pending_delete: Some(SecretId::new()),
             last_phase: VaultUiPhase::Unlocked,
             manager_window_active: true,
+            utilities: DesktopUtilities::default(),
+            #[cfg(unix)]
+            focused_unlock: None,
+            focus_auth_input: false,
         };
         app.desktop_lock_epoch = 6;
         app.desktop_lock = DesktopLockState::Locking { epoch: 6 };

@@ -33,12 +33,18 @@ results:
 
 ```text
 AppLocked status => state "locked", idle_remaining_ms absent/null
-AppLocked list   => vault_locked
-AppLocked run    => vault_locked
+AppLocked list   => local unlock prompt, then metadata after authentication
+AppLocked run    => local unlock prompt, then ordinary command approval
 AppLocked lock   => success after hard vault lock
 ```
 
-No RPC can request soft lock, start Touch ID, submit a PIN, or unlock the app.
+List/run on a desktop broker can request an unlock prompt, never submit a PIN,
+perform authentication, or bypass command approval. Status remains silent.
+A locked request waits up to two minutes for local authentication; denial,
+disconnection, shutdown, timeout or a subsequent hard lock terminates it.
+Only one unlock request waits at a time (others receive `busy`). The request
+is bound to a lock generation so an intervening hard lock invalidates it.
+Headless brokers retain `vault_locked`. No wire schema changes are needed.
 The agent-facing `lock` operation always performs the full vault lock and
 requires the passphrase for a subsequent unlock.
 

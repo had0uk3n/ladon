@@ -198,7 +198,7 @@ fn set_codex_entry(document: &mut DocumentMut, executable: &Path) -> Result<(), 
     let mut arguments = Array::new();
     arguments.push("mcp");
     ladon["args"] = value(arguments);
-    ladon["tool_timeout_sec"] = value(960);
+    ladon["tool_timeout_sec"] = value(1200);
     ladon.remove("url");
     ladon.remove("experimental_environment");
     Ok(())

@@ -28,8 +28,9 @@ owner-authenticated named-pipe transport is not implemented yet.
 - preview-before-write `ladon integrate codex|claude`, with a timestamped
   configuration backup and idempotent updates.
 
-Tray/background lifecycle, OS screen-lock handling, Windows named pipes, binary
-file drag-and-drop, and signed installers remain release work.
+On macOS, Ladon stays available in the menu bar when its window closes.
+OS screen-lock handling, tray support on other platforms, Windows named pipes,
+binary file drag-and-drop, and signed installers remain release work.
 
 ## Build and run
 
@@ -56,18 +57,18 @@ configuring a 4–12 digit session PIN is required before secret use. Five
 consecutive wrong PIN submissions lock the vault; a successful PIN or Touch ID
 confirmation resets the counter. The PIN verifier and all agent permissions
 stay only in memory. A hard vault lock or process exit forgets the PIN verifier;
-**Lock app** revokes all agent permissions while retaining the verifier only
-until the original idle deadline. The resulting release binaries do not require
+**Lock app** and the 30-minute idle timeout revoke agent permissions while
+retaining the vault key and PIN verifier for the running app session. The resulting release binaries do not require
 Rust to be installed on the computer where they run.
 
 While the vault is unlocked, choose **Lock app** for a temporary UI lock. It
 clears the visible selection, reveal and edit buffers, pending approvals, and
 all agent grants, closes agent admission, and cancels the active agent run
 before the lock completes. The unlocked vault key and session PIN verifier
-remain available only until the original idle deadline. One **Unlock** click
+remain available until an explicit hard lock, the fifth wrong PIN, or exit. One **Unlock** click
 starts Touch ID when it is
 available; when a session PIN is configured, **Use PIN instead** provides the
-fallback. App lock and app unlock do not extend the idle deadline. Choose
+fallback. Successful authentication starts a fresh 30-minute idle interval. Choose
 **Lock vault completely** when the passphrase should be required again.
 
 ## Viewing and editing a secret
@@ -110,8 +111,8 @@ Configure a local coding agent after reviewing the displayed change:
 
 The generated configuration contains only the absolute path to `ladon mcp`.
 It never contains vault values or credentials. Codex is configured with a
-16-minute MCP tool timeout so Ladon's bounded 15-minute MCP run can report
-cleanup and redaction results.
+20-minute MCP tool timeout to allow the 15-minute run, local unlock/approval
+waits, cleanup and redaction. Re-run integration to update an older timeout.
 
 ## Generic runner
 
@@ -178,9 +179,10 @@ authorized command is still finishing, the empty grant list stays hidden but
 the GUI keeps an **Agent command running** indicator and **Revoke all** control.
 
 **Lock app** is a soft UI lock. It revokes grants, cancels the active run,
-closes agent admission, and makes `list` and `run` return `vault_locked`; it
-retains the unlocked vault key and session PIN verifier only until the original
-idle deadline. Use the local GUI's **Unlock** action to resume, with Touch ID
+and prevents secret use until local authentication. The vault key and PIN
+verifier remain in this running process. Locked `list` and `run` requests open
+an unlock prompt and wait; they resume after local authentication. Use **Unlock**
+to resume, with Touch ID
 started by the first click when available and **Use PIN instead** when a session
 PIN is configured. A hard vault lock drops the unlocked session and requires
 the passphrase again. The MCP `lock` operation always performs that full vault
@@ -190,9 +192,33 @@ Saving or deleting a secret also revokes every existing grant for that immutable
 secret ID. Agent-facing CLI, MCP, and local IPC APIs remain value-free: they
 expose metadata and redacted run results, never a secret-value read or export.
 
-If an app or vault lock is active, the request returns `vault_locked`; unlock
-Ladon in the local GUI and retry it. An approval waits for at most two minutes
-and starts no child process before confirmation.
+An incoming locked request restores and focuses Ladon, including from the
+macOS menu bar. Unlock with PIN/Touch ID after ordinary app/idle locking, or
+with the master password after a hard lock or restart. The request continues
+automatically. Unlock waiting and subsequent command approval each allow two
+minutes; denial, connection loss, shutdown, or a later hard lock cancels the
+wait. A run still displays its command and required secrets for approval before
+starting a child. `status` never opens a prompt. Non-desktop brokers retain the
+immediate `vault_locked` response.
+
+## Menu bar and local exposure audit
+
+On macOS the **Ladon** menu provides **Open Ladon**, **Lock app**,
+**Lock vault completely**, and **Quit**. Closing the window hides and app-locks
+it, discarding visible values and unsaved edits. **Quit** fully locks and exits.
+PIN/Touch ID are session-only; restarting still requires the master password.
+
+**Find exposed secrets…** opens a local folder audit. Enter an absolute folder
+path and choose **Analyze folder**. Results show the number of likely plaintext
+credential assignments/private keys, file paths and line numbers; values and
+source snippets are never shown or uploaded. It does not check internet leaks
+or validate whether credentials work. Counts represent candidate occurrences,
+so copies count separately and false positives/negatives are possible.
+
+Scans run in a cancellable background worker with 2 MiB per-file, 100 MiB total,
+20,000 text-file, 100,000 directory-entry, 32-level, 30-second and 1,000-finding
+limits. Symlinks, binary files and common build/vendor/VCS directories are
+excluded. Partial coverage is labeled; zero findings is not proof of no secrets.
 
 ## Security boundary
 

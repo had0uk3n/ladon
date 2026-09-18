@@ -14,6 +14,9 @@ use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "gui", test))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+#[cfg(any(feature = "gui", test))]
+use crate::unlock_request::PendingUnlock;
+use crate::unlock_request::UnlockRequests;
 use ladon_core::{
     LadonError, RpcMethod, RpcRequest, RpcResponse, RpcResult, RunCaller, RunRequest,
     SecretFieldSummary, SecretId, SecretSummary, validate_run_request,
@@ -123,6 +126,7 @@ struct RunBlock {
 }
 
 struct UiLockCoordinator {
+    unlock_requests: UnlockRequests,
     state: Mutex<UiLockState>,
     changed: Condvar,
     wake_ui: Arc<dyn Fn() + Send + Sync>,
@@ -166,6 +170,7 @@ impl UiLockCoordinator {
     #[cfg(any(feature = "gui", test))]
     fn new(wake_ui: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
+            unlock_requests: UnlockRequests::default(),
             state: Mutex::new(UiLockState {
                 connected: true,
                 ..UiLockState::default()
@@ -190,6 +195,7 @@ impl UiLockCoordinator {
             .requested
             .checked_add(1)
             .ok_or(LadonError::ProcessFailure)?;
+        self.unlock_requests.cancel()?;
         Ok(state.requested)
     }
 
@@ -243,6 +249,11 @@ impl UiLockCoordinator {
         )
     }
 
+    fn unlock_blocked(&self) -> Result<bool, LadonError> {
+        let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        Ok(!state.connected || state.local_operation || state.requested > state.acknowledged)
+    }
+
     #[cfg(any(feature = "gui", test))]
     fn request_in_progress(&self) -> Result<bool, LadonError> {
         let state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
@@ -267,6 +278,7 @@ impl UiLockCoordinator {
     fn disconnect(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.connected = false;
+            let _ = self.unlock_requests.cancel();
             self.changed.notify_all();
         }
     }
@@ -693,6 +705,9 @@ impl LocalBrokerHandle {
         } else {
             None
         };
+        if let Some(ui) = &self.ui_locks {
+            ui.unlock_requests.cancel()?;
+        }
         lock_controller_and_runs(&self.coordinator, &self.approval, controller, None)
     }
 
@@ -711,6 +726,22 @@ impl LocalBrokerHandle {
             self.approval.reset_after_vault_lock()?;
         }
         Ok(locked)
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn pending_unlock(&self) -> Result<Option<PendingUnlock>, LadonError> {
+        self.ui_locks
+            .as_ref()
+            .map_or(Ok(None), |ui| ui.unlock_requests.pending())
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn resolve_unlock(&self, id: Uuid, allow: bool) -> Result<(), LadonError> {
+        self.ui_locks
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)?
+            .unlock_requests
+            .resolve(id, allow)
     }
 
     pub fn pending_approval(&self) -> Result<Option<PendingApproval>, LadonError> {
@@ -934,6 +965,11 @@ impl AgentBroker {
                 })
             }
             RpcMethod::List => {
+                self.await_local_unlock(
+                    &client_label,
+                    "List secret names",
+                    &connection_cancellation,
+                )?;
                 self.approval.require_app_active()?;
                 let controller = self.controller()?;
                 if controller.phase() != VaultUiPhase::Unlocked {
@@ -975,7 +1011,6 @@ impl AgentBroker {
                 timeout_ms,
                 output_limit_bytes,
             } => {
-                self.approval.require_app_active()?;
                 if self.shutting_down.load(Ordering::Acquire) {
                     return Err(LadonError::EndpointUnavailable);
                 }
@@ -990,6 +1025,11 @@ impl AgentBroker {
                     },
                     RunCaller::Cli,
                 )?;
+                self.await_local_unlock(
+                    &client_label,
+                    "Run a command (review follows unlock)",
+                    &connection_cancellation,
+                )?;
                 let cancellation = connection_cancellation;
                 let run_lease = self
                     .coordinator
@@ -1001,7 +1041,7 @@ impl AgentBroker {
                 if !validated.bindings().is_empty() {
                     let approval_plan = self.controller()?.approval_plan(validated.bindings())?;
                     run_lease.set_secret_context(approval_plan.binding_secret_ids.clone())?;
-                    let ticket = self.approval.authorize(
+                    let ticket = self.approval.authorize_with_wake(
                         PendingApproval::new(
                             approval_plan.vault_session_id,
                             client_session_id,
@@ -1012,6 +1052,11 @@ impl AgentBroker {
                             validated.working_directory(),
                         ),
                         &cancellation,
+                        || {
+                            if let Some(ui) = &self.ui_locks {
+                                (ui.wake_ui)();
+                            }
+                        },
                     )?;
                     let binding_secret_ids = approval_plan.binding_secret_ids;
                     let result = self.supervisor.run_guarded(
@@ -1043,6 +1088,48 @@ impl AgentBroker {
                 run_result(result)
             }
         }
+    }
+
+    fn await_local_unlock(
+        &self,
+        client_label: &str,
+        purpose: &str,
+        cancellation: &RunCancellation,
+    ) -> Result<(), LadonError> {
+        let Some(ui) = self.ui_locks.as_ref() else {
+            return self.approval.require_app_active();
+        };
+        let epoch = ui.unlock_requests.epoch();
+        if self.approval.app_access_state()? == AppAccessState::Active
+            && self.controller()?.phase() == VaultUiPhase::Unlocked
+        {
+            return Ok(());
+        }
+        if self.shutting_down.load(Ordering::Acquire) || ui.unlock_blocked()? {
+            return Err(LadonError::ApprovalCancelled);
+        }
+        ui.unlock_requests.wait(
+            epoch,
+            client_label,
+            purpose,
+            cancellation,
+            crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+            || {
+                if self.shutting_down.load(Ordering::Acquire) || ui.unlock_blocked().unwrap_or(true)
+                {
+                    let _ = ui.unlock_requests.cancel();
+                }
+                (ui.wake_ui)();
+            },
+        )?;
+        if self.shutting_down.load(Ordering::Acquire) || ui.unlock_blocked()? {
+            return Err(LadonError::ApprovalCancelled);
+        }
+        self.approval.require_app_active()?;
+        if self.controller()?.phase() != VaultUiPhase::Unlocked {
+            return Err(LadonError::VaultLocked);
+        }
+        Ok(())
     }
 
     fn controller(&self) -> Result<std::sync::MutexGuard<'_, VaultController>, LadonError> {
@@ -1797,6 +1884,89 @@ mod tests {
         assert_eq!(approval.app_access_state().unwrap(), AppAccessState::Active);
     }
 
+    fn wait_for_unlock(handle: &LocalBrokerHandle) -> PendingUnlock {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(pending) = handle.pending_unlock().unwrap() {
+                return pending;
+            }
+            assert!(Instant::now() < deadline, "unlock prompt did not appear");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn locked_requests_resume_after_local_unlock_and_run_still_needs_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let passphrase = SensitiveText::from("correct horse");
+        let mut vault = VaultController::new(directory.path().join("vault.ladon"));
+        vault.create(&passphrase, &passphrase).unwrap();
+        let mut secret = AddSecretDraft::new();
+        secret.set_name("app-lock-token");
+        secret.fields_mut()[0]
+            .value_mut()
+            .push_str("synthetic-token");
+        vault.add_secret(&mut secret).unwrap();
+        vault.lock();
+        let controller = Arc::new(Mutex::new(vault));
+        let endpoint = directory.path().join("broker.sock");
+        let handle = LocalBrokerHandle::start_at_for_desktop(
+            Arc::clone(&controller),
+            &endpoint,
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let client = LocalClient::new(&endpoint);
+        let session = Uuid::new_v4();
+        let waiting_client = client.clone();
+        let list =
+            thread::spawn(move || waiting_client.call(&request_for(session, RpcMethod::List)));
+        let pending = wait_for_unlock(&handle);
+        assert!(!list.is_finished());
+        assert!(handle.pending_approval().unwrap().is_none());
+        controller.lock().unwrap().unlock(&passphrase).unwrap();
+        handle.resolve_unlock(pending.id, true).unwrap();
+        assert!(matches!(
+            list.join().unwrap().unwrap().result(),
+            Some(RpcResult::List { .. })
+        ));
+
+        let attempt = handle.begin_app_lock().unwrap();
+        wait_for_app_lock_result(&attempt).unwrap();
+        let method = secret_run(directory.path());
+        let waiting_client = client.clone();
+        let run = thread::spawn(move || waiting_client.call(&request_for(session, method)));
+        let pending = wait_for_unlock(&handle);
+        assert!(!run.is_finished());
+        assert!(handle.pending_approval().unwrap().is_none());
+        handle.unlock_app(attempt.epoch()).unwrap();
+        handle.resolve_unlock(pending.id, true).unwrap();
+        let approval = wait_for_pending_approval(&handle);
+        assert!(!run.is_finished());
+        handle.approve(approval.id()).unwrap();
+        assert!(matches!(
+            run.join().unwrap().unwrap().result(),
+            Some(RpcResult::Run {
+                exit_code: Some(0),
+                ..
+            })
+        ));
+
+        controller.lock().unwrap().lock();
+        let waiting = thread::spawn(move || client.call(&request_for(session, RpcMethod::List)));
+        let _pending = wait_for_unlock(&handle);
+        handle.cancel_active_run_and_lock(&controller).unwrap();
+        assert_eq!(
+            waiting
+                .join()
+                .unwrap()
+                .unwrap()
+                .error_details()
+                .map(|(code, _)| code),
+            Some("approval_cancelled")
+        );
+    }
+
     #[test]
     fn app_lock_fails_closed_over_the_socket_and_keeps_hard_lock_callable() {
         let directory = tempfile::tempdir().unwrap();
@@ -1845,20 +2015,30 @@ mod tests {
                 idle_remaining_ms: None
             }) if state == "locked"
         ));
-        let list = client
-            .call(&request_for(client_session_id, RpcMethod::List))
-            .unwrap();
-        assert_eq!(
-            list.error_details(),
-            Some(("vault_locked", "vault is locked"))
-        );
-        let run = client
-            .call(&request_for(client_session_id, plain_run(directory.path())))
-            .unwrap();
-        assert_eq!(
-            run.error_details(),
-            Some(("vault_locked", "vault is locked"))
-        );
+        for method in [RpcMethod::List, plain_run(directory.path())] {
+            let waiting_client = client.clone();
+            let waiting =
+                thread::spawn(move || waiting_client.call(&request_for(client_session_id, method)));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let pending = loop {
+                if let Some(pending) = handle.pending_unlock().unwrap() {
+                    break pending;
+                }
+                assert!(Instant::now() < deadline, "unlock prompt never appeared");
+                thread::yield_now();
+            };
+            assert!(!waiting.is_finished());
+            handle.resolve_unlock(pending.id, false).unwrap();
+            assert_eq!(
+                waiting
+                    .join()
+                    .unwrap()
+                    .unwrap()
+                    .error_details()
+                    .map(|(code, _)| code),
+                Some("approval_denied")
+            );
+        }
 
         handle.unlock_app(attempt.epoch()).unwrap();
         let list = client
@@ -1906,7 +2086,7 @@ mod tests {
             Err(LadonError::InvalidRequest)
         );
 
-        let debug = format!("{status:?}{list:?}{run:?}{denied:?}");
+        let debug = format!("{status:?}{list:?}{denied:?}");
         assert!(!debug.contains("fake-app-lock-secret"));
     }
 

@@ -45,7 +45,7 @@ fn codex_edit_is_backed_up_scoped_and_idempotent() {
     assert!(updated.contains("model = \"keep-me\""));
     assert!(updated.contains("[mcp_servers.other]"));
     assert!(updated.contains("[mcp_servers.ladon]"));
-    assert!(updated.contains("tool_timeout_sec = 960"));
+    assert!(updated.contains("tool_timeout_sec = 1200"));
     assert!(!updated.contains("experimental_environment"));
 
     let second = apply_integration_config(IntegrationTarget::Codex, &config, &executable).unwrap();

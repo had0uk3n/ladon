@@ -5,13 +5,19 @@ mod approval;
 mod clipboard;
 #[cfg(feature = "gui")]
 mod desktop;
+#[cfg(feature = "gui")]
+mod exposure_scan;
 #[cfg(unix)]
 mod ipc;
 mod secret_editor;
 mod session_auth;
 mod supervisor;
 mod touch_id;
+#[cfg(feature = "gui")]
+mod tray;
 mod ui;
+#[cfg(unix)]
+mod unlock_request;
 
 #[cfg(unix)]
 pub use agent_broker::LocalBrokerHandle;

@@ -163,9 +163,13 @@ The new name reaches the GUI on the next broker request. It does not change
 the session ID, grant duration, or permissions, and does not authenticate a chat.
 
 The first run from an MCP process that needs a particular secret opens a local
-approval window. Confirm once with the session PIN or Touch ID and that MCP
-process may use the displayed secret for a fixed 30 minutes; use does not extend
-the timer. A different MCP process or another secret asks separately. The GUI's
+approval window. Long commands (over 400 displayed characters or more than four
+arguments) start collapsed under **Show full command**. Expand the section to
+inspect all arguments in a scrollable area; the executable and working directory
+remain visible.
+
+Confirm once with the session PIN or Touch ID and that MCP process may use the
+displayed secret for a fixed 30 minutes; use does not extend the timer. A different MCP process or another secret asks separately. The GUI's
 **Agent access** panel shows one row per active process/secret grant, with its
 reported name, eight-character session ID, secret name, remaining time, and
 **Running** while that pair is in use. **Revoke** removes only that row's grant

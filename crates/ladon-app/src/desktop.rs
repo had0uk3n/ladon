@@ -2353,21 +2353,7 @@ impl LadonDesktop {
                     ui.label(RichText::new(fields.join(", ")).color(COBALT));
                 }
                 ui.add_space(16.0);
-                Frame::new()
-                    .fill(CANVAS)
-                    .corner_radius(6)
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(view.executable()).monospace().color(INK));
-                        for argument in view.arguments() {
-                            ui.label(RichText::new(argument).monospace().color(MUTED));
-                        }
-                        ui.label(
-                            RichText::new(format!("in {}", view.working_directory()))
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                    });
+                show_approval_command(ui, &view, pending.id());
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(
@@ -3020,6 +3006,50 @@ fn update_focused_approval(
     true
 }
 
+#[cfg(unix)]
+fn show_approval_command(ui: &mut egui::Ui, view: &PendingRequestView, request_id: uuid::Uuid) {
+    Frame::new()
+        .fill(CANVAS)
+        .corner_radius(6)
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.label(RichText::new(view.executable()).monospace().color(INK));
+            let character_count = view.executable().chars().count()
+                + view.working_directory().chars().count()
+                + view
+                    .arguments()
+                    .iter()
+                    .map(|argument| argument.chars().count())
+                    .sum::<usize>();
+            let show_arguments = |ui: &mut egui::Ui| {
+                for argument in view.arguments() {
+                    ui.add(
+                        egui::Label::new(RichText::new(argument).monospace().color(MUTED)).wrap(),
+                    );
+                }
+            };
+            if character_count > 400 || view.arguments().len() + 2 > 6 {
+                egui::CollapsingHeader::new("Show full command")
+                    .id_salt(("approval-command", request_id))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("approval-command-scroll", request_id))
+                            .max_height(180.0)
+                            .auto_shrink([false, true])
+                            .show(ui, show_arguments);
+                    });
+            } else {
+                show_arguments(ui);
+            }
+            ui.label(
+                RichText::new(format!("in {}", view.working_directory()))
+                    .size(12.0)
+                    .color(MUTED),
+            );
+        });
+}
+
 fn default_vault_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = env::var_os("APPDATA").map(PathBuf::from);
@@ -3043,6 +3073,106 @@ fn default_vault_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    #[cfg(unix)]
+    fn approval_command_keeps_short_arguments_visible_and_collapses_large_requests() {
+        for (arguments, collapsed) in [
+            (vec!["--version".to_owned()], false),
+            (vec!["я".repeat(150)], false),
+            (vec!["script".repeat(200)], true),
+            (vec!["--flag".to_owned(); 8], true),
+            (vec!["\n".repeat(100)], true),
+        ] {
+            let context = egui::Context::default();
+            let view = PendingRequestView::new(
+                "Codex",
+                "/usr/bin/python3",
+                &arguments,
+                "/tmp",
+                Duration::from_secs(120),
+            );
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.set_width(540.0);
+                    show_approval_command(ui, &view, Uuid::nil());
+                    ui.label("Confirm");
+                });
+            });
+            let contains = |text: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(&shape.shape, text))
+            };
+            assert!(contains("/usr/bin/python3"));
+            assert!(contains("in /tmp"));
+            assert!(contains("Confirm"));
+            assert_eq!(contains("Show full command"), collapsed);
+            assert_eq!(contains(&view.arguments()[0]), !collapsed);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approval_command_expands_without_truncation_and_resets_for_next_request() {
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let view = PendingRequestView::new(
+            "Codex",
+            "/usr/bin/python3",
+            &["print('example')\n".repeat(100)],
+            "/tmp",
+            Duration::from_secs(120),
+        );
+        let render = |request_id, events| {
+            context.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        ui.set_width(540.0);
+                        show_approval_command(ui, &view, request_id);
+                        ui.label("Confirm");
+                    });
+                },
+            )
+        };
+        let initial = render(Uuid::nil(), vec![]);
+        let pos = text_position(&initial.shapes, "Show full command") + egui::vec2(5.0, 5.0);
+        for pressed in [true, false] {
+            render(
+                Uuid::nil(),
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            );
+        }
+        let expanded = render(Uuid::nil(), vec![]);
+        assert!(
+            expanded
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, &view.arguments()[0]))
+        );
+        assert!(text_position(&expanded.shapes, "Confirm").y < 350.0);
+        let next = render(Uuid::from_u128(1), vec![]);
+        assert!(
+            !next
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, &view.arguments()[0]))
+        );
+        assert!(text_position(&next.shapes, "Confirm").y < 150.0);
+    }
 
     #[test]
     fn agent_access_formatting_is_stable_and_compact() {

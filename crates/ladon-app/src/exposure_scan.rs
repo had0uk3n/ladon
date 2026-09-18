@@ -868,7 +868,9 @@ mod tests {
 
         assert!(report.findings.is_empty());
         assert_eq!(report.files_scanned, 0);
-        assert!(report.skipped_files >= 3);
+        // Binary + oversized file on every platform; the symlink fixture
+        // above is created only on Unix.
+        assert_eq!(report.skipped_files, if cfg!(unix) { 3 } else { 2 });
     }
 
     #[test]

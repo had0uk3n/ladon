@@ -16,8 +16,6 @@ use eframe::egui::{
 use ladon_core::{LadonError, SecretId, SecretMetadata, SensitiveBytes};
 
 #[cfg(unix)]
-use crate::PendingRequestView;
-#[cfg(unix)]
 use crate::agent_broker::{AgentGrantView, AppLockAttempt, LocalBrokerHandle};
 use crate::clipboard::SecretClipboard;
 use crate::touch_id::TouchIdAttempt;
@@ -31,6 +29,8 @@ use crate::{
     EditableValue,
     ui::{AddDraftValidationError, ReadOnlySensitiveText},
 };
+#[cfg(unix)]
+use crate::{PendingRequestView, approval_lifetime::ApprovalLifetime};
 
 const CANVAS: Color32 = Color32::from_rgb(244, 247, 251);
 const INK: Color32 = Color32::from_rgb(23, 35, 60);
@@ -49,16 +49,9 @@ const SECRET_ROW_HEIGHT: f32 = 30.0;
 const SECRET_ROW_LEADING_INSET: f32 = 6.0;
 const NEW_SECRET_TEXT_SIZE: f32 = SECRET_ROW_TEXT_SIZE;
 const NEW_SECRET_ROW_HEIGHT: f32 = SECRET_ROW_HEIGHT;
-#[cfg(unix)]
-const AGENT_ACCESS_MAX_HEIGHT: f32 = 160.0;
-#[cfg(unix)]
-const AGENT_ACCESS_CHROME_HEIGHT: f32 = 58.0;
-#[cfg(unix)]
-const SECRET_NAVIGATION_MIN_HEIGHT: f32 = 126.0;
 const WORKSPACE_CARD_WIDTH: f32 = 380.0;
 const AUTH_FORM_WIDTH: f32 = 340.0;
-const SENSITIVE_FIELD_HEIGHT: f32 = 34.0;
-const REMOVE_BUTTON_HEIGHT: f32 = SENSITIVE_FIELD_HEIGHT;
+const REMOVE_BUTTON_WIDTH: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DesktopLockState {
@@ -181,6 +174,7 @@ enum TouchIdTarget {
     Approval {
         approval_id: uuid::Uuid,
         vault_session_id: uuid::Uuid,
+        lifetime: ApprovalLifetime,
     },
 }
 
@@ -683,7 +677,12 @@ impl LadonDesktop {
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        if let Some(secret) = &selected_metadata {
+                        if self.detail.navigation_target() == NavigationTarget::Sessions {
+                            ui.label(RichText::new("Active sessions").size(24.0).color(INK));
+                            ui.label(
+                                RichText::new("Manage access granted to MCP clients.").color(MUTED),
+                            );
+                        } else if let Some(secret) = &selected_metadata {
                             ui.label(RichText::new(&secret.name).size(24.0).color(INK));
                             ui.label(
                                 RichText::new(format!("ID: {}", secret.id))
@@ -707,7 +706,10 @@ impl LadonDesktop {
                 });
                 ui.add_space(16.0);
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(secret) = &selected_metadata {
+                    if self.detail.navigation_target() == NavigationTarget::Sessions {
+                        #[cfg(unix)]
+                        self.show_agent_access(ui);
+                    } else if let Some(secret) = &selected_metadata {
                         self.show_selected_workspace(ui, secret);
                     } else {
                         self.show_add_workspace(ui);
@@ -768,12 +770,14 @@ impl LadonDesktop {
             .corner_radius(10)
             .inner_margin(Margin::same(18))
             .show(ui, |ui| {
-                ui.set_width(WORKSPACE_CARD_WIDTH);
+                ui.set_width(WORKSPACE_CARD_WIDTH.min(ui.available_width()));
                 field_label(ui, "Name");
                 let mut changed = ui
-                    .add(
+                    .add_sized(
+                        [ui.available_width(), compact_field_height(ui)],
                         TextEdit::singleline(self.draft.name_mut())
                             .hint_text("e.g. production-api")
+                            .margin(egui::vec2(6.0, 4.0))
                             .desired_width(f32::INFINITY),
                     )
                     .changed();
@@ -781,48 +785,65 @@ impl LadonDesktop {
                 let current_error = self.add_form_error;
                 let mut remove_index = None;
                 for (index, field) in self.draft.fields_mut().iter_mut().enumerate() {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), SENSITIVE_FIELD_HEIGHT),
-                        Layout::left_to_right(Align::Max),
-                        |ui| {
-                            ui.vertical(|ui| {
-                                field_label(
-                                    ui,
-                                    if index == 0 {
-                                        "Field"
-                                    } else {
-                                        "Additional field"
-                                    },
-                                );
-                                changed |= ui
-                                    .add_sized(
-                                        [104.0, SENSITIVE_FIELD_HEIGHT],
-                                        TextEdit::singleline(field.name_mut())
-                                            .hint_text("field_name")
-                                            .desired_width(104.0),
-                                    )
-                                    .changed();
-                            });
-                            ui.add_space(10.0);
-                            ui.vertical(|ui| {
-                                field_label(ui, "Secret value");
-                                changed |= visible_sensitive_text_field(
-                                    ui,
-                                    field.value_mut(),
-                                    "Secret value",
-                                    210.0,
-                                )
+                    let gap = ui.spacing().item_spacing.x;
+                    let fields_width =
+                        (ui.available_width() - REMOVE_BUTTON_WIDTH - 2.0 * gap).max(0.0);
+                    let name_width = fields_width * 0.35;
+                    let value_width = fields_width - name_width;
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [name_width, 0.0],
+                            egui::Label::new(
+                                RichText::new(if index == 0 {
+                                    "Field"
+                                } else {
+                                    "Additional field"
+                                })
+                                .size(12.0)
+                                .strong()
+                                .color(INK),
+                            )
+                            .truncate()
+                            .halign(Align::Min),
+                        );
+                        ui.add_sized(
+                            [value_width, 0.0],
+                            egui::Label::new(
+                                RichText::new("Secret value").size(12.0).strong().color(INK),
+                            )
+                            .truncate()
+                            .halign(Align::Min),
+                        );
+                        ui.allocate_exact_size(
+                            Vec2::new(REMOVE_BUTTON_WIDTH, 0.0),
+                            egui::Sense::hover(),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        changed |=
+                            compact_text_field(ui, field.name_mut(), "field_name", name_width)
                                 .changed();
-                            });
-                            if index > 0
-                                && remove_field_button(ui)
-                                    .on_hover_text("Remove field")
-                                    .clicked()
+                        changed |= visible_sensitive_text_field(
+                            ui,
+                            field.value_mut(),
+                            "Secret value",
+                            value_width,
+                        )
+                        .changed();
+                        if index > 0 {
+                            if remove_field_button(ui)
+                                .on_hover_text("Remove field")
+                                .clicked()
                             {
                                 remove_index = Some(index);
                             }
-                        },
-                    );
+                        } else {
+                            ui.allocate_exact_size(
+                                Vec2::new(REMOVE_BUTTON_WIDTH, compact_field_height(ui)),
+                                egui::Sense::hover(),
+                            );
+                        }
+                    });
                     if let Some(error) = current_error.filter(|error| error.field_index() == index)
                     {
                         ui.label(RichText::new(add_form_error_text(error)).color(DANGER));
@@ -837,6 +858,7 @@ impl LadonDesktop {
                     self.notice = None;
                 }
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().button_padding.x = 10.0;
                     let add_field = ui.add_enabled(
                         self.draft.can_add_field(),
                         egui::Button::new(RichText::new("+ Add field").color(INK))
@@ -884,7 +906,7 @@ impl LadonDesktop {
             .corner_radius(10)
             .inner_margin(Margin::same(18))
             .show(ui, |ui| {
-                ui.set_width(WORKSPACE_CARD_WIDTH);
+                ui.set_width(WORKSPACE_CARD_WIDTH.min(ui.available_width()));
                 if !editing {
                     ui.horizontal(|ui| {
                         match action_set {
@@ -955,9 +977,10 @@ impl LadonDesktop {
                                         let width = (ui.available_width() - 60.0).max(24.0);
                                         let mut buffer = ReadOnlySensitiveText::new(value);
                                         ui.add_sized(
-                                            [width, SENSITIVE_FIELD_HEIGHT],
+                                            [width, compact_field_height(ui)],
                                             TextEdit::singleline(&mut buffer)
                                                 .interactive(false)
+                                                .margin(egui::vec2(6.0, 4.0))
                                                 .desired_width(width),
                                         );
                                         copy_value_button(ui, field.value(), &mut copy_request);
@@ -977,7 +1000,9 @@ impl LadonDesktop {
                         field_label(ui, "Name");
                         if ui
                             .add(
-                                TextEdit::singleline(draft.name_mut()).desired_width(f32::INFINITY),
+                                TextEdit::singleline(draft.name_mut())
+                                    .margin(egui::vec2(6.0, 4.0))
+                                    .desired_width(ui.available_width()),
                             )
                             .changed()
                         {
@@ -988,20 +1013,24 @@ impl LadonDesktop {
                         let can_remove = draft.fields().len() > 1;
                         for (index, field) in draft.fields_mut().iter_mut().enumerate() {
                             ui.horizontal(|ui| {
-                                if ui
-                                    .add_sized(
-                                        [94.0, SENSITIVE_FIELD_HEIGHT],
-                                        TextEdit::singleline(field.name_mut())
-                                            .hint_text("field_name")
-                                            .desired_width(94.0),
-                                    )
-                                    .changed()
+                                let gap = ui.spacing().item_spacing.x;
+                                let text_width =
+                                    (ui.available_width() - 52.0 - REMOVE_BUTTON_WIDTH - 3.0 * gap)
+                                        .max(0.0);
+                                let name_width = text_width * 0.35;
+                                if compact_text_field(
+                                    ui,
+                                    field.name_mut(),
+                                    "field_name",
+                                    name_width,
+                                )
+                                .changed()
                                 {
                                     *dirty = true;
                                 }
                                 match field.value_mut() {
                                     EditableValue::Text(value) => {
-                                        let width = (ui.available_width() - 98.0).max(24.0);
+                                        let width = text_width - name_width;
                                         if visible_sensitive_text_field(
                                             ui,
                                             value,
@@ -1128,7 +1157,33 @@ impl LadonDesktop {
                         .color(Color32::from_rgb(173, 187, 214)),
                 );
                 #[cfg(unix)]
-                self.show_agent_access(ui, agent_access_list_height(ui.available_height()));
+                {
+                    ui.add_space(12.0);
+                    let sessions = self.active_session_count();
+                    let selected = self.detail.navigation_target() == NavigationTarget::Sessions;
+                    let sessions_button = secret_navigation_row(
+                        ui,
+                        "active-sessions",
+                        selected,
+                        SECRET_ROW_HEIGHT,
+                        |ui| {
+                            ui.label(
+                                RichText::new(format!("Active sessions ({sessions})"))
+                                    .size(12.0)
+                                    .color(Color32::WHITE),
+                            );
+                        },
+                    );
+                    ui.painter().rect_stroke(
+                        sessions_button.rect,
+                        6.0,
+                        Stroke::new(1.0_f32, Color32::from_rgb(100, 113, 137)),
+                        egui::StrokeKind::Inside,
+                    );
+                    if sessions_button.clicked() {
+                        self.request_navigation(NavigationTarget::Sessions);
+                    }
+                }
                 ui.add_space(18.0);
                 egui::ScrollArea::vertical()
                     .id_salt("secret-navigation")
@@ -1146,17 +1201,23 @@ impl LadonDesktop {
         ui.add_space(8.0);
 
         let new_secret =
-            secret_navigation_row(ui, "new-secret", false, NEW_SECRET_ROW_HEIGHT, |ui| {
+            secret_navigation_row(ui, "new-secret", true, NEW_SECRET_ROW_HEIGHT, |ui| {
                 ui.label(
                     RichText::new("+ New secret")
                         .size(NEW_SECRET_TEXT_SIZE)
                         .color(Color32::WHITE),
                 );
             });
+        ui.painter().rect_stroke(
+            new_secret.rect,
+            6.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(122, 151, 255)),
+            egui::StrokeKind::Inside,
+        );
         if new_secret.clicked() {
             self.request_navigation(NavigationTarget::Add);
         }
-        ui.add_space(4.0);
+        ui.add_space(10.0);
 
         let secrets = with_controller(&self.controller, |controller| Ok(controller.secrets()))
             .unwrap_or_default();
@@ -1210,7 +1271,7 @@ impl LadonDesktop {
             if response.clicked() {
                 self.request_navigation(NavigationTarget::Secret(secret.id));
             }
-            ui.add_space(4.0);
+            ui.add_space(10.0);
         }
     }
 
@@ -1287,97 +1348,95 @@ impl LadonDesktop {
     }
 
     #[cfg(unix)]
-    fn show_agent_access(&mut self, ui: &mut egui::Ui, list_height: f32) {
-        if self.agent_grants.is_empty() && !self.agent_command_active {
-            return;
-        }
-        ui.add_space(10.0);
-        if self.agent_grants.is_empty() {
-            ui.label(
-                RichText::new("Agent command running")
-                    .size(12.0)
-                    .color(Color32::WHITE),
-            );
-        } else {
-            ui.label(
-                RichText::new(format!("Agent access · {}", self.agent_grants.len()))
-                    .size(12.0)
-                    .color(Color32::WHITE),
-            );
-            if self.agent_command_active && !self.agent_grants.iter().any(AgentGrantView::running) {
-                ui.label(
-                    RichText::new("Agent command running")
-                        .size(11.0)
-                        .color(Color32::LIGHT_GRAY),
-                );
-            }
-        }
+    fn active_session_count(&self) -> usize {
+        self.agent_grants
+            .iter()
+            .map(AgentGrantView::client_session_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    #[cfg(unix)]
+    fn show_agent_access(&mut self, ui: &mut egui::Ui) {
         let mut revoke = None;
-        if !self.agent_grants.is_empty() {
-            egui::ScrollArea::vertical()
-                .id_salt("agent-access")
-                .max_height(list_height)
-                .show(ui, |ui| {
-                    for grant in &self.agent_grants {
-                        let label = sanitize_untrusted(grant.client_label());
-                        let name = sanitize_untrusted(grant.secret_name());
-                        let id = grant.client_session_id();
-                        ui.push_id((id, grant.secret_id().to_string()), |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&label).size(11.0).color(Color32::WHITE),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(format!("{label} (reported)\nSession: {id}"));
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("(reported)")
-                                        .size(10.0)
-                                        .color(Color32::LIGHT_GRAY),
-                                );
-                                ui.label(
-                                    RichText::new(short_session_id(id))
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(Color32::LIGHT_GRAY),
-                                )
-                                .on_hover_text(id.to_string());
-                            });
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&name).size(12.0).color(Color32::WHITE),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&name);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format_grant_remaining(grant.remaining()))
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(Color32::LIGHT_GRAY),
-                                );
-                                if grant.running() {
-                                    ui.label(
-                                        RichText::new("Running")
-                                            .size(10.0)
-                                            .color(Color32::LIGHT_GRAY),
-                                    );
-                                }
-                                if ui.small_button("Revoke").clicked() {
-                                    revoke = Some((id, grant.secret_id()));
-                                }
-                            });
-                            ui.add_space(6.0);
-                        });
+        let mut revoke_all = false;
+        Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(10)
+            .inner_margin(Margin::same(18))
+            .show(ui, |ui| {
+                ui.set_width(WORKSPACE_CARD_WIDTH.min(ui.available_width()));
+                if self.agent_grants.is_empty() {
+                    ui.label(RichText::new("No active sessions").color(MUTED));
+                }
+                if self.agent_command_active
+                    && !self.agent_grants.iter().any(AgentGrantView::running)
+                {
+                    ui.label(RichText::new("Agent command running").color(MUTED));
+                }
+                let mut shown = std::collections::BTreeSet::new();
+                for session in &self.agent_grants {
+                    let id = session.client_session_id();
+                    if !shown.insert(id) {
+                        continue;
                     }
-                });
-        }
+                    let label = sanitize_untrusted(session.client_label());
+                    ui.push_id(id, |ui| {
+                        ui.label(RichText::new(&label).strong().color(INK));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("(reported)").size(11.0).color(MUTED));
+                            ui.label(
+                                RichText::new(short_session_id(id))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(MUTED),
+                            )
+                            .on_hover_text(id.to_string());
+                        });
+                        for grant in self
+                            .agent_grants
+                            .iter()
+                            .filter(|grant| grant.client_session_id() == id)
+                        {
+                            ui.push_id(grant.secret_id().to_string(), |ui| {
+                                let name = sanitize_untrusted(grant.secret_name());
+                                ui.label(RichText::new(&name).color(INK));
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(if grant.expires_with_session() {
+                                            "Until session ends".to_owned()
+                                        } else {
+                                            format!(
+                                                "{} remaining",
+                                                format_grant_remaining(grant.remaining())
+                                            )
+                                        })
+                                        .size(12.0)
+                                        .color(MUTED),
+                                    );
+                                    if grant.running() {
+                                        ui.label(RichText::new("Running").size(11.0).color(MUTED));
+                                    }
+                                    if quiet_button(ui, "Revoke").clicked() {
+                                        revoke = Some((id, grant.secret_id()));
+                                    }
+                                });
+                            });
+                        }
+                    });
+                    ui.add_space(12.0);
+                }
+                if (!self.agent_grants.is_empty() || self.agent_command_active)
+                    && quiet_button(ui, "Revoke all").clicked()
+                {
+                    revoke_all = true;
+                }
+            });
         if let Some((session, secret)) = revoke {
             self.revoke_agent_grant(session, secret);
         }
-        if ui.small_button("Revoke all").clicked() {
+        if revoke_all {
             self.revoke_all_agent_grants();
         }
     }
@@ -1444,30 +1503,7 @@ impl LadonDesktop {
                 ui.label(RichText::new("Unlock this secret").size(24.0).color(INK));
                 ui.label(RichText::new("Confirm once for this selected secret.").color(MUTED));
                 ui.add_space(18.0);
-                if actions.contains(&ConfirmationAction::TouchId)
-                    && primary_button(ui, "Confirm with Touch ID").clicked()
-                {
-                    action = Some(ConfirmationAction::TouchId);
-                }
-                if actions.contains(&ConfirmationAction::Pin) {
-                    ui.add_space(14.0);
-                    password_field(ui, &mut self.local_pin, "Session PIN");
-                    if quiet_button(ui, "Confirm with PIN").clicked() {
-                        action = Some(ConfirmationAction::Pin);
-                    }
-                }
-                if actions.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "Touch ID is unavailable and this session has no configured PIN.",
-                        )
-                        .color(AMBER),
-                    );
-                }
-                ui.add_space(10.0);
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
+                (action, cancel) = secret_confirmation_controls(ui, &actions, &mut self.local_pin);
                 self.show_notice(ui);
             });
 
@@ -1592,9 +1628,10 @@ impl LadonDesktop {
                 TouchIdTarget::Approval {
                     approval_id,
                     vault_session_id,
+                    lifetime,
                 },
                 Ok(()),
-            ) => self.finish_approval_touch_id(approval_id, vault_session_id),
+            ) => self.finish_approval_touch_id(approval_id, vault_session_id, lifetime),
             (_, Err(LadonError::ApprovalCancelled)) => {}
             (_, Err(error)) => self.notice_from(Err(error), ""),
         }
@@ -2346,6 +2383,12 @@ impl LadonDesktop {
             .is_some_and(SessionConfirmation::has_pin);
         let actions = confirmation_actions(touch_id_available, pin_configured);
         let mut action = None;
+        let mut lifetime = ApprovalLifetime::default();
+        let session_connected = self.broker.as_ref().is_some_and(|broker| {
+            broker
+                .client_session_connected(pending.client_session_id())
+                .unwrap_or(false)
+        });
         egui::Modal::new("agent-approval".into())
             .frame(
                 Frame::window(&context.style())
@@ -2365,11 +2408,15 @@ impl LadonDesktop {
                 ui.add_space(16.0);
                 show_approval_command(ui, &view, pending.id());
                 ui.add_space(12.0);
+                lifetime = approval_lifetime_picker(
+                    ui,
+                    pending.id(),
+                    session_connected,
+                    self.pending_touch_id.is_some(),
+                );
                 ui.label(
-                    RichText::new(
-                        "Approval lasts 30 minutes for only this client session and these secrets.",
-                    )
-                    .color(AMBER),
+                    RichText::new("Access applies only to this agent session and these secrets.")
+                        .color(AMBER),
                 );
                 ui.add_space(16.0);
                 if actions.contains(&ConfirmationAction::TouchId)
@@ -2406,7 +2453,7 @@ impl LadonDesktop {
 
         match action {
             Some(ApprovalAction::Approve(method)) => {
-                self.authenticate_pending_approval(method, &pending);
+                self.authenticate_pending_approval(method, &pending, lifetime);
             }
             Some(ApprovalAction::Deny) => {
                 self.pending_touch_id = None;
@@ -2427,6 +2474,7 @@ impl LadonDesktop {
         &mut self,
         method: ConfirmationAction,
         pending: &crate::PendingApproval,
+        lifetime: ApprovalLifetime,
     ) {
         let captured_id = pending.id();
         let captured_session_id = pending.vault_session_id();
@@ -2446,6 +2494,7 @@ impl LadonDesktop {
                         target: TouchIdTarget::Approval {
                             approval_id: captured_id,
                             vault_session_id: captured_session_id,
+                            lifetime,
                         },
                     });
                 }
@@ -2494,7 +2543,7 @@ impl LadonDesktop {
             return;
         }
 
-        self.finish_authenticated_approval(captured_id, captured_session_id, false);
+        self.finish_authenticated_approval(captured_id, captured_session_id, false, lifetime);
     }
 
     #[cfg(unix)]
@@ -2504,6 +2553,7 @@ impl LadonDesktop {
             Some(TouchIdTarget::Approval {
                 approval_id,
                 vault_session_id,
+                ..
             }) if current != Some((*approval_id, *vault_session_id))
         );
         if stale {
@@ -2516,8 +2566,9 @@ impl LadonDesktop {
         &mut self,
         captured_id: uuid::Uuid,
         captured_session_id: uuid::Uuid,
+        lifetime: ApprovalLifetime,
     ) {
-        self.finish_authenticated_approval(captured_id, captured_session_id, true);
+        self.finish_authenticated_approval(captured_id, captured_session_id, true, lifetime);
     }
 
     #[cfg(unix)]
@@ -2526,6 +2577,7 @@ impl LadonDesktop {
         captured_id: uuid::Uuid,
         captured_session_id: uuid::Uuid,
         touch_id_succeeded: bool,
+        lifetime: ApprovalLifetime,
     ) {
         let current_session_id = self.vault_session_id().ok();
         let current_pending = self
@@ -2548,7 +2600,7 @@ impl LadonDesktop {
             .broker
             .as_ref()
             .ok_or(LadonError::EndpointUnavailable)
-            .and_then(|broker| broker.approve(captured_id));
+            .and_then(|broker| lifetime.approve(broker, captured_id));
         if let (true, Some(confirmation)) = (
             result.is_ok() && touch_id_succeeded,
             &mut self.session_confirmation,
@@ -2556,7 +2608,14 @@ impl LadonDesktop {
             confirmation.record_touch_id_success();
         }
         self.local_pin.clear();
-        self.notice_from(result, "Agent access allowed for 30 minutes");
+        self.notice_from(
+            result,
+            match lifetime {
+                ApprovalLifetime::ThirtyMinutes => "Agent access allowed for 30 minutes",
+                ApprovalLifetime::EndOfDay => "Agent access allowed until end of day",
+                ApprovalLifetime::Session => "Agent access allowed until session ends",
+            },
+        );
     }
 }
 
@@ -2771,12 +2830,6 @@ fn status_dot_geometry(rect: egui::Rect) -> (egui::Pos2, f32) {
     )
 }
 
-#[cfg(unix)]
-fn agent_access_list_height(available_height: f32) -> f32 {
-    (available_height - SECRET_NAVIGATION_MIN_HEIGHT - AGENT_ACCESS_CHROME_HEIGHT)
-        .clamp(0.0, AGENT_ACCESS_MAX_HEIGHT)
-}
-
 #[cfg(any(unix, test))]
 fn short_session_id(id: uuid::Uuid) -> String {
     id.to_string()[..8].to_owned()
@@ -2806,7 +2859,11 @@ fn secret_navigation_row(
             .id_salt(id)
             .max_rect(rect.shrink2(egui::vec2(SECRET_ROW_LEADING_INSET, 0.0)))
             .layout(Layout::left_to_right(Align::Center)),
-        contents,
+        |ui| {
+            // Navigation labels must let the enclosing row handle clicks.
+            ui.style_mut().interaction.selectable_labels = false;
+            contents(ui);
+        },
     );
     response
 }
@@ -2908,9 +2965,10 @@ fn sensitive_text_edit(
         clipboard_events
     });
     let response = ui.add_sized(
-        [width, SENSITIVE_FIELD_HEIGHT],
+        [width, compact_field_height(ui)],
         TextEdit::singleline(value)
             .password(password)
+            .margin(egui::vec2(6.0, 4.0))
             .hint_text(hint)
             .desired_width(width),
     );
@@ -2937,8 +2995,68 @@ fn sensitive_text_edit(
     response
 }
 
+fn secret_confirmation_controls(
+    ui: &mut egui::Ui,
+    actions: &[ConfirmationAction],
+    pin: &mut SensitiveText,
+) -> (Option<ConfirmationAction>, bool) {
+    let mut action = None;
+    let mut cancel = false;
+    if actions.contains(&ConfirmationAction::Pin) {
+        password_field(ui, pin, "Session PIN");
+        ui.add_space(10.0);
+    }
+    if actions.is_empty() {
+        ui.label(
+            RichText::new("Touch ID is unavailable and this session has no configured PIN.")
+                .color(AMBER),
+        );
+    }
+    ui.horizontal(|ui| {
+        if actions.contains(&ConfirmationAction::TouchId)
+            && primary_button(ui, "Touch ID").clicked()
+        {
+            action = Some(ConfirmationAction::TouchId);
+        }
+        if actions.contains(&ConfirmationAction::Pin) && quiet_button(ui, "PIN").clicked() {
+            action = Some(ConfirmationAction::Pin);
+        }
+        if quiet_button(ui, "Cancel").clicked() {
+            cancel = true;
+        }
+    });
+    (action, cancel)
+}
+
+fn compact_field_height(ui: &egui::Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body) + 8.0
+}
+
+fn compact_text_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    ui.add_sized(
+        [width, compact_field_height(ui)],
+        TextEdit::singleline(value)
+            .hint_text(hint)
+            .margin(egui::vec2(6.0, 4.0))
+            .desired_width(width),
+    )
+}
+
+fn compact_row_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0);
+        ui.add_sized([width, compact_field_height(ui)], egui::Button::new(text))
+    })
+    .inner
+}
+
 fn remove_field_button(ui: &mut egui::Ui) -> egui::Response {
-    ui.add_sized([30.0, REMOVE_BUTTON_HEIGHT], egui::Button::new("×"))
+    compact_row_button(ui, "×", REMOVE_BUTTON_WIDTH)
 }
 
 fn copy_value_button(
@@ -2949,10 +3067,7 @@ fn copy_value_button(
     let Some(text) = copyable_text(value) else {
         return;
     };
-    if ui
-        .add_sized([52.0, SENSITIVE_FIELD_HEIGHT], egui::Button::new("Copy"))
-        .clicked()
-    {
+    if compact_row_button(ui, "Copy", 52.0).clicked() {
         *request = Some(SensitiveBytes::new(text.as_bytes().to_vec()));
     }
 }
@@ -3014,6 +3129,53 @@ fn update_focused_approval(
     approval_pin.clear();
     *focused = next;
     true
+}
+
+#[cfg(unix)]
+fn approval_lifetime_picker(
+    ui: &mut egui::Ui,
+    request_id: uuid::Uuid,
+    session_connected: bool,
+    authenticating: bool,
+) -> ApprovalLifetime {
+    let id = egui::Id::new(("approval-lifetime", request_id));
+    let mut lifetime = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<ApprovalLifetime>(id))
+        .unwrap_or_default();
+    if lifetime == ApprovalLifetime::Session && !session_connected {
+        lifetime = ApprovalLifetime::default();
+    }
+    ui.horizontal(|ui| {
+        ui.label("Allow access for");
+        ui.add_enabled_ui(!authenticating, |ui| {
+            egui::ComboBox::from_id_salt(id)
+                .selected_text(lifetime.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut lifetime,
+                        ApprovalLifetime::ThirtyMinutes,
+                        ApprovalLifetime::ThirtyMinutes.label(),
+                    );
+                    ui.selectable_value(
+                        &mut lifetime,
+                        ApprovalLifetime::EndOfDay,
+                        ApprovalLifetime::EndOfDay.label(),
+                    );
+                    ui.add_enabled_ui(session_connected, |ui| {
+                        ui.selectable_value(
+                            &mut lifetime,
+                            ApprovalLifetime::Session,
+                            ApprovalLifetime::Session.label(),
+                        );
+                    })
+                    .response
+                    .on_hover_text("Available while the agent's session connection is active.");
+                });
+        });
+    });
+    ui.ctx().data_mut(|data| data.insert_temp(id, lifetime));
+    lifetime
 }
 
 #[cfg(unix)]
@@ -3083,6 +3245,44 @@ fn default_vault_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    #[cfg(unix)]
+    fn approval_duration_defaults_per_request_and_rejects_disconnected_session_choice() {
+        let context = egui::Context::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        context.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("approval-lifetime", first)),
+                ApprovalLifetime::EndOfDay,
+            )
+        });
+        for (id, connected, expected) in [
+            (first, true, ApprovalLifetime::EndOfDay),
+            (second, true, ApprovalLifetime::ThirtyMinutes),
+        ] {
+            let _ = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    assert_eq!(approval_lifetime_picker(ui, id, connected, false), expected);
+                });
+            });
+        }
+        context.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("approval-lifetime", first)),
+                ApprovalLifetime::Session,
+            )
+        });
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                assert_eq!(
+                    approval_lifetime_picker(ui, first, false, false),
+                    ApprovalLifetime::ThirtyMinutes
+                );
+            });
+        });
+    }
 
     #[test]
     #[cfg(unix)]
@@ -3182,6 +3382,134 @@ mod tests {
                 .any(|shape| shape_contains_text(&shape.shape, &view.arguments()[0]))
         );
         assert!(text_position(&next.shapes, "Confirm").y < 150.0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sessions_navigation_uses_unique_client_ids_and_keeps_details_in_workspace() {
+        let (mut app, _, _directory) = app_with_sensitive_detail(false);
+        let secret = app.controller.lock().unwrap().secrets().remove(0);
+        app.agent_grants = [
+            (1, "Client one", "first secret"),
+            (1, "Client one", "second secret"),
+            (2, "Client two", "third secret"),
+        ]
+        .into_iter()
+        .map(|(id, label, name)| {
+            AgentGrantView::for_test(
+                Uuid::from_u128(id),
+                label,
+                SecretId::new(),
+                name,
+                Duration::from_secs(61),
+                false,
+            )
+        })
+        .collect();
+        assert_eq!(app.active_session_count(), 2);
+        let context = egui::Context::default();
+        configure_style(&context);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(MANAGER_WINDOW_SIZE[0], 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run(input(), |context| app.show_secret_rail(context));
+        let rail = context.run(input(), |context| app.show_secret_rail(context));
+        let button = text_position(&rail.shapes, "Active sessions (2)") + egui::vec2(5.0, 5.0);
+        for forbidden in ["Client one", "first secret", "Revoke", "Revoke all"] {
+            assert!(
+                !rail
+                    .shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(&shape.shape, forbidden))
+            );
+        }
+        for pressed in [true, false] {
+            let mut input = input();
+            input.events = vec![
+                egui::Event::PointerMoved(button),
+                egui::Event::PointerButton {
+                    pos: button,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ];
+            let _ = context.run(input, |context| app.show_secret_rail(context));
+        }
+        assert_eq!(app.detail.navigation_target(), NavigationTarget::Sessions);
+        let workspace = context.run(input(), |context| {
+            app.show_unlocked(context);
+        });
+        for expected in [
+            "Client one",
+            "Client two",
+            "first secret",
+            "second secret",
+            "third secret",
+            "01:01 remaining",
+            "Revoke",
+            "Revoke all",
+        ] {
+            assert!(text_position(&workspace.shapes, expected).x > SECRET_RAIL_WIDTH);
+        }
+        assert!(
+            !workspace
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, "Add a secret"))
+        );
+        app.request_navigation(NavigationTarget::Secret(secret.id));
+        assert_eq!(
+            app.detail.navigation_target(),
+            NavigationTarget::Secret(secret.id)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sessions_navigation_preserves_dirty_edit_until_discard_is_confirmed() {
+        let (mut app, _, _directory) = app_with_sensitive_detail(true);
+        let selected = app.detail.selected();
+        app.request_navigation(NavigationTarget::Sessions);
+        assert!(app.discard_confirmation);
+        assert_eq!(app.detail.selected(), selected);
+        assert!(app.detail.has_sensitive_buffer());
+        app.detail.cancel_pending_navigation();
+        app.discard_confirmation = false;
+        assert_eq!(app.detail.selected(), selected);
+        app.request_navigation(NavigationTarget::Sessions);
+        assert!(!app.finish_discard_navigation());
+        assert_eq!(app.detail.navigation_target(), NavigationTarget::Sessions);
+        assert!(!app.detail.has_sensitive_buffer());
+        assert!(app.detail.selected().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secret_confirmation_places_pin_above_one_row_of_actions() {
+        let context = egui::Context::default();
+        configure_style(&context);
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.set_width(AUTH_FORM_WIDTH);
+                secret_confirmation_controls(
+                    ui,
+                    &confirmation_actions(true, true),
+                    &mut SensitiveText::default(),
+                );
+            });
+        });
+        let touch = text_position(&output.shapes, "Touch ID");
+        let pin = text_position(&output.shapes, "PIN");
+        let cancel = text_position(&output.shapes, "Cancel");
+        assert_eq!(touch.y, pin.y);
+        assert_eq!(pin.y, cancel.y);
+        assert!(touch.x < pin.x && pin.x < cancel.x);
+        assert!(text_position(&output.shapes, "Session PIN").y < touch.y);
     }
 
     #[test]
@@ -3497,12 +3825,9 @@ mod tests {
         app.refresh_agent_grants();
         let context = egui::Context::default();
         let output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
-                app.show_agent_access(ui, AGENT_ACCESS_MAX_HEIGHT)
-            });
+            egui::CentralPanel::default().show(context, |ui| app.show_agent_access(ui));
         });
         for expected in [
-            "Agent access · 1",
             "client\\u{a}\\u{202e}evil",
             "(reported)",
             "a31f92c4",
@@ -3549,9 +3874,7 @@ mod tests {
         app.agent_command_active = true;
         let context = egui::Context::default();
         let output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
-                app.show_agent_access(ui, AGENT_ACCESS_MAX_HEIGHT)
-            });
+            egui::CentralPanel::default().show(context, |ui| app.show_agent_access(ui));
         });
 
         for expected in ["Agent command running", "Revoke all"] {
@@ -3567,7 +3890,7 @@ mod tests {
             output
                 .shapes
                 .iter()
-                .any(|shape| shape_contains_text(&shape.shape, "Agent access · 1"))
+                .any(|shape| shape_contains_text(&shape.shape, "unrelated client"))
         );
     }
 
@@ -3589,11 +3912,6 @@ mod tests {
             selected_action_labels(SelectedActionSet::Editing).0,
             &[] as &[&str]
         );
-    }
-
-    #[test]
-    fn remove_control_matches_the_sensitive_text_row_height() {
-        assert_eq!(REMOVE_BUTTON_HEIGHT, SENSITIVE_FIELD_HEIGHT);
     }
 
     #[test]
@@ -3704,10 +4022,7 @@ mod tests {
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
                 ui.horizontal(|ui| {
-                    let name = ui.add_sized(
-                        [94.0, SENSITIVE_FIELD_HEIGHT],
-                        TextEdit::singleline(&mut name),
-                    );
+                    let name = compact_text_field(ui, &mut name, "", 94.0);
                     let value = visible_sensitive_text_field(ui, &mut value, "Value", 170.0);
                     let copy = ui.scope(|ui| {
                         copy_value_button(
@@ -3720,7 +4035,8 @@ mod tests {
                     assert_eq!(name.rect.height(), value.rect.height());
                     assert_eq!(value.rect.height(), copy.response.rect.height());
                     assert_eq!(value.rect.height(), remove.rect.height());
-                    assert_eq!(remove.rect.height(), 34.0);
+                    assert_eq!(remove.rect.height(), compact_field_height(ui));
+                    assert!(remove.rect.height() < 30.0);
                 });
             });
         });
@@ -3730,27 +4046,62 @@ mod tests {
     #[cfg(unix)]
     fn add_field_rows_stay_compact_and_keep_remove_aligned_with_values() {
         let (mut app, _, _directory) = app_with_sensitive_detail(false);
+        app.request_navigation(NavigationTarget::Add);
+        app.draft.set_name("my-secret");
+        *app.draft.fields_mut()[0].name_mut() = "first_field".to_owned();
         app.draft.fields_mut()[0]
             .value_mut()
             .push_str("fake-primary");
         app.draft.add_field();
+        *app.draft.fields_mut()[1].name_mut() = "next_field".to_owned();
         app.draft.fields_mut()[1]
             .value_mut()
             .push_str("fake-additional");
-        let context = egui::Context::default();
-        configure_style(&context);
-        let output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| app.show_add_workspace(ui));
-        });
-        let primary = text_position(&output.shapes, "fake-primary");
-        let additional = text_position(&output.shapes, "fake-additional");
-        let remove = text_position(&output.shapes, "×");
-        assert!(primary.y < 200.0);
-        assert!(additional.y < 300.0);
-        assert!(
-            (additional.y - remove.y).abs() < 10.0,
-            "remove must align with its value input"
-        );
+        for width in [MANAGER_WINDOW_SIZE[0], WINDOW_MIN_SIZE[0]] {
+            let context = egui::Context::default();
+            configure_style(&context);
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, MANAGER_WINDOW_SIZE[1]),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    app.show_unlocked(context);
+                },
+            );
+            let input_rect = |label| {
+                let position = text_position(&output.shapes, label);
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Rect(rect)
+                            if rect.rect.contains(position) && rect.rect.height() < 30.0 =>
+                        {
+                            Some(rect.rect)
+                        }
+                        _ => None,
+                    })
+                    .min_by(|left, right| left.area().total_cmp(&right.area()))
+                    .unwrap_or_else(|| panic!("missing compact input: {label}"))
+            };
+            let name = input_rect("my-secret");
+            let field = input_rect("first_field");
+            let primary = input_rect("fake-primary");
+            let additional = input_rect("fake-additional");
+            let remove = input_rect("×");
+            assert!((field.left() - name.left()).abs() < 1.0);
+            assert!((remove.right() - name.right()).abs() < 1.0);
+            assert!((primary.left() - additional.left()).abs() < 1.0);
+            assert!((primary.width() - additional.width()).abs() < 1.0);
+            assert!((additional.top() - remove.top()).abs() < 1.0);
+            assert!(name.left() >= SECRET_RAIL_WIDTH);
+            assert!(remove.right() <= width - 20.0);
+            assert!(additional.bottom() - primary.top() < 120.0);
+        }
     }
 
     #[test]

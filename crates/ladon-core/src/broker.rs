@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    time::{Duration, SystemTime},
+};
 
 use crate::{FieldName, SecretId};
 
@@ -7,6 +10,10 @@ const MAX_ACTIVITY_REFERENCES: usize = 16;
 
 pub trait MonotonicClock {
     fn now_millis(&self) -> u64;
+
+    fn wall_time(&self) -> SystemTime {
+        SystemTime::now()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

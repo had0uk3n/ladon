@@ -30,7 +30,8 @@ use crate::{
 };
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const MAX_CONNECTION_WORKERS: usize = 8;
+// Lifecycle sockets are capped separately, preserving capacity for actual RPCs.
+const MAX_CONNECTION_WORKERS: usize = crate::approval::MAX_TRACKED_SESSIONS + 8;
 
 pub struct LocalBrokerHandle {
     stop: Arc<AtomicBool>,
@@ -48,6 +49,7 @@ pub(crate) struct AgentGrantView {
     secret_id: SecretId,
     secret_name: String,
     remaining: Duration,
+    expires_with_session: bool,
     running: bool,
 }
 
@@ -68,6 +70,7 @@ impl AgentGrantView {
             secret_id,
             secret_name: secret_name.into(),
             remaining,
+            expires_with_session: false,
             running,
         }
     }
@@ -90,6 +93,11 @@ impl AgentGrantView {
 
     pub(crate) const fn remaining(&self) -> Duration {
         self.remaining
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) const fn expires_with_session(&self) -> bool {
+        self.expires_with_session
     }
 
     pub(crate) const fn running(&self) -> bool {
@@ -752,6 +760,26 @@ impl LocalBrokerHandle {
         self.approval.approve(approval_id)
     }
 
+    pub fn approve_for(&self, approval_id: Uuid, lifetime: Duration) -> Result<(), LadonError> {
+        self.approval.approve_for(approval_id, lifetime)
+    }
+
+    pub fn approve_until(
+        &self,
+        approval_id: Uuid,
+        deadline: std::time::SystemTime,
+    ) -> Result<(), LadonError> {
+        self.approval.approve_until(approval_id, deadline)
+    }
+
+    pub fn approve_session(&self, approval_id: Uuid) -> Result<(), LadonError> {
+        self.approval.approve_session(approval_id)
+    }
+
+    pub fn client_session_connected(&self, client: Uuid) -> Result<bool, LadonError> {
+        self.approval.client_session_connected(client)
+    }
+
     pub fn deny(&self, approval_id: Uuid) -> Result<(), LadonError> {
         self.approval.deny(approval_id)
     }
@@ -796,6 +824,7 @@ impl LocalBrokerHandle {
                     secret_id: grant.secret_id(),
                     secret_name,
                     remaining: grant.remaining(),
+                    expires_with_session: grant.expires_with_session(),
                     running: running.contains(&(grant.client_session_id(), grant.secret_id())),
                 })
             })
@@ -887,6 +916,7 @@ impl Drop for LocalBrokerHandle {
             ui_locks.disconnect();
         }
         self.stop.store(true, Ordering::Release);
+        let _ = self.approval.close_client_sessions();
         let _ = self.approval.cancel_pending();
         let _ = self.approval.revoke_all();
         let _ = self.cancel_active_run_and_wait();
@@ -951,6 +981,11 @@ impl AgentBroker {
         }
         // Hard lock must still attempt vault cleanup when approval coordination has failed.
         match method {
+            RpcMethod::SessionOpen => {
+                self.approval
+                    .register_client_session(client_session_id, connection_cancellation)?;
+                Ok(RpcResult::SessionOpened)
+            }
             RpcMethod::Status => {
                 if self.approval.app_access_state()? != AppAccessState::Active {
                     return Ok(RpcResult::Status {

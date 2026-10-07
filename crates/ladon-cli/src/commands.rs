@@ -62,6 +62,12 @@ fn call_and_render(
         client_label: "Ladon CLI".to_owned(),
         method,
     };
+    // Lock and status must remain available even when lifecycle slots are full.
+    let _lifetime = if matches!(request.method, RpcMethod::Run { .. } | RpcMethod::List) {
+        Some(transport.open_session(request.client_session_id, &request.client_label)?)
+    } else {
+        None
+    };
     render_response(&transport.call(&request)?, stdout)
 }
 

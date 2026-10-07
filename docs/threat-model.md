@@ -37,7 +37,12 @@ does not itself grant the command permission to use secrets.
 
 Secret-bearing runs also require an unexpired in-memory grant for every
 referenced secret. A grant is scoped to a random client-session UUID and an
-immutable secret ID for a fixed 30 minutes, within one vault unlock lifetime.
+immutable secret ID for 30 minutes, until local midnight, or until the tracked
+MCP process ends, within one vault unlock lifetime. A process holds a separate
+same-user authenticated lifecycle socket; disconnect revokes its grants and
+cancels its pending approval. Session expiry is unavailable without that live
+connection. Timed grants also end on tracked process disconnection. Calendar
+expiry uses wall time so sleep does not postpone midnight.
 The broker revalidates that grant immediately before reading plaintext and
 serializes resolution against revocation. This prevents accidental reuse by a
 different integration instance; it is not authentication against a malicious
@@ -52,8 +57,8 @@ them with a short session ID; neither proves identity. Renaming only changes
 display metadata on the next broker request, never the grant key or expiry.
 
 The active-grant list and per-pair revoke controls are GUI-only and never
-cross RPC/MCP. Each row represents one process/secret grant with a fixed
-30-minute lifetime; use does not extend it. Targeted revoke cancels and waits
+cross RPC/MCP. Each row represents one process/secret grant with the expiry
+chosen during approval; use does not extend it. Targeted revoke cancels and waits
 for a matching run while preserving unrelated grants. Revoke all cancels the
 active run and clears all grants. Neither operation can erase bytes already
 consumed, retained, or transmitted by an authorized child.

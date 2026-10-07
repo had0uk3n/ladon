@@ -149,3 +149,82 @@ fn revoke_pair_removes_only_the_exact_client_and_secret() {
     assert!(grants.missing(first_client, [second]).is_empty());
     assert!(grants.missing(second_client, [first]).is_empty());
 }
+
+#[test]
+fn per_approval_duration_expires_without_changing_other_grants() {
+    let clock = FakeClock::new();
+    let mut grants = GrantStore::new(clock.clone(), Duration::from_secs(1800));
+    let client = Uuid::new_v4();
+    let short = SecretId::new();
+    let long = SecretId::new();
+    grants.grant(client, [short]);
+    grants.grant_for(client, [long], Duration::from_secs(7200));
+    clock.advance(Duration::from_secs(1800));
+    assert_eq!(grants.missing(client, [short, long]), [short]);
+    assert_eq!(
+        grants.remaining(client, long),
+        Some(Duration::from_secs(5400))
+    );
+    clock.advance(Duration::from_secs(5400));
+    assert_eq!(grants.missing(client, [long]), [long]);
+}
+
+#[test]
+fn session_grants_have_no_timer_and_client_revocation_is_isolated() {
+    let clock = FakeClock::new();
+    let mut grants = GrantStore::new(clock.clone(), Duration::from_secs(1800));
+    let client = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let secret = SecretId::new();
+    grants.grant_session(client, [secret]);
+    grants.grant_for(other, [secret], Duration::from_secs(3 * 86400));
+    clock.advance(Duration::from_secs(2 * 86400));
+    assert!(grants.missing(client, [secret]).is_empty());
+    assert!(
+        grants
+            .active()
+            .iter()
+            .find(|entry| entry.client_session_id() == client)
+            .unwrap()
+            .expires_with_session()
+    );
+    grants.revoke_client(client);
+    assert_eq!(grants.missing(client, [secret]), [secret]);
+    assert!(grants.missing(other, [secret]).is_empty());
+}
+
+#[test]
+fn calendar_deadline_expires_even_when_elapsed_clock_stops_during_sleep() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[derive(Clone)]
+    struct SleepClock(Rc<Cell<u64>>);
+    impl MonotonicClock for SleepClock {
+        fn now_millis(&self) -> u64 {
+            0
+        }
+        fn wall_time(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(self.0.get())
+        }
+    }
+    let wall = Rc::new(Cell::new(10));
+    let mut grants = GrantStore::new(SleepClock(wall.clone()), Duration::from_secs(1800));
+    let client = Uuid::new_v4();
+    let calendar = SecretId::new();
+    let timed = SecretId::new();
+    grants.grant_until(client, [calendar], UNIX_EPOCH + Duration::from_secs(100));
+    grants.grant(client, [timed]);
+    assert_eq!(
+        grants.remaining(client, calendar),
+        Some(Duration::from_secs(90))
+    );
+    assert!(
+        !grants
+            .active()
+            .iter()
+            .find(|entry| entry.secret_id() == calendar)
+            .unwrap()
+            .expires_with_session()
+    );
+    wall.set(100);
+    assert_eq!(grants.missing(client, [calendar, timed]), [calendar]);
+}

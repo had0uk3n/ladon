@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use uuid::Uuid;
@@ -10,7 +10,24 @@ use crate::{MonotonicClock, SecretId};
 pub struct GrantStore<C> {
     clock: C,
     lifetime_millis: u64,
-    deadlines: HashMap<(Uuid, SecretId), u64>,
+    deadlines: HashMap<(Uuid, SecretId), GrantDeadline>,
+}
+
+#[derive(Clone, Copy)]
+enum GrantDeadline {
+    Elapsed(u64),
+    WallClock(SystemTime),
+    Session,
+}
+
+impl GrantDeadline {
+    fn remaining(self, elapsed: u64, wall: SystemTime) -> Duration {
+        match self {
+            Self::Elapsed(deadline) => Duration::from_millis(deadline.saturating_sub(elapsed)),
+            Self::WallClock(deadline) => deadline.duration_since(wall).unwrap_or(Duration::ZERO),
+            Self::Session => Duration::MAX,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +35,7 @@ pub struct GrantEntry {
     client_session_id: Uuid,
     secret_id: SecretId,
     remaining: Duration,
+    expires_with_session: bool,
 }
 
 impl GrantEntry {
@@ -29,8 +47,13 @@ impl GrantEntry {
         self.secret_id
     }
 
+    /// Session grants have no timed deadline and report Duration::MAX.
     pub const fn remaining(&self) -> Duration {
         self.remaining
+    }
+
+    pub const fn expires_with_session(&self) -> bool {
+        self.expires_with_session
     }
 }
 
@@ -49,12 +72,62 @@ impl<C: MonotonicClock> GrantStore<C> {
         client_session_id: Uuid,
         secret_ids: impl IntoIterator<Item = SecretId>,
     ) {
+        self.grant_for(
+            client_session_id,
+            secret_ids,
+            Duration::from_millis(self.lifetime_millis),
+        );
+    }
+
+    pub fn grant_for(
+        &mut self,
+        client_session_id: Uuid,
+        secret_ids: impl IntoIterator<Item = SecretId>,
+        lifetime: Duration,
+    ) {
         self.purge_expired();
-        let deadline = self.clock.now_millis().saturating_add(self.lifetime_millis);
+        let deadline = self
+            .clock
+            .now_millis()
+            .saturating_add(duration_millis(lifetime));
+        for secret_id in secret_ids {
+            self.deadlines.insert(
+                (client_session_id, secret_id),
+                GrantDeadline::Elapsed(deadline),
+            );
+        }
+    }
+
+    pub fn grant_until(
+        &mut self,
+        client_session_id: Uuid,
+        secret_ids: impl IntoIterator<Item = SecretId>,
+        deadline: SystemTime,
+    ) {
+        self.purge_expired();
+        for secret_id in secret_ids {
+            self.deadlines.insert(
+                (client_session_id, secret_id),
+                GrantDeadline::WallClock(deadline),
+            );
+        }
+    }
+
+    pub fn grant_session(
+        &mut self,
+        client_session_id: Uuid,
+        secret_ids: impl IntoIterator<Item = SecretId>,
+    ) {
+        self.purge_expired();
         for secret_id in secret_ids {
             self.deadlines
-                .insert((client_session_id, secret_id), deadline);
+                .insert((client_session_id, secret_id), GrantDeadline::Session);
         }
+    }
+
+    pub fn revoke_client(&mut self, client_session_id: Uuid) {
+        self.deadlines
+            .retain(|(client, _), _| *client != client_session_id);
     }
 
     pub fn missing(
@@ -79,7 +152,7 @@ impl<C: MonotonicClock> GrantStore<C> {
         self.purge_expired();
         self.deadlines
             .get(&(client_session_id, secret_id))
-            .map(|deadline| Duration::from_millis(deadline.saturating_sub(self.clock.now_millis())))
+            .map(|deadline| deadline.remaining(self.clock.now_millis(), self.clock.wall_time()))
     }
 
     pub fn revoke_all(&mut self) {
@@ -99,7 +172,8 @@ impl<C: MonotonicClock> GrantStore<C> {
             .map(|((client_session_id, secret_id), deadline)| GrantEntry {
                 client_session_id: *client_session_id,
                 secret_id: *secret_id,
-                remaining: Duration::from_millis(deadline.saturating_sub(now)),
+                remaining: deadline.remaining(now, self.clock.wall_time()),
+                expires_with_session: matches!(deadline, GrantDeadline::Session),
             })
             .collect()
     }
@@ -124,7 +198,9 @@ impl<C: MonotonicClock> GrantStore<C> {
 
     fn purge_expired(&mut self) {
         let now = self.clock.now_millis();
-        self.deadlines.retain(|_, deadline| now < *deadline);
+        let wall = self.clock.wall_time();
+        self.deadlines
+            .retain(|_, deadline| !deadline.remaining(now, wall).is_zero());
     }
 }
 

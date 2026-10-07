@@ -62,7 +62,7 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
                         name: "TOKEN".to_owned(),
                     },
                 }],
-                timeout_ms: 5_000,
+                timeout_ms: 30_000,
                 output_limit_bytes: 64 * 1024,
             },
         ))
@@ -94,9 +94,11 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
         panic!("expected run response: {:?}", run.error_details());
     };
     assert!(!stdout.contains("fake-broker-secret"));
-    assert!(stdout.contains("[REDACTED]"));
+    assert!(stdout.contains("[REDACTED]"), "run result: {run:?}");
     assert!(*redaction_count >= 1);
 
+    let ready = directory.path().join("revoke-ready");
+    let run_directory = directory.path().to_string_lossy().into_owned();
     let run_client = client.clone();
     let running = thread::spawn(move || {
         run_client.call(&request_for(
@@ -105,9 +107,10 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
                 executable: "/bin/sh".to_owned(),
                 arguments: vec![
                     "-c".to_owned(),
-                    "trap '' TERM; while :; do sleep 1; done".to_owned(),
+                    "trap '' TERM; printf ready > revoke-ready; while :; do sleep 1; done"
+                        .to_owned(),
                 ],
-                working_directory: "/tmp".to_owned(),
+                working_directory: run_directory,
                 bindings: vec![SecretBindingRequest {
                     secret_ref: "test-token".to_owned(),
                     field: "value".to_owned(),
@@ -115,16 +118,25 @@ fn gui_broker_runs_with_a_secret_without_returning_plaintext() {
                         name: "TOKEN".to_owned(),
                     },
                 }],
-                timeout_ms: 1_000,
+                timeout_ms: 30_000,
                 output_limit_bytes: 64 * 1024,
             },
         ))
     });
-    thread::sleep(Duration::from_millis(100));
+    // Revocation must test an established TERM-ignoring child, not race its startup.
+    let ready_deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(Instant::now() < ready_deadline, "child never became ready");
+        thread::sleep(Duration::from_millis(10));
+    }
     let revoke_started = Instant::now();
     server.revoke_grants().unwrap();
-    assert!(revoke_started.elapsed() >= Duration::from_millis(400));
+    let revoke_elapsed = revoke_started.elapsed();
     let run = running.join().unwrap().unwrap();
+    assert!(
+        revoke_elapsed >= Duration::from_millis(400),
+        "revoke: {revoke_elapsed:?}; result: {run:?}"
+    );
     let Some(RpcResult::Run { termination, .. }) = run.result() else {
         panic!("expected cancelled run response");
     };
@@ -515,4 +527,82 @@ fn wait_for_no_pending(server: &LocalBrokerHandle) {
         );
         thread::yield_now();
     }
+}
+
+#[test]
+fn ending_a_lifetime_connection_requires_new_approval_and_shutdown_releases_connections() {
+    let directory = tempfile::tempdir().unwrap();
+    let passphrase = SensitiveText::from("correct horse");
+    let mut controller = VaultController::new(directory.path().join("vault.ladon"));
+    controller.create(&passphrase, &passphrase).unwrap();
+    let mut draft = AddSecretDraft::new();
+    draft.set_name("session-token");
+    draft.fields_mut()[0]
+        .value_mut()
+        .push_str("fake-session-secret");
+    controller.add_secret(&mut draft).unwrap();
+    let endpoint = directory.path().join("broker.sock");
+    let broker = LocalBrokerHandle::start_at(Arc::new(Mutex::new(controller)), &endpoint).unwrap();
+    let client = LocalClient::new(&endpoint);
+    let session = Uuid::new_v4();
+    let lifetime = client
+        .open_session(&request_for(session, RpcMethod::SessionOpen))
+        .unwrap();
+    let run = request_for(
+        session,
+        RpcMethod::Run {
+            executable: "/usr/bin/true".to_owned(),
+            arguments: vec![],
+            working_directory: "/tmp".to_owned(),
+            bindings: vec![SecretBindingRequest {
+                secret_ref: "session-token".to_owned(),
+                field: "value".to_owned(),
+                target: BindingTarget::Environment {
+                    name: "TOKEN".to_owned(),
+                },
+            }],
+            timeout_ms: 5000,
+            output_limit_bytes: 1024,
+        },
+    );
+    let running = {
+        let client = client.clone();
+        let run = run.clone();
+        thread::spawn(move || client.call(&run))
+    };
+    let pending = wait_for_pending(&broker);
+    broker.approve_session(pending.id()).unwrap();
+    assert!(matches!(
+        running.join().unwrap().unwrap().result(),
+        Some(RpcResult::Run { .. })
+    ));
+    drop(lifetime);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while broker.client_session_connected(session).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "session disconnect was not observed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let retry = {
+        let client = client.clone();
+        thread::spawn(move || client.call(&run))
+    };
+    let pending = wait_for_pending(&broker);
+    broker.deny(pending.id()).unwrap();
+    assert_eq!(
+        retry.join().unwrap().unwrap().error_details().unwrap().0,
+        "approval_denied"
+    );
+    let _live_connection = client
+        .open_session(&request_for(Uuid::new_v4(), RpcMethod::SessionOpen))
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        drop(broker);
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(3))
+        .expect("broker shutdown waited on a live MCP connection");
 }

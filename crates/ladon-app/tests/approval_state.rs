@@ -31,6 +31,10 @@ impl MonotonicClock for FakeClock {
     fn now_millis(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    fn wall_time(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_millis(self.now_millis())
+    }
 }
 
 fn request(client: Uuid, secrets: &[(SecretId, &str)]) -> PendingApproval {
@@ -885,4 +889,154 @@ fn locked_app_rejects_new_authorizations_without_pending_request() {
         Err(LadonError::VaultLocked)
     );
     assert_eq!(coordinator.pending().unwrap(), None);
+}
+
+#[test]
+fn selected_duration_is_scoped_to_the_approved_pairs_and_not_extended_by_use() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "token")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator
+        .approve_for(pending.id(), Duration::from_secs(7200))
+        .unwrap();
+    let ticket = waiting.join().unwrap().unwrap();
+    clock.advance(Duration::from_secs(3600));
+    assert!(coordinator.with_valid_grant(&ticket, || Ok(())).is_ok());
+    assert_eq!(
+        coordinator.active_grants().unwrap()[0].remaining(),
+        Duration::from_secs(3600)
+    );
+    clock.advance(Duration::from_secs(3600));
+    assert_eq!(
+        coordinator.with_valid_grant(&ticket, || Ok(())),
+        Err(LadonError::ApprovalCancelled)
+    );
+}
+
+#[test]
+fn ending_a_tracked_session_revokes_its_grants_without_touching_another_client() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let secret = SecretId::new();
+    let lifetime = RunCancellation::new();
+    coordinator
+        .register_client_session(client, lifetime.clone())
+        .unwrap();
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "token")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator.approve_session(pending.id()).unwrap();
+    let ticket = waiting.join().unwrap().unwrap();
+    approve_request(&coordinator, request(other, &[(secret, "token")]));
+    clock.advance(Duration::from_secs(30));
+    assert!(
+        coordinator
+            .active_grants()
+            .unwrap()
+            .iter()
+            .any(|grant| grant.expires_with_session())
+    );
+    lifetime.cancel();
+    assert_eq!(
+        coordinator.with_valid_grant(&ticket, || Ok(())),
+        Err(LadonError::ApprovalCancelled)
+    );
+    let remaining = coordinator.active_grants().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].client_session_id(), other);
+}
+
+#[test]
+fn session_approval_requires_a_live_tracked_connection() {
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "token")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    assert_eq!(
+        coordinator.approve_session(pending.id()),
+        Err(LadonError::ApprovalCancelled)
+    );
+    coordinator.deny(pending.id()).unwrap();
+    assert_eq!(waiting.join().unwrap(), Err(LadonError::ApprovalDenied));
+}
+
+#[test]
+fn calendar_approval_revalidates_the_selected_absolute_deadline() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(1800),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            coordinator.authorize(
+                request(client, &[(secret, "calendar")]),
+                &RunCancellation::new(),
+            )
+        })
+    };
+    let pending = wait_for_pending(&coordinator);
+    coordinator
+        .approve_until(
+            pending.id(),
+            std::time::UNIX_EPOCH + Duration::from_secs(7200),
+        )
+        .unwrap();
+    let ticket = waiting.join().unwrap().unwrap();
+    clock.advance(Duration::from_secs(7199));
+    assert_eq!(coordinator.with_valid_grant(&ticket, || Ok(9)), Ok(9));
+    let grants = coordinator.active_grants().unwrap();
+    assert_eq!(grants[0].remaining(), Duration::from_secs(1));
+    assert!(!grants[0].expires_with_session());
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        coordinator.with_valid_grant(&ticket, || Ok(9)),
+        Err(LadonError::ApprovalCancelled)
+    );
+    assert!(coordinator.active_grants().unwrap().is_empty());
 }

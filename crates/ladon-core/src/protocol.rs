@@ -29,6 +29,7 @@ pub struct RpcRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum RpcMethod {
+    SessionOpen,
     Status,
     List,
     Lock,
@@ -87,6 +88,7 @@ struct RpcErrorBody {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResult {
+    SessionOpened,
     Status {
         state: String,
         idle_remaining_ms: Option<u64>,

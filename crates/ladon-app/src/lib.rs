@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod agent_broker;
 mod approval;
+#[cfg(all(unix, any(feature = "gui", test)))]
+mod approval_lifetime;
 #[cfg(feature = "gui")]
 mod clipboard;
 #[cfg(feature = "gui")]
@@ -28,7 +30,7 @@ pub use approval::{
 #[cfg(feature = "gui")]
 pub use desktop::run_desktop;
 #[cfg(unix)]
-pub use ipc::{LocalClient, LocalServer, default_endpoint_path};
+pub use ipc::{LocalClient, LocalServer, LocalSession, default_endpoint_path};
 pub use secret_editor::{EditSecretDraft, EditableField, EditableValue};
 pub use session_auth::{PinVerification, SessionConfirmation, SessionPin};
 pub use supervisor::{RunCancellation, RunResult, RunTermination, Supervisor};

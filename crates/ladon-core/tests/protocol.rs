@@ -154,3 +154,20 @@ fn rejects_excessive_nesting_and_client_labels() {
         LadonError::InvalidRequest
     );
 }
+
+#[test]
+fn session_open_request_and_response_round_trip() {
+    let mut json = serde_json::to_value(status_request()).unwrap();
+    json["method"] = "session_open".into();
+    let request = decode_request_frame(&framed(&serde_json::to_vec(&json).unwrap())).unwrap();
+    assert_eq!(serde_json::to_value(&request).unwrap(), json);
+
+    let response_json = serde_json::json!({
+        "version": 2,
+        "request_id": request.request_id,
+        "result": {"type": "session_opened"}
+    });
+    let frame = framed(&serde_json::to_vec(&response_json).unwrap());
+    let response = ladon_core::decode_response_frame(&frame).unwrap();
+    assert_eq!(serde_json::to_value(&response).unwrap(), response_json);
+}

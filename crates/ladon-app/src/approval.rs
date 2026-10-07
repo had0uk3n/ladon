@@ -1,13 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Condvar, Mutex, MutexGuard},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ladon_core::{GrantStore, LadonError, MonotonicClock, SecretId, SystemMonotonicClock};
 use uuid::Uuid;
 
 use crate::RunCancellation;
+
+pub(crate) const MAX_TRACKED_SESSIONS: usize = 32;
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub const DEFAULT_GRANT_LIFETIME: Duration = Duration::from_secs(30 * 60);
@@ -144,6 +146,8 @@ struct ApprovalState<C> {
     vault_session_id: Option<Uuid>,
     pending: Option<PendingState>,
     client_labels: HashMap<Uuid, String>,
+    client_sessions: HashMap<Uuid, RunCancellation>,
+    sessions_closed: bool,
     app_access: AppAccessState,
     lock_epoch: u64,
 }
@@ -161,6 +165,7 @@ pub struct ActiveGrantSnapshot {
     client_label: String,
     secret_id: SecretId,
     remaining: Duration,
+    expires_with_session: bool,
 }
 
 impl ActiveGrantSnapshot {
@@ -183,6 +188,10 @@ impl ActiveGrantSnapshot {
     pub const fn remaining(&self) -> Duration {
         self.remaining
     }
+
+    pub fn expires_with_session(&self) -> bool {
+        self.expires_with_session
+    }
 }
 
 struct PendingState {
@@ -193,7 +202,9 @@ struct PendingState {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ApprovalDecision {
-    Approve,
+    Approve(Option<Duration>),
+    ApproveUntil(SystemTime),
+    ApproveSession,
     Deny,
     Cancel,
 }
@@ -207,6 +218,8 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                 vault_session_id: None,
                 pending: None,
                 client_labels: HashMap::new(),
+                client_sessions: HashMap::new(),
+                sessions_closed: false,
                 app_access: AppAccessState::Active,
                 lock_epoch: 0,
             }),
@@ -230,6 +243,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         wake: impl FnOnce(),
     ) -> Result<GrantTicket, LadonError> {
         let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
         if !is_app_active(&state) {
             return Err(LadonError::VaultLocked);
         }
@@ -282,6 +296,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         wake();
         let mut state = self.lock_state()?;
         loop {
+            purge_disconnected_clients(&mut state);
             if cancellation.is_cancelled() {
                 clear_pending(&mut state, approval_id);
                 self.changed.notify_all();
@@ -291,12 +306,50 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             if let Some(decision) = decision_for(&state, approval_id) {
                 let pending = state.pending.take().ok_or(LadonError::ProcessFailure)?;
                 match decision {
-                    ApprovalDecision::Approve => {
+                    ApprovalDecision::Approve(lifetime) => {
                         let client_session_id = pending.request.client_session_id;
                         let client_label = pending.request.client_label.clone();
                         let secret_ids = pending.request.secrets.iter().map(ApprovalSecret::id);
-                        state.grants.grant(client_session_id, secret_ids);
+                        if let Some(lifetime) = lifetime {
+                            state
+                                .grants
+                                .grant_for(client_session_id, secret_ids, lifetime);
+                        } else {
+                            state.grants.grant(client_session_id, secret_ids);
+                        }
                         state.client_labels.insert(client_session_id, client_label);
+                        self.changed.notify_all();
+                        return Ok(ticket);
+                    }
+                    ApprovalDecision::ApproveUntil(deadline) => {
+                        let client = pending.request.client_session_id;
+                        state.grants.grant_until(
+                            client,
+                            pending.request.secrets.iter().map(ApprovalSecret::id),
+                            deadline,
+                        );
+                        state
+                            .client_labels
+                            .insert(client, pending.request.client_label);
+                        self.changed.notify_all();
+                        return Ok(ticket);
+                    }
+                    ApprovalDecision::ApproveSession => {
+                        let client = pending.request.client_session_id;
+                        if !state
+                            .client_sessions
+                            .get(&client)
+                            .is_some_and(|session| !session.is_cancelled())
+                        {
+                            return Err(LadonError::ApprovalCancelled);
+                        }
+                        state.grants.grant_session(
+                            client,
+                            pending.request.secrets.iter().map(ApprovalSecret::id),
+                        );
+                        state
+                            .client_labels
+                            .insert(client, pending.request.client_label);
                         self.changed.notify_all();
                         return Ok(ticket);
                     }
@@ -328,9 +381,46 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         }
     }
 
+    pub fn register_client_session(
+        &self,
+        client: Uuid,
+        cancellation: RunCancellation,
+    ) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        if state.sessions_closed
+            || state.client_sessions.contains_key(&client)
+            || state.client_sessions.len() >= MAX_TRACKED_SESSIONS
+        {
+            return Err(LadonError::Busy);
+        }
+        state.grants.revoke_client(client);
+        state.client_sessions.insert(client, cancellation);
+        Ok(())
+    }
+
+    pub fn client_session_connected(&self, client: Uuid) -> Result<bool, LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        Ok(state.client_sessions.contains_key(&client))
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn close_client_sessions(&self) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        state.sessions_closed = true;
+        for cancellation in state.client_sessions.values() {
+            cancellation.cancel();
+        }
+        purge_disconnected_clients(&mut state);
+        self.changed.notify_all();
+        Ok(())
+    }
+
     pub fn pending(&self) -> Result<Option<PendingApproval>, LadonError> {
-        Ok(self
-            .lock_state()?
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        Ok(state
             .pending
             .as_ref()
             .filter(|pending| pending.decision.is_none())
@@ -368,6 +458,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
 
     pub fn active_grants(&self) -> Result<Vec<ActiveGrantSnapshot>, LadonError> {
         let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
         let active = state.grants.active();
         let active_clients: HashSet<_> = active
             .iter()
@@ -387,6 +478,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                     .unwrap_or_else(|| "MCP client".to_owned()),
                 secret_id: grant.secret_id(),
                 remaining: grant.remaining(),
+                expires_with_session: grant.expires_with_session(),
             })
             .collect())
     }
@@ -458,7 +550,19 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
     }
 
     pub fn approve(&self, approval_id: Uuid) -> Result<(), LadonError> {
-        self.set_decision(approval_id, ApprovalDecision::Approve)
+        self.set_decision(approval_id, ApprovalDecision::Approve(None))
+    }
+
+    pub fn approve_for(&self, approval_id: Uuid, lifetime: Duration) -> Result<(), LadonError> {
+        self.set_decision(approval_id, ApprovalDecision::Approve(Some(lifetime)))
+    }
+
+    pub fn approve_until(&self, approval_id: Uuid, deadline: SystemTime) -> Result<(), LadonError> {
+        self.set_decision(approval_id, ApprovalDecision::ApproveUntil(deadline))
+    }
+
+    pub fn approve_session(&self, approval_id: Uuid) -> Result<(), LadonError> {
+        self.set_decision(approval_id, ApprovalDecision::ApproveSession)
     }
 
     pub fn deny(&self, approval_id: Uuid) -> Result<(), LadonError> {
@@ -529,6 +633,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         operation: impl FnOnce() -> Result<T, LadonError>,
     ) -> Result<T, LadonError> {
         let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
         if !is_app_active(&state)
             || state.vault_session_id != Some(ticket.vault_session_id)
             || !state
@@ -547,12 +652,29 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         decision: ApprovalDecision,
     ) -> Result<(), LadonError> {
         let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        if decision == ApprovalDecision::ApproveSession {
+            let client = state
+                .pending
+                .as_ref()
+                .ok_or(LadonError::InvalidRequest)?
+                .request
+                .client_session_id;
+            if !state.client_sessions.contains_key(&client) {
+                return Err(LadonError::ApprovalCancelled);
+            }
+        }
         let pending = state.pending.as_mut().ok_or(LadonError::InvalidRequest)?;
         if pending.request.id != approval_id || pending.decision.is_some() {
             return Err(LadonError::InvalidRequest);
         }
         pending.decision = Some(decision);
-        if decision != ApprovalDecision::Approve {
+        if !matches!(
+            decision,
+            ApprovalDecision::Approve(_)
+                | ApprovalDecision::ApproveUntil(_)
+                | ApprovalDecision::ApproveSession
+        ) {
             prune_client_labels(&mut state);
         }
         self.changed.notify_all();
@@ -561,6 +683,27 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
 
     fn lock_state(&self) -> Result<MutexGuard<'_, ApprovalState<C>>, LadonError> {
         self.state.lock().map_err(|_| LadonError::ProcessFailure)
+    }
+}
+
+fn purge_disconnected_clients<C: MonotonicClock>(state: &mut ApprovalState<C>) {
+    let disconnected: Vec<_> = state
+        .client_sessions
+        .iter()
+        .filter(|(_, token)| token.is_cancelled())
+        .map(|(client, _)| *client)
+        .collect();
+    for client in disconnected {
+        state.client_sessions.remove(&client);
+        state.grants.revoke_client(client);
+        state.client_labels.remove(&client);
+        if let Some(pending) = state
+            .pending
+            .as_mut()
+            .filter(|pending| pending.request.client_session_id == client)
+        {
+            pending.decision = Some(ApprovalDecision::Cancel);
+        }
     }
 }
 
@@ -621,6 +764,21 @@ mod wake_tests {
     use super::*;
 
     #[test]
+    fn shutdown_rejects_session_registration_after_cancelling_existing_connections() {
+        let coordinator = ApprovalCoordinator::session_defaults();
+        let token = RunCancellation::new();
+        coordinator
+            .register_client_session(Uuid::new_v4(), token.clone())
+            .unwrap();
+        coordinator.close_client_sessions().unwrap();
+        assert!(token.is_cancelled());
+        assert_eq!(
+            coordinator.register_client_session(Uuid::new_v4(), RunCancellation::new()),
+            Err(LadonError::Busy)
+        );
+    }
+
+    #[test]
     fn approval_wakes_after_publication_without_holding_the_state_mutex() {
         let coordinator = ApprovalCoordinator::session_defaults();
         let request = PendingApproval::new(
@@ -641,5 +799,36 @@ mod wake_tests {
         });
         assert_eq!(result, Err(LadonError::ApprovalDenied));
         assert!(coordinator.pending().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn session_capacity_is_bounded_and_disconnect_releases_a_slot() {
+        let coordinator = ApprovalCoordinator::session_defaults();
+        let first = RunCancellation::new();
+        let client = Uuid::new_v4();
+        coordinator
+            .register_client_session(client, first.clone())
+            .unwrap();
+        for _ in 1..MAX_TRACKED_SESSIONS {
+            coordinator
+                .register_client_session(Uuid::new_v4(), RunCancellation::new())
+                .unwrap();
+        }
+        assert_eq!(
+            coordinator.register_client_session(Uuid::new_v4(), RunCancellation::new()),
+            Err(LadonError::Busy)
+        );
+        assert!(coordinator.client_session_connected(client).unwrap());
+        first.cancel();
+        coordinator
+            .register_client_session(Uuid::new_v4(), RunCancellation::new())
+            .unwrap();
+        assert!(!coordinator.client_session_connected(client).unwrap());
+        coordinator.close_client_sessions().unwrap();
     }
 }

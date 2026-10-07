@@ -808,6 +808,7 @@ pub enum DetailMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NavigationTarget {
     Add,
+    Sessions,
     Secret(SecretId),
     Close,
 }
@@ -832,6 +833,7 @@ pub enum DetailStateError {
 }
 
 pub struct SecretDetailState {
+    navigation_target: NavigationTarget,
     selected: Option<SecretId>,
     authorized: Option<LocalAuthAttempt>,
     selection_epoch: u64,
@@ -842,6 +844,7 @@ pub struct SecretDetailState {
 impl Default for SecretDetailState {
     fn default() -> Self {
         Self {
+            navigation_target: NavigationTarget::Add,
             selected: None,
             authorized: None,
             selection_epoch: 0,
@@ -852,6 +855,11 @@ impl Default for SecretDetailState {
 }
 
 impl SecretDetailState {
+    #[must_use]
+    pub const fn navigation_target(&self) -> NavigationTarget {
+        self.navigation_target
+    }
+
     #[must_use]
     pub const fn selected(&self) -> Option<SecretId> {
         self.selected
@@ -963,9 +971,10 @@ impl SecretDetailState {
     pub fn navigate_now(&mut self, target: NavigationTarget) {
         self.drop_sensitive_mode();
         self.authorized = None;
+        self.navigation_target = target;
         self.selected = match target {
             NavigationTarget::Secret(secret_id) => Some(secret_id),
-            NavigationTarget::Add | NavigationTarget::Close => None,
+            NavigationTarget::Add | NavigationTarget::Sessions | NavigationTarget::Close => None,
         };
         self.pending_navigation = None;
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
@@ -974,6 +983,7 @@ impl SecretDetailState {
     pub fn clear_for_vault_lock(&mut self) {
         self.drop_sensitive_mode();
         self.selected = None;
+        self.navigation_target = NavigationTarget::Add;
         self.authorized = None;
         self.pending_navigation = None;
         self.selection_epoch = self.selection_epoch.wrapping_add(1);

@@ -16,8 +16,8 @@ use std::{
 };
 
 use ladon_core::{
-    LadonError, MAX_FRAME_BYTES, RpcRequest, RpcResponse, decode_request_frame,
-    decode_response_frame, encode_request_frame, encode_response_frame,
+    LadonError, MAX_FRAME_BYTES, RpcMethod, RpcRequest, RpcResponse, RpcResult,
+    decode_request_frame, decode_response_frame, encode_request_frame, encode_response_frame,
 };
 
 use crate::RunCancellation;
@@ -151,12 +151,24 @@ impl LocalConnection {
                 }
             }
         });
-        let response = handler(request, cancellation);
-        let frame = encode_response_frame(&response)?;
-        let write_result = self
-            .stream
-            .write_all(&frame)
-            .map_err(|_| LadonError::EndpointUnavailable);
+        let is_session_open = matches!(request.method, RpcMethod::SessionOpen);
+        let response = handler(request, cancellation.clone());
+        let session_opened =
+            is_session_open && response.result() == Some(&RpcResult::SessionOpened);
+        let write_result = encode_response_frame(&response).and_then(|frame| {
+            self.stream
+                .write_all(&frame)
+                .map_err(|_| LadonError::EndpointUnavailable)
+        });
+        if is_session_open {
+            if session_opened && write_result.is_ok() {
+                while !cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            } else {
+                cancellation.cancel();
+            }
+        }
         monitor_stop.store(true, Ordering::Release);
         let _ = monitor.join();
         write_result
@@ -185,6 +197,31 @@ pub struct LocalClient {
     path: PathBuf,
 }
 
+/// Keeps the authenticated session connection open until this guard is dropped.
+#[derive(Debug)]
+pub struct LocalSession {
+    _stream: UnixStream,
+}
+
+impl LocalSession {
+    /// Checks the dedicated session socket without consuming bytes or blocking.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        let mut byte = [0_u8; 1];
+        // SAFETY: the stream owns an open fd and byte is writable for its full length.
+        // MSG_DONTWAIT avoids changing socket-wide flags or blocking this health check.
+        let received = unsafe {
+            libc::recv(
+                self._stream.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                byte.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        received < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+    }
+}
+
 #[must_use]
 pub fn default_endpoint_path() -> PathBuf {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -206,7 +243,28 @@ impl LocalClient {
         }
     }
 
+    pub fn open_session(&self, request: &RpcRequest) -> Result<LocalSession, LadonError> {
+        if !matches!(request.method, RpcMethod::SessionOpen) {
+            return Err(LadonError::InvalidRequest);
+        }
+        let (stream, response) = self.exchange(request)?;
+        if response.request_id != request.request_id {
+            return Err(LadonError::InvalidRequest);
+        }
+        if let Some((code, _)) = response.error_details() {
+            return Err(LadonError::from_code(code).unwrap_or(LadonError::InvalidRequest));
+        }
+        if response.result() != Some(&RpcResult::SessionOpened) {
+            return Err(LadonError::InvalidRequest);
+        }
+        Ok(LocalSession { _stream: stream })
+    }
+
     pub fn call(&self, request: &RpcRequest) -> Result<RpcResponse, LadonError> {
+        self.exchange(request).map(|(_, response)| response)
+    }
+
+    fn exchange(&self, request: &RpcRequest) -> Result<(UnixStream, RpcResponse), LadonError> {
         validate_endpoint(&self.path)?;
         let mut stream =
             UnixStream::connect(&self.path).map_err(|_| LadonError::EndpointUnavailable)?;
@@ -216,7 +274,7 @@ impl LocalClient {
             .write_all(&frame)
             .map_err(|_| LadonError::EndpointUnavailable)?;
         let response = read_frame(&mut stream)?;
-        decode_response_frame(&response)
+        Ok((stream, decode_response_frame(&response)?))
     }
 }
 
@@ -338,5 +396,107 @@ fn verify_peer(fd: RawFd) -> Result<(), LadonError> {
         Ok(())
     } else {
         Err(LadonError::InvalidPeer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ladon_core::{PROTOCOL_VERSION, RpcMethod, RpcResult};
+    use std::sync::mpsc;
+    use uuid::Uuid;
+
+    #[test]
+    fn session_socket_remains_open_until_guard_disconnects() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let request = RpcRequest {
+            version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            client_session_id: Uuid::new_v4(),
+            client_label: "MCP lifetime".to_owned(),
+            method: RpcMethod::SessionOpen,
+        };
+        let (token_tx, token_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = LocalConnection { stream: server }.serve(|request, cancellation| {
+                token_tx.send(cancellation).unwrap();
+                RpcResponse::success(request.request_id, RpcResult::SessionOpened)
+            });
+            finished_tx.send(result).unwrap();
+        });
+        client
+            .write_all(&encode_request_frame(&request).unwrap())
+            .unwrap();
+        let response = decode_response_frame(&read_frame(&mut client).unwrap()).unwrap();
+        assert_eq!(response.result(), Some(&RpcResult::SessionOpened));
+        let cancellation = token_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(150))
+                .is_err()
+        );
+        assert!(!cancellation.is_cancelled());
+        drop(client);
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(cancellation.is_cancelled());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancelling_session_token_releases_worker_with_client_still_connected() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let request = RpcRequest {
+            version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            client_session_id: Uuid::new_v4(),
+            client_label: "MCP lifetime".to_owned(),
+            method: RpcMethod::SessionOpen,
+        };
+        let (token_tx, token_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = LocalConnection { stream: server }.serve(|request, cancellation| {
+                token_tx.send(cancellation).unwrap();
+                RpcResponse::success(request.request_id, RpcResult::SessionOpened)
+            });
+            finished_tx.send(result).unwrap();
+        });
+        client
+            .write_all(&encode_request_frame(&request).unwrap())
+            .unwrap();
+        read_frame(&mut client).unwrap();
+        token_rx.recv().unwrap().cancel();
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        drop(client);
+    }
+
+    #[test]
+    fn session_health_check_is_nonblocking_and_detects_peer_eof() {
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let session = LocalSession { _stream: client };
+        let started = std::time::Instant::now();
+        assert!(session.is_connected());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(server);
+        assert!(!session.is_connected());
+    }
+
+    #[test]
+    fn session_health_check_rejects_unexpected_incoming_bytes() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let session = LocalSession { _stream: client };
+        server.write_all(b"unexpected").unwrap();
+        assert!(!session.is_connected());
     }
 }

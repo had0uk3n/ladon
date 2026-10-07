@@ -9,7 +9,11 @@ follow-up fixes below are part of the same security-preview delivery.
 The subsequent session-grant change adds a memory-only authorization boundary:
 protocol-v2 clients receive a random process-lifetime UUID; the broker resolves
 requested metadata before plaintext, blocks before process launch, and grants
-only the displayed `(client session, secret ID)` pairs for a fixed 30 minutes.
+only the displayed `(client session, secret ID)` pairs. The approval now selects
+30 minutes, local midnight, or tracked process lifetime. A separate authenticated
+local lifecycle socket revokes all grants for that client on disconnect; session
+expiry requires a live connection. Calendar expiry follows wall time across sleep
+and daylight-saving changes.
 PIN and strict macOS Touch ID both gate that same transition.
 
 An independent review of that change found three important race/lifetime gaps:

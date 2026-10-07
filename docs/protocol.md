@@ -6,7 +6,7 @@ On Unix, `ladon-app` listens on an owner-only Unix socket under
 `$XDG_RUNTIME_DIR/ladon/broker.sock` or an owner-specific temporary directory.
 The directory is mode `0700`, the socket is `0600`, and both sides verify peer
 UID credentials. Connections use one length-prefixed protocol-v2 JSON request
-and response;
+and response (the lifecycle connection described below stays open);
 the maximum JSON payload is 4 MiB and nesting/duplicate keys are rejected.
 
 Every request contains a random `client_session_id`. `ladon mcp` generates it
@@ -19,8 +19,9 @@ The existing `client_label` field carries the current untrusted reported name;
 it is non-secret display metadata, not an authentication claim. The GUI marks
 it as reported and shows an eight-character session ID for disambiguation.
 
-Protocol version 2 supports four methods:
+Protocol version 2 supports five methods:
 
+- `session_open`: register a process-lifetime connection;
 - `status`: lock state and non-secret idle time;
 - `list`: secret IDs, names, and field names only;
 - `lock`: cancel the active run and lock the vault;
@@ -52,15 +53,31 @@ There is no get/export/plaintext method. A run response contains exit status,
 termination reason, bounded redacted stdout/stderr, duration, redaction count,
 truncation state, and a non-sensitive temporary-file cleanup warning.
 
-The broker accepts at most eight concurrent same-user connection workers and
-one active run. Socket reads/writes have five-second timeouts. Run bindings are
+Clients open a separate `session_open` connection before their first list or run
+request. A `session_opened` response acknowledges registration; the client keeps
+the socket open for its process lifetime, while ordinary RPCs use separate
+connections. Status and lock never require a lifecycle slot, so admission
+limits cannot prevent hard locking. EOF or a socket error revokes that client's grants and cancels its
+pending approval. A duplicate live UUID is rejected. MCP reconnects before its
+next tool call if Ladon has restarted. A one-shot CLI command holds the connection
+until its RPC completes. This is internal IPC, not a sixth MCP tool. Older direct
+RPC clients can still use timed approvals, but cannot select session expiry.
+
+The broker accepts at most 40 concurrent same-user connection workers, with at
+most 32 lifecycle connections, leaving capacity for ordinary RPCs. Only one run
+can execute at a time. Socket reads/writes have five-second timeouts; established
+lifecycle sockets instead monitor disconnection until shutdown. Run bindings are
 limited to 16 and one MiB of injected data in aggregate.
 
 Before a secret-bearing run, the app resolves references to immutable secret
-IDs and checks a fixed 30-minute in-memory grant for every
+IDs and checks an unexpired in-memory grant for every
 `(client_session_id, secret_id)` pair. Missing grants create one bounded pending
 GUI approval. PIN or Touch ID approval grants only the displayed missing IDs;
-use does not extend expiry. Denial, timeout, or client disconnect starts no
+the selected expiry is 30 minutes by default, the next local midnight, or the
+end of the tracked MCP process. Midnight uses a wall-clock deadline, including
+sleep and daylight-saving changes; 30-minute grants use elapsed time. Use does
+not extend expiry. Tracked client disconnection revokes its grants. Denial,
+timeout, or client disconnect starts no
 child. Listing metadata and runs with no secret bindings do not create grants.
 Only one run may reserve the approval/execution slot at a time, so a busy request
 cannot accidentally obtain a grant. Lock and app shutdown cancel a pending
@@ -68,16 +85,17 @@ approval and clear all grants. Each unlock has a fresh internal epoch, so an
 abnormal lock cannot leave a reusable permission. The broker rechecks expiry
 and revocation immediately before plaintext resolution.
 
-The GUI's **Agent access** panel lists active grants, their reported names,
-session IDs, secret names, remaining time, and whether each pair is running.
+The GUI's left **Active sessions** button counts distinct clients with grants
+and opens their details on the right. Grants are grouped by reported name and
+session ID, with secret names, remaining time or session expiry, and running state.
 Its per-row **Revoke** removes exactly one `(client_session_id, secret_id)`
 grant, cancels and waits for a matching active run, and preserves other grants.
 **Revoke all** clears every grant and cancels and waits for the active run.
 Active-grant snapshots and targeted revocation are GUI-only and never cross
-RPC or MCP; protocol v2 still has only the four methods above. Revocation
+RPC or MCP. Revocation
 cannot erase bytes already consumed, retained, or transmitted by an authorized
-child. If the last grant expires before its command finishes, the GUI hides the
-empty list but retains an **Agent command running** indicator and **Revoke all**
+child. If the last grant expires before its command finishes, the session view
+retains an **Agent command running** indicator and **Revoke all**
 until that command exits or is cancelled.
 
 Saving or deleting a secret in the GUI also invalidates every grant for that

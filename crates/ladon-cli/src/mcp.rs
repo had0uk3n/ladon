@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{RpcTransport, commands::resolve_executable};
+use crate::{RpcSessionLease, RpcTransport, commands::resolve_executable};
 
 const MCP_LEGACY_VERSION: &str = "2025-11-25";
 const MCP_MODERN_VERSION: &str = "2026-07-28";
@@ -19,6 +19,7 @@ struct McpSession {
     id: Uuid,
     initialized_name: Option<String>,
     display_name: Option<String>,
+    lifetime: Option<Box<dyn RpcSessionLease>>,
 }
 
 impl McpSession {
@@ -27,6 +28,7 @@ impl McpSession {
             id: Uuid::new_v4(),
             initialized_name: None,
             display_name: None,
+            lifetime: None,
         }
     }
 
@@ -188,6 +190,22 @@ fn call_tool(
         Ok(method) => method,
         Err(error) => return tool_error(id, error.code(), error.safe_message()),
     };
+    // Admission limits must not prevent a new client from locking the vault.
+    if matches!(method, RpcMethod::Run { .. } | RpcMethod::List) {
+        if session
+            .lifetime
+            .as_ref()
+            .is_some_and(|lease| !lease.is_connected())
+        {
+            session.lifetime = None;
+        }
+        if session.lifetime.is_none() {
+            match transport.open_session(session.id, session.label()) {
+                Ok(lifetime) => session.lifetime = Some(lifetime),
+                Err(error) => return tool_error(id, error.code(), error.safe_message()),
+            }
+        }
+    }
     let request = RpcRequest {
         version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),

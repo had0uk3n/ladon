@@ -18,7 +18,8 @@ owner-authenticated named-pipe transport is not implemented yet.
   and editing, explicit backup recovery, and 30-minute activity locking;
 - optional memory-only 4–12 digit session PIN on every platform plus strict
   Touch ID on macOS;
-- one-confirmation, fixed 30-minute access per agent-process/secret pair, with
+- one-confirmation access per agent-process/secret pair for 30 minutes, until
+  local midnight, or until that process ends, with
   a live GUI access list and per-grant or all-grant revocation;
 - generic direct process execution without a shell added by Ladon;
 - environment, stdin, and temporary-file injection by secret name or ID;
@@ -168,19 +169,26 @@ arguments) start collapsed under **Show full command**. Expand the section to
 inspect all arguments in a scrollable area; the executable and working directory
 remain visible.
 
-Confirm once with the session PIN or Touch ID and that MCP process may use the
-displayed secret for a fixed 30 minutes; use does not extend the timer. A different MCP process or another secret asks separately. The GUI's
-**Agent access** panel shows one row per active process/secret grant, with its
-reported name, eight-character session ID, secret name, remaining time, and
-**Running** while that pair is in use. **Revoke** removes only that row's grant
-and cancels a matching supervised run before returning, preserving unrelated
-grants. **Revoke all** clears every grant and cancels the active run. These
-active-grant views and targeted revoke controls are GUI-only; neither is
-exposed over RPC or MCP. A one-shot `ladon run` invocation has a fresh client
-identity, so it asks each time. Revocation cannot erase bytes a child has
-already consumed, retained, or transmitted. If a grant expires while its
-authorized command is still finishing, the empty grant list stays hidden but
-the GUI keeps an **Agent command running** indicator and **Revoke all** control.
+Choose **30 minutes** (the default), **Until end of day** (local midnight), or
+**Until session ends** in the approval window, then confirm with the session PIN
+or Touch ID. Use does not extend the chosen deadline. Here a session is one
+`ladon mcp` process, rather than a chat: its private authenticated local socket
+lets Ladon detect disconnection and revoke that process's grants. This also
+bounds timed grants; lock and app shutdown revoke all grants. Calendar expiry
+uses the wall clock, including time spent asleep. A different process or another
+secret asks separately.
+
+The left **Active sessions** button counts processes with active grants. Clicking
+it opens the session details on the right, grouped by reported name and short
+session ID, with secret names, remaining time (or **Until session ends**), and
+**Running** while a grant is in use. **Revoke** removes only that grant and cancels
+a matching supervised run before returning. **Revoke all** clears every grant
+and cancels the active run. These views and targeted controls are GUI-only.
+A one-shot `ladon run` invocation has a fresh client identity and ends its session
+after the command, so it asks each time. Revocation cannot erase bytes a child
+has already consumed, retained, or transmitted. If the last grant expires while
+its command is finishing, the session view retains an **Agent command running**
+indicator and **Revoke all** control until that command exits or is cancelled.
 
 **Lock app** is a soft UI lock. It revokes grants, cancels the active run,
 and prevents secret use until local authentication. The vault key and PIN

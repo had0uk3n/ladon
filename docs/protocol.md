@@ -34,13 +34,13 @@ results:
 
 ```text
 AppLocked status => state "locked", idle_remaining_ms absent/null
-AppLocked list   => local unlock prompt, then metadata after authentication
-AppLocked run    => local unlock prompt, then ordinary command approval
+AppLocked list   => authorized unattended snapshot, otherwise local unlock prompt
+AppLocked run    => valid unattended grants, otherwise local unlock prompt and approval
 AppLocked lock   => success after hard vault lock
 ```
 
 List/run on a desktop broker can request an unlock prompt, never submit a PIN,
-perform authentication, or bypass command approval. Status remains silent.
+perform authentication, or create unattended permissions. Status remains silent.
 A locked request waits up to two minutes for local authentication; denial,
 disconnection, shutdown, timeout or a subsequent hard lock terminates it.
 Only one unlock request waits at a time (others receive `busy`). The request
@@ -80,14 +80,16 @@ not extend expiry. Tracked client disconnection revokes its grants. Denial,
 timeout, or client disconnect starts no
 child. Listing metadata and runs with no secret bindings do not create grants.
 Only one run may reserve the approval/execution slot at a time, so a busy request
-cannot accidentally obtain a grant. Lock and app shutdown cancel a pending
+cannot accidentally obtain a grant. Manual lock and app shutdown cancel a pending
 approval and clear all grants. Each unlock has a fresh internal epoch, so an
 abnormal lock cannot leave a reusable permission. The broker rechecks expiry
 and revocation immediately before plaintext resolution.
 
-The GUI's left **Active sessions** button counts distinct clients with grants
-and opens their details on the right. Grants are grouped by reported name and
-session ID, with secret names, remaining time or session expiry, and running state.
+The GUI's left **Active sessions** button includes every live lifecycle connection,
+including connections without grants, plus legacy clients with active grants.
+Connection cards show reported names, local aliases/notes, project, last activity,
+waiting/running/idle state and grants with expiration. Annotations are bounded,
+memory-only and removed on disconnection; they never alter UUID permission keys.
 Its per-row **Revoke** removes exactly one `(client_session_id, secret_id)`
 grant, cancels and waits for a matching active run, and preserves other grants.
 **Revoke all** clears every grant and cancels and waits for the active run.
@@ -97,6 +99,21 @@ cannot erase bytes already consumed, retained, or transmitted by an authorized
 child. If the last grant expires before its command finishes, the session view
 retains an **Agent command running** indicator and **Revoke all**
 until that command exits or is cancelled.
+
+Unattended approval is GUI-only and requires fresh local PIN or Touch ID.
+The GUI captures immutable secret IDs, vault session, mutation revision and lock
+epoch before authentication. Completion validates this context before granting;
+a mutation or intervening lock rejects stale confirmation. Expiration is fixed
+at confirmation capture: 30 minutes, 2/8/12 hours or local HH:MM within 24 hours.
+It uses an absolute wall-clock deadline with an elapsed-time ceiling, so clock
+changes or sleep cannot extend the grant. New secrets never join that snapshot.
+Automatic interface locking preserves only these grants and eligible runs.
+While locked, every referenced secret must have unattended access; listing is
+restricted to that connection's authorized IDs. Missing access requires local
+unlock. Manual app lock, hard lock, targeted/session/global revoke, deadline,
+disconnection and exit revoke access. A manual lock while already automatically
+locked still revokes retained grants. **Revoke session** also cancels that
+connection's pending/running command.
 
 Saving or deleting a secret in the GUI also invalidates every grant for that
 immutable secret ID. This does not add a protocol method: the local selected-

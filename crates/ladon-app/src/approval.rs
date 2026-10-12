@@ -150,6 +150,31 @@ struct ApprovalState<C> {
     sessions_closed: bool,
     app_access: AppAccessState,
     lock_epoch: u64,
+    revision: u64,
+    sessions: HashMap<Uuid, SessionDetails>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionDetails {
+    pub client_session_id: Uuid,
+    pub connection_id: Uuid,
+    pub reported_name: String,
+    pub user_name: String,
+    pub note: String,
+    pub working_directory: String,
+    pub last_action: String,
+    pub connected_at: SystemTime,
+    pub last_activity: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnattendedContext {
+    pub(crate) client: Uuid,
+    pub(crate) vault: Uuid,
+    revision: u64,
+    epoch: u64,
+    connection_id: Uuid,
+    pub(crate) session_label: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,6 +191,8 @@ pub struct ActiveGrantSnapshot {
     secret_id: SecretId,
     remaining: Duration,
     expires_with_session: bool,
+    unattended: bool,
+    expires_at: Option<SystemTime>,
 }
 
 impl ActiveGrantSnapshot {
@@ -192,6 +219,12 @@ impl ActiveGrantSnapshot {
     pub fn expires_with_session(&self) -> bool {
         self.expires_with_session
     }
+    pub const fn unattended(&self) -> bool {
+        self.unattended
+    }
+    pub const fn expires_at(&self) -> Option<SystemTime> {
+        self.expires_at
+    }
 }
 
 struct PendingState {
@@ -205,6 +238,7 @@ enum ApprovalDecision {
     Approve(Option<Duration>),
     ApproveUntil(SystemTime),
     ApproveSession,
+    Granted,
     Deny,
     Cancel,
 }
@@ -222,6 +256,8 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                 sessions_closed: false,
                 app_access: AppAccessState::Active,
                 lock_epoch: 0,
+                revision: 0,
+                sessions: HashMap::new(),
             }),
             changed: Condvar::new(),
             approval_timeout,
@@ -245,7 +281,21 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         let mut state = self.lock_state()?;
         purge_disconnected_clients(&mut state);
         if !is_app_active(&state) {
-            return Err(LadonError::VaultLocked);
+            let ids: Vec<_> = request.secrets.iter().map(ApprovalSecret::id).collect();
+            if state.vault_session_id != Some(request.vault_session_id)
+                || !client_has_unattended(&mut state, request.client_session_id)
+                || !state
+                    .grants
+                    .missing_unattended(request.client_session_id, ids.iter().copied())
+                    .is_empty()
+            {
+                return Err(LadonError::VaultLocked);
+            }
+            return Ok(GrantTicket {
+                vault_session_id: request.vault_session_id,
+                client_session_id: request.client_session_id,
+                secret_ids: ids,
+            });
         }
         if state.pending.is_some() {
             return Err(LadonError::Busy);
@@ -306,6 +356,17 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             if let Some(decision) = decision_for(&state, approval_id) {
                 let pending = state.pending.take().ok_or(LadonError::ProcessFailure)?;
                 match decision {
+                    ApprovalDecision::Granted => {
+                        if !state
+                            .grants
+                            .missing(ticket.client_session_id, ticket.secret_ids.iter().copied())
+                            .is_empty()
+                        {
+                            return Err(LadonError::ApprovalCancelled);
+                        }
+                        self.changed.notify_all();
+                        return Ok(ticket);
+                    }
                     ApprovalDecision::Approve(lifetime) => {
                         let client_session_id = pending.request.client_session_id;
                         let client_label = pending.request.client_label.clone();
@@ -395,6 +456,21 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             return Err(LadonError::Busy);
         }
         state.grants.revoke_client(client);
+        let now = state.grants.wall_time();
+        state.sessions.insert(
+            client,
+            SessionDetails {
+                client_session_id: client,
+                connection_id: Uuid::new_v4(),
+                reported_name: "MCP client".to_owned(),
+                user_name: String::new(),
+                note: String::new(),
+                working_directory: String::new(),
+                last_action: "Connected".to_owned(),
+                connected_at: now,
+                last_activity: now,
+            },
+        );
         state.client_sessions.insert(client, cancellation);
         Ok(())
     }
@@ -433,6 +509,12 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         client_label: &str,
     ) -> Result<(), LadonError> {
         let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        let now = state.grants.wall_time();
+        if let Some(session) = state.sessions.get_mut(&client_session_id) {
+            session.reported_name = bounded_metadata(client_label, 128);
+            session.last_activity = now;
+        }
         let owns_active_grant = state
             .grants
             .active()
@@ -479,6 +561,8 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                 secret_id: grant.secret_id(),
                 remaining: grant.remaining(),
                 expires_with_session: grant.expires_with_session(),
+                unattended: grant.unattended(),
+                expires_at: grant.expires_at(),
             })
             .collect())
     }
@@ -497,6 +581,14 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
     }
 
     pub fn begin_app_lock(&self) -> Result<u64, LadonError> {
+        self.begin_app_lock_with_policy(false)
+    }
+
+    pub fn begin_auto_app_lock(&self) -> Result<u64, LadonError> {
+        self.begin_app_lock_with_policy(true)
+    }
+
+    fn begin_app_lock_with_policy(&self, preserve: bool) -> Result<u64, LadonError> {
         let mut state = self.lock_state()?;
         if !is_app_active(&state) {
             return Err(LadonError::Busy);
@@ -508,8 +600,13 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         state.lock_epoch = epoch;
         state.app_access = AppAccessState::Locking { epoch };
         cancel_pending(&mut state);
-        state.grants.revoke_all();
-        state.client_labels.clear();
+        if preserve {
+            state.grants.retain_unattended();
+            prune_client_labels(&mut state);
+        } else {
+            state.grants.revoke_all();
+            state.client_labels.clear();
+        }
         self.changed.notify_all();
         Ok(epoch)
     }
@@ -581,6 +678,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
 
     pub fn revoke_all(&self) -> Result<(), LadonError> {
         let mut state = self.lock_state()?;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(LadonError::InvalidRequest)?;
         state.grants.revoke_all();
         state.client_labels.clear();
         Ok(())
@@ -592,6 +693,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         secret_id: SecretId,
     ) -> Result<bool, LadonError> {
         let mut state = self.lock_state()?;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(LadonError::InvalidRequest)?;
         if let Some(pending) = state.pending.as_mut().filter(|pending| {
             pending.request.client_session_id == client_session_id
                 && pending.requested_secret_ids.contains(&secret_id)
@@ -612,6 +717,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
     ) -> Result<T, LadonError> {
         let mut state = self.lock_state()?;
         let prepared = prepare()?;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(LadonError::InvalidRequest)?;
         if let Some(pending) = state
             .pending
             .as_mut()
@@ -634,7 +743,13 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
     ) -> Result<T, LadonError> {
         let mut state = self.lock_state()?;
         purge_disconnected_clients(&mut state);
-        if !is_app_active(&state)
+        let access_valid = is_app_active(&state)
+            || (client_has_unattended(&mut state, ticket.client_session_id)
+                && state
+                    .grants
+                    .missing_unattended(ticket.client_session_id, ticket.secret_ids.iter().copied())
+                    .is_empty());
+        if !access_valid
             || state.vault_session_id != Some(ticket.vault_session_id)
             || !state
                 .grants
@@ -684,6 +799,227 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
     fn lock_state(&self) -> Result<MutexGuard<'_, ApprovalState<C>>, LadonError> {
         self.state.lock().map_err(|_| LadonError::ProcessFailure)
     }
+
+    pub fn sessions(&self) -> Result<Vec<SessionDetails>, LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        let mut sessions: Vec<_> = state.sessions.values().cloned().collect();
+        sessions.sort_by_key(|s| (s.connected_at, s.client_session_id));
+        Ok(sessions)
+    }
+
+    pub fn set_session_annotation(
+        &self,
+        client: Uuid,
+        name: &str,
+        note: &str,
+    ) -> Result<(), LadonError> {
+        self.set_session_annotation_checked(client, None, name, note)
+    }
+
+    pub(crate) fn set_session_annotation_for_connection(
+        &self,
+        client: Uuid,
+        connection_id: Uuid,
+        name: &str,
+        note: &str,
+    ) -> Result<(), LadonError> {
+        self.set_session_annotation_checked(client, Some(connection_id), name, note)
+    }
+
+    fn set_session_annotation_checked(
+        &self,
+        client: Uuid,
+        connection_id: Option<Uuid>,
+        name: &str,
+        note: &str,
+    ) -> Result<(), LadonError> {
+        if name.chars().count() > 64
+            || note.chars().count() > 512
+            || name.chars().any(char::is_control)
+            || note.chars().any(|c| c.is_control() && c != '\n')
+        {
+            return Err(LadonError::InvalidRequest);
+        }
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        if !is_app_active(&state) {
+            return Err(LadonError::VaultLocked);
+        }
+        let session = state
+            .sessions
+            .get_mut(&client)
+            .ok_or(LadonError::InvalidRequest)?;
+        if connection_id.is_some_and(|expected| expected != session.connection_id) {
+            return Err(LadonError::ApprovalCancelled);
+        }
+        session.user_name = name.trim().to_owned();
+        session.note = note.trim().to_owned();
+        Ok(())
+    }
+
+    pub fn observe_run(&self, client: Uuid, project: &str, action: &str) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        let now = state.grants.wall_time();
+        if let Some(session) = state.sessions.get_mut(&client) {
+            session.working_directory = bounded_metadata(project, 512);
+            session.last_action = bounded_metadata(action, 128);
+            session.last_activity = now;
+        }
+        Ok(())
+    }
+
+    pub fn capture_unattended(
+        &self,
+        client: Uuid,
+        vault: Uuid,
+    ) -> Result<UnattendedContext, LadonError> {
+        self.capture_unattended_with(client, || Ok((vault, ())))
+            .map(|(context, ())| context)
+    }
+
+    pub(crate) fn capture_unattended_with<T>(
+        &self,
+        client: Uuid,
+        snapshot: impl FnOnce() -> Result<(Uuid, T), LadonError>,
+    ) -> Result<(UnattendedContext, T), LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        if !is_app_active(&state) || !state.client_sessions.contains_key(&client) {
+            return Err(LadonError::ApprovalCancelled);
+        }
+        let (vault, snapshot) = snapshot()?;
+        if state.vault_session_id != Some(vault) {
+            state.grants.revoke_all();
+            state.client_labels.clear();
+            state.vault_session_id = Some(vault);
+        }
+        let session = state
+            .sessions
+            .get(&client)
+            .ok_or(LadonError::ApprovalCancelled)?;
+        let connection_id = session.connection_id;
+        let session_label = if session.user_name.is_empty() {
+            session.reported_name.clone()
+        } else {
+            session.user_name.clone()
+        };
+        Ok((
+            UnattendedContext {
+                client,
+                vault,
+                revision: state.revision,
+                epoch: state.lock_epoch,
+                connection_id,
+                session_label,
+            },
+            snapshot,
+        ))
+    }
+
+    pub fn grant_unattended(
+        &self,
+        context: &UnattendedContext,
+        secrets: &[SecretId],
+        deadline: SystemTime,
+        validate: impl FnOnce() -> Result<(), LadonError>,
+    ) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        let remaining = deadline
+            .duration_since(state.grants.wall_time())
+            .map_err(|_| LadonError::InvalidRequest)?;
+        if remaining.is_zero() || remaining > Duration::from_secs(24 * 3600) || secrets.is_empty() {
+            return Err(LadonError::InvalidRequest);
+        }
+        if !is_app_active(&state)
+            || state.vault_session_id != Some(context.vault)
+            || state.lock_epoch != context.epoch
+            || state.revision != context.revision
+            || !state.client_sessions.contains_key(&context.client)
+            || !state
+                .sessions
+                .get(&context.client)
+                .is_some_and(|session| session.connection_id == context.connection_id)
+        {
+            return Err(LadonError::ApprovalCancelled);
+        }
+        validate()?;
+        state
+            .grants
+            .grant_unattended_until(context.client, secrets.iter().copied(), deadline);
+        if let Some(pending) = state.pending.as_mut().filter(|p| {
+            p.request.client_session_id == context.client
+                && p.decision.is_none()
+                && p.requested_secret_ids.iter().all(|id| secrets.contains(id))
+        }) {
+            pending.decision = Some(ApprovalDecision::Granted);
+        }
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    pub fn require_client_access(&self, client: Uuid) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        if is_app_active(&state) || client_has_unattended(&mut state, client) {
+            Ok(())
+        } else {
+            Err(LadonError::VaultLocked)
+        }
+    }
+
+    pub fn has_unattended(&self, client: Uuid) -> Result<bool, LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        Ok(client_has_unattended(&mut state, client))
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn unattended_covers(
+        &self,
+        client: Uuid,
+        ids: &[SecretId],
+    ) -> Result<bool, LadonError> {
+        let mut state = self.lock_state()?;
+        purge_disconnected_clients(&mut state);
+        Ok(client_has_unattended(&mut state, client)
+            && state
+                .grants
+                .missing_unattended(client, ids.iter().copied())
+                .is_empty())
+    }
+
+    pub fn revoke_client(&self, client: Uuid) -> Result<(), LadonError> {
+        let mut state = self.lock_state()?;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(LadonError::InvalidRequest)?;
+        state.grants.revoke_client(client);
+        if let Some(pending) = state
+            .pending
+            .as_mut()
+            .filter(|p| p.request.client_session_id == client)
+        {
+            pending.decision = Some(ApprovalDecision::Cancel);
+        }
+        prune_client_labels(&mut state);
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+fn bounded_metadata(value: &str, limit: usize) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(limit)
+        .collect()
+}
+
+fn client_has_unattended<C: MonotonicClock>(state: &mut ApprovalState<C>, client: Uuid) -> bool {
+    state.client_sessions.contains_key(&client) && state.grants.has_unattended(client)
 }
 
 fn purge_disconnected_clients<C: MonotonicClock>(state: &mut ApprovalState<C>) {
@@ -697,6 +1033,7 @@ fn purge_disconnected_clients<C: MonotonicClock>(state: &mut ApprovalState<C>) {
         state.client_sessions.remove(&client);
         state.grants.revoke_client(client);
         state.client_labels.remove(&client);
+        state.sessions.remove(&client);
         if let Some(pending) = state
             .pending
             .as_mut()

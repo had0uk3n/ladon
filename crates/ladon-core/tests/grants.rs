@@ -228,3 +228,39 @@ fn calendar_deadline_expires_even_when_elapsed_clock_stops_during_sleep() {
     wall.set(100);
     assert_eq!(grants.missing(client, [calendar, timed]), [calendar]);
 }
+
+#[test]
+fn unattended_deadline_cannot_be_extended_by_clock_rollback_and_sleep_expires_it() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[derive(Clone)]
+    struct Clock {
+        elapsed: Rc<Cell<u64>>,
+        wall: Rc<Cell<u64>>,
+    }
+    impl MonotonicClock for Clock {
+        fn now_millis(&self) -> u64 {
+            self.elapsed.get() * 1000
+        }
+        fn wall_time(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(self.wall.get())
+        }
+    }
+    let clock = Clock {
+        elapsed: Rc::new(Cell::new(0)),
+        wall: Rc::new(Cell::new(10)),
+    };
+    let mut grants = GrantStore::new(clock.clone(), Duration::from_secs(1800));
+    let client = Uuid::new_v4();
+    let secret = SecretId::new();
+    grants.grant_unattended_until(client, [secret], UNIX_EPOCH + Duration::from_secs(100));
+    clock.elapsed.set(20);
+    clock.wall.set(5);
+    assert_eq!(
+        grants.remaining(client, secret),
+        Some(Duration::from_secs(70))
+    );
+    clock.wall.set(100);
+    assert_eq!(grants.missing_unattended(client, [secret]), [secret]);
+    clock.wall.set(5);
+    assert_eq!(grants.missing(client, [secret]), [secret]);
+}

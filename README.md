@@ -58,8 +58,8 @@ configuring a 4–12 digit session PIN is required before secret use. Five
 consecutive wrong PIN submissions lock the vault; a successful PIN or Touch ID
 confirmation resets the counter. The PIN verifier and all agent permissions
 stay only in memory. A hard vault lock or process exit forgets the PIN verifier;
-**Lock app** and the 30-minute idle timeout revoke agent permissions while
-retaining the vault key and PIN verifier for the running app session. The resulting release binaries do not require
+**Lock app** revokes agent permissions; the 30-minute idle timeout preserves
+only explicitly confirmed unattended access while retaining the vault key and PIN verifier for the running app session. The resulting release binaries do not require
 Rust to be installed on the computer where they run.
 
 While the vault is unlocked, choose **Lock app** for a temporary UI lock. It
@@ -174,14 +174,17 @@ Choose **30 minutes** (the default), **Until end of day** (local midnight), or
 or Touch ID. Use does not extend the chosen deadline. Here a session is one
 `ladon mcp` process, rather than a chat: its private authenticated local socket
 lets Ladon detect disconnection and revoke that process's grants. This also
-bounds timed grants; lock and app shutdown revoke all grants. Calendar expiry
+bounds timed grants; manual lock and app shutdown revoke all grants. Calendar expiry
 uses the wall clock, including time spent asleep. A different process or another
 secret asks separately.
 
-The left **Active sessions** button counts processes with active grants. Clicking
-it opens the session details on the right, grouped by reported name and short
-session ID, with secret names, remaining time (or **Until session ends**), and
-**Running** while a grant is in use. **Revoke** removes only that grant and cancels
+The left **Active sessions** button counts live MCP connections, including those
+without grants, and legacy clients with active grants. Each connection card shows
+its reported name, short session ID, project, last activity, running/waiting/idle
+state, and secret grants with expiry. A human can save a local alias and note;
+these are bounded, memory-only annotations and disappear on disconnection.
+Reported names and aliases never authenticate a chat or change permission scope.
+**Revoke** removes only that grant and cancels
 a matching supervised run before returning. **Revoke all** clears every grant
 and cancels the active run. These views and targeted controls are GUI-only.
 A one-shot `ladon run` invocation has a fresh client identity and ends its session
@@ -190,10 +193,26 @@ has already consumed, retained, or transmitted. If the last grant expires while
 its command is finishing, the session view retains an **Agent command running**
 indicator and **Revoke all** control until that command exits or is cancelled.
 
+Choose **Allow all current secrets…** on a session card or pending approval to
+capture a snapshot of the current secret IDs. Review every name and the exact
+expiry, then authenticate freshly with Touch ID or the session PIN. Choose 30
+minutes, 2, 8 or 12 hours, or a local **HH:MM** within the next 24 hours. The
+fixed deadline includes time spent asleep and does not renew on use. Secrets
+added later are excluded. Saving or deleting a secret revokes its access and
+invalidates an in-flight snapshot confirmation.
+
+**Access continues while interface is locked** for this explicit unattended
+permission. Automatic idle locking wipes GUI values and preserves only these
+grants and their supervised runs. Other sessions still require local unlock;
+locked metadata listing reveals only the authorized snapshot. **Revoke session**,
+manual **Lock app** (including when already automatically locked), hard vault
+lock, expiry, disconnection and exit end this access. Missing permissions while
+locked cannot be silently approved.
+
 **Lock app** is a soft UI lock. It revokes grants, cancels the active run,
 and prevents secret use until local authentication. The vault key and PIN
-verifier remain in this running process. Locked `list` and `run` requests open
-an unlock prompt and wait; they resume after local authentication. Use **Unlock**
+verifier remain in this running process. Without valid unattended permission,
+locked `list` and `run` requests open an unlock prompt and wait; they resume after local authentication. Use **Unlock**
 to resume, with Touch ID
 started by the first click when available and **Use PIN instead** when a session
 PIN is configured. A hard vault lock drops the unlocked session and requires

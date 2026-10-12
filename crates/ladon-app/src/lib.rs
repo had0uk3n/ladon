@@ -25,7 +25,7 @@ mod unlock_request;
 pub use agent_broker::LocalBrokerHandle;
 pub use approval::{
     ActiveGrantSnapshot, AppAccessState, ApprovalCoordinator, ApprovalSecret, GrantTicket,
-    PendingApproval,
+    PendingApproval, SessionDetails, UnattendedContext,
 };
 #[cfg(feature = "gui")]
 pub use desktop::run_desktop;

@@ -10,7 +10,8 @@ use std::{
 };
 
 #[cfg(any(feature = "gui", test))]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 #[cfg(any(feature = "gui", test))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -51,6 +52,24 @@ pub(crate) struct AgentGrantView {
     remaining: Duration,
     expires_with_session: bool,
     running: bool,
+    unattended: bool,
+    expires_at: Option<std::time::SystemTime>,
+}
+
+#[cfg(any(feature = "gui", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentSessionView {
+    pub(crate) details: crate::SessionDetails,
+    pub(crate) grants: Vec<AgentGrantView>,
+    pub(crate) running: bool,
+    pub(crate) waiting: bool,
+}
+
+#[cfg(any(feature = "gui", test))]
+#[derive(Clone, Debug)]
+pub(crate) struct UnattendedConsent {
+    pub(crate) context: crate::UnattendedContext,
+    pub(crate) secrets: Vec<ladon_core::SecretMetadata>,
 }
 
 #[cfg(any(feature = "gui", test))]
@@ -72,6 +91,8 @@ impl AgentGrantView {
             remaining,
             expires_with_session: false,
             running,
+            unattended: false,
+            expires_at: None,
         }
     }
 
@@ -102,6 +123,12 @@ impl AgentGrantView {
 
     pub(crate) const fn running(&self) -> bool {
         self.running
+    }
+    pub(crate) const fn unattended(&self) -> bool {
+        self.unattended
+    }
+    pub(crate) const fn expires_at(&self) -> Option<std::time::SystemTime> {
+        self.expires_at
     }
 }
 
@@ -222,6 +249,32 @@ impl UiLockCoordinator {
         Ok(Some(UiLocalOperation {
             coordinator: Arc::clone(self),
         }))
+    }
+
+    fn wait_begin_local_operation(
+        self: &Arc<Self>,
+    ) -> Result<Option<UiLocalOperation>, LadonError> {
+        // Release the UI mutex while another local cleanup finishes. External locks
+        // need the GUI to acknowledge them, so never wait on an external transition.
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        loop {
+            if !state.connected {
+                return Err(LadonError::EndpointUnavailable);
+            }
+            if state.requested > state.acknowledged {
+                return Ok(None);
+            }
+            if !state.local_operation {
+                state.local_operation = true;
+                return Ok(Some(UiLocalOperation {
+                    coordinator: Arc::clone(self),
+                }));
+            }
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| LadonError::ProcessFailure)?;
+        }
     }
 
     fn finish_request(&self, request_id: u64) -> Result<(), LadonError> {
@@ -424,6 +477,38 @@ impl RunCoordinator {
         }
         Ok(RunBlock {
             coordinator: Arc::clone(self),
+        })
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    fn block_for_client_revoke(self: &Arc<Self>, client: Uuid) -> Result<RunBlock, LadonError> {
+        let mut state = self.state.lock().map_err(|_| LadonError::ProcessFailure)?;
+        while state.block_new {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| LadonError::ProcessFailure)?;
+        }
+        state.block_new = true;
+        if let Some(run) = state
+            .active
+            .as_ref()
+            .filter(|run| run.client_session_id == client)
+        {
+            run.cancellation.cancel();
+        }
+        while state
+            .active
+            .as_ref()
+            .is_some_and(|run| run.client_session_id == client)
+        {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| LadonError::ProcessFailure)?;
+        }
+        Ok(RunBlock {
+            coordinator: self.clone(),
         })
     }
 }
@@ -689,6 +774,66 @@ impl LocalBrokerHandle {
     }
 
     #[cfg(any(feature = "gui", test))]
+    pub(crate) fn begin_auto_app_lock(&self) -> Result<AppLockAttempt, LadonError> {
+        let ui_locks = self.ui_locks.as_ref().ok_or(LadonError::InvalidRequest)?;
+        let operation = ui_locks
+            .try_begin_local_operation()?
+            .ok_or(LadonError::Busy)?;
+        let epoch = self.approval.begin_auto_app_lock()?;
+        let active = {
+            let state = self
+                .coordinator
+                .state
+                .lock()
+                .map_err(|_| LadonError::ProcessFailure)?;
+            state.active.as_ref().map(|run| {
+                (
+                    run.client_session_id,
+                    run.secret_ids.clone(),
+                    run.cancellation.clone(),
+                )
+            })
+        };
+        if let Some((client, ids, cancellation)) = active {
+            if !self
+                .approval
+                .unattended_covers(client, ids.as_deref().unwrap_or_default())?
+            {
+                cancellation.cancel();
+            }
+        }
+        let coordinator = self.coordinator.clone();
+        let approval = self.approval.clone();
+        let (tx, result) = mpsc::channel();
+        thread::Builder::new()
+            .name("ladon-auto-app-lock".to_owned())
+            .spawn(move || {
+                let completion = (|| {
+                    let mut state = coordinator
+                        .state
+                        .lock()
+                        .map_err(|_| LadonError::ProcessFailure)?;
+                    while state
+                        .active
+                        .as_ref()
+                        .is_some_and(|run| run.cancellation.is_cancelled())
+                    {
+                        state = coordinator
+                            .changed
+                            .wait(state)
+                            .map_err(|_| LadonError::ProcessFailure)?;
+                    }
+                    drop(state);
+                    approval.finish_app_lock(epoch)
+                })();
+                drop(operation);
+                let _ = tx.send(completion);
+            })
+            .map_err(|_| LadonError::ProcessFailure)?;
+        Ok(AppLockAttempt { epoch, result })
+    }
+
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn unlock_app(&self, epoch: u64) -> Result<(), LadonError> {
         self.approval.unlock_app(epoch)
     }
@@ -703,11 +848,15 @@ impl LocalBrokerHandle {
         &self,
         controller: &Arc<Mutex<VaultController>>,
     ) -> Result<(), LadonError> {
+        // Revoke before waiting for an automatic-lock worker's child cleanup.
+        let pending_result = self.approval.cancel_pending();
+        let revoke_result = self.approval.revoke_all();
+        self.coordinator.cancel_active();
         let _local_operation = if let Some(ui_locks) = &self.ui_locks {
-            let Some(operation) = ui_locks.try_begin_local_operation()? else {
+            let Some(operation) = ui_locks.wait_begin_local_operation()? else {
                 // The external request already owns the lock transition. Returning lets the GUI
                 // wipe its state and acknowledge that request instead of waiting on its run block.
-                return Ok(());
+                return pending_result.and(revoke_result);
             };
             Some(operation)
         } else {
@@ -716,7 +865,8 @@ impl LocalBrokerHandle {
         if let Some(ui) = &self.ui_locks {
             ui.unlock_requests.cancel()?;
         }
-        lock_controller_and_runs(&self.coordinator, &self.approval, controller, None)
+        let locked = lock_controller_and_runs(&self.coordinator, &self.approval, controller, None);
+        pending_result.and(revoke_result).and(locked)
     }
 
     pub fn auto_lock_controller_if_idle(
@@ -785,8 +935,11 @@ impl LocalBrokerHandle {
     }
 
     pub fn revoke_grants(&self) -> Result<(), LadonError> {
+        self.approval.cancel_pending()?;
+        self.approval.revoke_all()?;
+        self.coordinator.cancel_active();
         let _local_operation = if let Some(ui_locks) = &self.ui_locks {
-            let Some(operation) = ui_locks.try_begin_local_operation()? else {
+            let Some(operation) = ui_locks.wait_begin_local_operation()? else {
                 // An external lock cancels pending approval and revokes all grants itself.
                 return Ok(());
             };
@@ -826,6 +979,8 @@ impl LocalBrokerHandle {
                     remaining: grant.remaining(),
                     expires_with_session: grant.expires_with_session(),
                     running: running.contains(&(grant.client_session_id(), grant.secret_id())),
+                    unattended: grant.unattended(),
+                    expires_at: grant.expires_at(),
                 })
             })
             .collect();
@@ -836,6 +991,114 @@ impl LocalBrokerHandle {
                 .then_with(|| left.secret_name.cmp(&right.secret_name))
         });
         Ok(views)
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn agent_sessions(
+        &self,
+        controller: &Arc<Mutex<VaultController>>,
+    ) -> Result<Vec<AgentSessionView>, LadonError> {
+        let grants = self.agent_grants(controller)?;
+        let pending = self.approval.pending()?;
+        let active_client = self
+            .coordinator
+            .state
+            .lock()
+            .map_err(|_| LadonError::ProcessFailure)?
+            .active
+            .as_ref()
+            .filter(|run| run.running)
+            .map(|run| run.client_session_id);
+        Ok(self
+            .approval
+            .sessions()?
+            .into_iter()
+            .map(|details| {
+                let client = details.client_session_id;
+                AgentSessionView {
+                    details,
+                    grants: grants
+                        .iter()
+                        .filter(|g| g.client_session_id() == client)
+                        .cloned()
+                        .collect(),
+                    running: active_client == Some(client),
+                    waiting: pending
+                        .as_ref()
+                        .is_some_and(|p| p.client_session_id() == client),
+                }
+            })
+            .collect())
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn snapshot_unattended(
+        &self,
+        controller: &Arc<Mutex<VaultController>>,
+        client: Uuid,
+    ) -> Result<UnattendedConsent, LadonError> {
+        let (context, secrets) = self.approval.capture_unattended_with(client, || {
+            let controller = controller.lock().map_err(|_| LadonError::ProcessFailure)?;
+            Ok((
+                controller.session_id().ok_or(LadonError::VaultLocked)?,
+                controller.secrets(),
+            ))
+        })?;
+        if secrets.is_empty() {
+            return Err(LadonError::InvalidRequest);
+        }
+        Ok(UnattendedConsent { context, secrets })
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn grant_unattended(
+        &self,
+        controller: &Arc<Mutex<VaultController>>,
+        consent: &UnattendedConsent,
+        deadline: std::time::SystemTime,
+    ) -> Result<(), LadonError> {
+        let ids: Vec<_> = consent.secrets.iter().map(|s| s.id).collect();
+        self.approval
+            .grant_unattended(&consent.context, &ids, deadline, || {
+                let controller = controller.lock().map_err(|_| LadonError::ProcessFailure)?;
+                if controller.session_id() != Some(consent.context.vault)
+                    || consent.secrets.iter().any(|s| {
+                        !controller
+                            .secrets()
+                            .iter()
+                            .any(|current| current.id == s.id)
+                    })
+                {
+                    return Err(LadonError::ApprovalCancelled);
+                }
+                Ok(())
+            })
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn set_session_annotation(
+        &self,
+        client: Uuid,
+        connection_id: Uuid,
+        name: &str,
+        note: &str,
+    ) -> Result<(), LadonError> {
+        self.approval
+            .set_session_annotation_for_connection(client, connection_id, name, note)
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn revoke_session(&self, client: Uuid) -> Result<(), LadonError> {
+        let _operation = self
+            .ui_locks
+            .as_ref()
+            .map(|ui| ui.try_begin_local_operation()?.ok_or(LadonError::Busy))
+            .transpose()?;
+        // A client-wide revoke covers even pre-context reservations.
+        let block = self.coordinator.block_for_client_revoke(client)?;
+        self.approval.revoke_client(client)?;
+        drop(block);
+        Ok(())
     }
 
     #[cfg(feature = "gui")]
@@ -984,6 +1247,8 @@ impl AgentBroker {
             RpcMethod::SessionOpen => {
                 self.approval
                     .register_client_session(client_session_id, connection_cancellation)?;
+                self.approval
+                    .observe_client(client_session_id, &client_label)?;
                 Ok(RpcResult::SessionOpened)
             }
             RpcMethod::Status => {
@@ -1001,11 +1266,27 @@ impl AgentBroker {
             }
             RpcMethod::List => {
                 self.await_local_unlock(
+                    client_session_id,
                     &client_label,
                     "List secret names",
                     &connection_cancellation,
                 )?;
-                self.approval.require_app_active()?;
+                self.approval.require_client_access(client_session_id)?;
+                let authorized: Option<HashSet<_>> =
+                    if self.approval.app_access_state()? == AppAccessState::Active {
+                        None
+                    } else {
+                        Some(
+                            self.approval
+                                .active_grants()?
+                                .into_iter()
+                                .filter(|g| {
+                                    g.client_session_id() == client_session_id && g.unattended()
+                                })
+                                .map(|g| g.secret_id())
+                                .collect(),
+                        )
+                    };
                 let controller = self.controller()?;
                 if controller.phase() != VaultUiPhase::Unlocked {
                     return Err(LadonError::VaultLocked);
@@ -1013,6 +1294,11 @@ impl AgentBroker {
                 let secrets = controller
                     .secrets()
                     .into_iter()
+                    .filter(|secret| {
+                        authorized
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(&secret.id))
+                    })
                     .map(|secret| {
                         let id = Uuid::parse_str(&secret.id.to_string())
                             .map_err(|_| LadonError::InvalidVaultPayload)?;
@@ -1061,6 +1347,7 @@ impl AgentBroker {
                     RunCaller::Cli,
                 )?;
                 self.await_local_unlock(
+                    client_session_id,
                     &client_label,
                     "Run a command (review follows unlock)",
                     &connection_cancellation,
@@ -1069,7 +1356,12 @@ impl AgentBroker {
                 let run_lease = self
                     .coordinator
                     .try_start(cancellation.clone(), client_session_id)?;
-                self.approval.require_app_active()?;
+                self.approval.require_client_access(client_session_id)?;
+                self.approval.observe_run(
+                    client_session_id,
+                    validated.working_directory(),
+                    validated.executable(),
+                )?;
                 if self.shutting_down.load(Ordering::Acquire) {
                     return Err(LadonError::EndpointUnavailable);
                 }
@@ -1103,7 +1395,10 @@ impl AgentBroker {
                                     .resolve_bindings_for_ids(bindings, &binding_secret_ids)
                             })
                         },
-                        |command| run_lease.spawn_child(command),
+                        |command| {
+                            self.approval
+                                .with_valid_grant(&ticket, || run_lease.spawn_child(command))
+                        },
                     );
                     if let Ok(mut controller) = self.controller.lock() {
                         controller.record_secret_activity();
@@ -1115,7 +1410,10 @@ impl AgentBroker {
                     validated,
                     cancellation,
                     |bindings| self.controller()?.resolve_bindings(bindings),
-                    |command| run_lease.spawn_child(command),
+                    |command| {
+                        self.approval.require_client_access(client_session_id)?;
+                        run_lease.spawn_child(command)
+                    },
                 );
                 if let Ok(mut controller) = self.controller.lock() {
                     controller.record_secret_activity();
@@ -1127,12 +1425,18 @@ impl AgentBroker {
 
     fn await_local_unlock(
         &self,
+        client_session_id: Uuid,
         client_label: &str,
         purpose: &str,
         cancellation: &RunCancellation,
     ) -> Result<(), LadonError> {
+        if self.approval.has_unattended(client_session_id)?
+            && self.controller()?.phase() == VaultUiPhase::Unlocked
+        {
+            return Ok(());
+        }
         let Some(ui) = self.ui_locks.as_ref() else {
-            return self.approval.require_app_active();
+            return self.approval.require_client_access(client_session_id);
         };
         let epoch = ui.unlock_requests.epoch();
         if self.approval.app_access_state()? == AppAccessState::Active
@@ -2339,5 +2643,213 @@ mod tests {
                 .try_start(RunCancellation::new(), Uuid::new_v4())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn unattended_access_runs_through_auto_lock_and_lists_only_its_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let passphrase = SensitiveText::from("correct horse");
+        let mut vault = VaultController::new(directory.path().join("vault.ladon"));
+        vault.create(&passphrase, &passphrase).unwrap();
+        let mut draft = AddSecretDraft::new();
+        draft.set_name("app-lock-token");
+        draft.fields_mut()[0]
+            .value_mut()
+            .push_str("fake-night-value");
+        let first = vault.add_secret(&mut draft).unwrap();
+        let controller = Arc::new(Mutex::new(vault));
+        let coordinator = Arc::new(RunCoordinator::default());
+        let approval = Arc::new(ApprovalCoordinator::session_defaults());
+        let handle = desktop_handle(coordinator.clone(), approval.clone());
+        let client = Uuid::new_v4();
+        approval
+            .register_client_session(client, RunCancellation::new())
+            .unwrap();
+        let consent = handle.snapshot_unattended(&controller, client).unwrap();
+        handle
+            .grant_unattended(
+                &controller,
+                &consent,
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            )
+            .unwrap();
+        let mut later = AddSecretDraft::new();
+        later.set_name("added-later");
+        later.fields_mut()[0]
+            .value_mut()
+            .push_str("fake-later-value");
+        controller.lock().unwrap().add_secret(&mut later).unwrap();
+        let attempt = handle.begin_auto_app_lock().unwrap();
+        wait_for_app_lock_result(&attempt).unwrap();
+        let broker = AgentBroker::new(
+            controller.clone(),
+            coordinator,
+            approval,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let list = broker
+            .handle_method(
+                client,
+                "night agent".to_owned(),
+                RpcMethod::List,
+                RunCancellation::new(),
+            )
+            .unwrap();
+        let RpcResult::List { secrets } = list else {
+            panic!("expected metadata");
+        };
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].id.to_string(), first.to_string());
+        let result = broker
+            .handle_method(
+                client,
+                "night agent".to_owned(),
+                secret_run(directory.path()),
+                RunCancellation::new(),
+            )
+            .unwrap();
+        assert!(matches!(result, RpcResult::Run { .. }));
+        assert_eq!(
+            broker.handle_method(
+                Uuid::new_v4(),
+                "other".to_owned(),
+                RpcMethod::List,
+                RunCancellation::new()
+            ),
+            Err(LadonError::VaultLocked)
+        );
+        handle.revoke_session(client).unwrap();
+        assert_eq!(
+            broker.handle_method(
+                client,
+                "night agent".to_owned(),
+                RpcMethod::List,
+                RunCancellation::new()
+            ),
+            Err(LadonError::VaultLocked)
+        );
+    }
+    fn assert_manual_operation_upgrades_pending_auto_lock(hard_lock: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let passphrase = crate::SensitiveText::from("correct horse");
+        let mut vault = VaultController::new(directory.path().join("vault.ladon"));
+        vault.create(&passphrase, &passphrase).unwrap();
+        let mut draft = crate::AddSecretDraft::new();
+        draft.set_name("night-token");
+        draft.fields_mut()[0]
+            .value_mut()
+            .push_str("fake-night-token");
+        vault.add_secret(&mut draft).unwrap();
+        let controller = Arc::new(Mutex::new(vault));
+        let coordinator = Arc::new(RunCoordinator::default());
+        let approval = Arc::new(ApprovalCoordinator::session_defaults());
+        let ui = Arc::new(UiLockCoordinator::new(Arc::new(|| {})));
+        let handle = Arc::new(LocalBrokerHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            coordinator: coordinator.clone(),
+            approval: approval.clone(),
+            ui_locks: Some(ui),
+            thread: None,
+        });
+        let night_client = Uuid::new_v4();
+        approval
+            .register_client_session(night_client, RunCancellation::new())
+            .unwrap();
+        let consent = handle
+            .snapshot_unattended(&controller, night_client)
+            .unwrap();
+        handle
+            .grant_unattended(
+                &controller,
+                &consent,
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            )
+            .unwrap();
+        let ordinary = RunCancellation::new();
+        let lease = coordinator
+            .try_start(ordinary.clone(), Uuid::new_v4())
+            .unwrap();
+        let attempt = handle.begin_auto_app_lock().unwrap();
+        assert!(ordinary.is_cancelled());
+        let (tx, rx) = mpsc::channel();
+        let manual_handle = handle.clone();
+        let manual_controller = controller.clone();
+        let manual = thread::spawn(move || {
+            let result = if hard_lock {
+                manual_handle.cancel_active_run_and_lock(&manual_controller)
+            } else {
+                manual_handle.revoke_grants()
+            };
+            tx.send(result).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut early_result = None;
+        while !approval.active_grants().unwrap().is_empty() && std::time::Instant::now() < deadline
+        {
+            if let Ok(result) = rx.try_recv() {
+                early_result = Some(result);
+                break;
+            }
+            thread::yield_now();
+        }
+        let revoked_before_cleanup = approval.active_grants().unwrap().is_empty();
+        drop(lease);
+        wait_for_app_lock_result(&attempt).unwrap();
+        let result =
+            early_result.unwrap_or_else(|| rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        manual.join().unwrap();
+        assert!(
+            revoked_before_cleanup,
+            "manual lock left unattended grants during automatic cleanup"
+        );
+        assert_eq!(result, Ok(()));
+        if hard_lock {
+            assert_eq!(controller.lock().unwrap().phase(), VaultUiPhase::Locked);
+        }
+        assert!(approval.active_grants().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_revoke_during_auto_lock_revokes_before_waiting_for_cleanup() {
+        assert_manual_operation_upgrades_pending_auto_lock(false);
+    }
+
+    #[test]
+    fn hard_lock_during_auto_lock_revokes_and_finishes_the_vault_lock() {
+        assert_manual_operation_upgrades_pending_auto_lock(true);
+    }
+
+    #[test]
+    fn captured_session_annotation_cannot_transfer_to_a_reconnected_client() {
+        let approval = Arc::new(ApprovalCoordinator::session_defaults());
+        let handle = LocalBrokerHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            coordinator: Arc::new(RunCoordinator::default()),
+            approval: approval.clone(),
+            ui_locks: None,
+            thread: None,
+        };
+        let client = Uuid::new_v4();
+        let first = RunCancellation::new();
+        approval
+            .register_client_session(client, first.clone())
+            .unwrap();
+        let captured_connection = approval.sessions().unwrap()[0].connection_id;
+        first.cancel();
+        approval
+            .register_client_session(client, RunCancellation::new())
+            .unwrap();
+        assert_ne!(
+            approval.sessions().unwrap()[0].connection_id,
+            captured_connection
+        );
+        assert_eq!(
+            handle.set_session_annotation(client, captured_connection, "Stale alias", "Stale note"),
+            Err(LadonError::ApprovalCancelled)
+        );
+        let replacement = approval.sessions().unwrap().remove(0);
+        assert!(replacement.user_name.is_empty());
+        assert!(replacement.note.is_empty());
     }
 }

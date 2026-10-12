@@ -27,9 +27,9 @@ into it and untrusted for all other fields.
 
 `AppLocked` is an additional trust boundary inside the unlocked process. The
 unlocked vault key and session PIN verifier remain in Ladon memory until hard
-lock or exit; GUI values are wiped, secret use is closed,
-all grants are revoked, and active supervised runs are cancelled before
-completion. This improves accidental-disclosure behavior, but it does not
+lock or exit; GUI values are wiped. Manual lock closes secret use, revokes all
+grants and cancels supervised runs before completion. Automatic idle locking
+preserves only explicitly confirmed unattended grants and their eligible runs. This improves accidental-disclosure behavior, but it does not
 improve resistance to a same-user process that can inspect or control Ladon
 memory. Locked desktop requests can open a value-free local unlock prompt and
 wait for local authentication. A later hard lock cancels that wait. Unlocking
@@ -50,13 +50,26 @@ process already running as the same user. MCP does not provide a universal
 trusted chat identifier, so the scope is an integration process rather than a
 conversation.
 
+Unattended access is a deliberate local authorization of a current secret-ID
+snapshot for one live MCP connection. Fresh PIN or Touch ID is mandatory, with
+secret names, session label, fixed expiry and locked-interface behavior displayed before approval.
+A captured vault session, mutation revision and lock epoch reject stale results.
+New secrets are excluded; edits/deletions invalidate affected access. Fixed
+wall-clock expiry also has an elapsed-time ceiling to resist backward clock
+changes. While automatically locked, every run binding needs valid unattended
+access and metadata listing is restricted to that connection's granted IDs.
+Manual lock, including while the interface is already automatically locked,
+hard lock, revoke, disconnect and exit end this access. This intentionally lets
+an authorized child consume secrets while the human is away; supervision and
+redaction cannot prevent that child from transmitting or retaining them.
+
 `ladon_identify_session` is optional, process-local MCP state containing only
 an untrusted, non-secret reported name. Initialization's `clientInfo.name` or
 `MCP client` supplies a fallback. The GUI marks names as reported and pairs
 them with a short session ID; neither proves identity. Renaming only changes
 display metadata on the next broker request, never the grant key or expiry.
 
-The active-grant list and per-pair revoke controls are GUI-only and never
+Connection cards, memory-only local aliases/notes, and revoke controls are GUI-only and never
 cross RPC/MCP. Each row represents one process/secret grant with the expiry
 chosen during approval; use does not extend it. Targeted revoke cancels and waits
 for a matching run while preserving unrelated grants. Revoke all cancels the
@@ -123,13 +136,15 @@ secrecy.
 4. Vault headers and payloads are authenticated; authentication errors are
    non-oracular.
 5. Secret output is redacted or suppressed before crossing the broker boundary.
-6. App lock blocks agent admission before clearing GUI values and does not
-   complete until active child cleanup finishes.
+6. Manual app lock blocks agent admission before clearing GUI values and waits
+   for child cleanup. Automatic interface lock preserves only explicitly
+   authorized unattended grants and eligible runs.
 7. Hard lock additionally drops the unlocked session.
 8. Setup writes only an absolute local MCP command and makes a backup before
    changing an existing client configuration.
 9. Session PIN verifiers, Touch ID choice, pending approvals, and grants are
-   memory-only. App lock clears pending approvals and grants but retains the
+   memory-only. Manual app lock clears pending approvals and grants; automatic
+   lock preserves only unattended grants. Both retain the
    in-memory session confirmation for quick unlock; idle expiry soft-locks
    configured sessions. Hard lock and process exit remove it. No native credential store is used.
 10. Any new vault unlock lifetime invalidates grants from the preceding one;

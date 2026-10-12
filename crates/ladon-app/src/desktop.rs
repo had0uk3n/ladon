@@ -8,6 +8,8 @@ use std::{
 
 #[cfg(all(test, unix))]
 use std::time::Instant;
+#[cfg(unix)]
+use std::time::SystemTime;
 
 use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
@@ -16,7 +18,9 @@ use eframe::egui::{
 use ladon_core::{LadonError, SecretId, SecretMetadata, SensitiveBytes};
 
 #[cfg(unix)]
-use crate::agent_broker::{AgentGrantView, AppLockAttempt, LocalBrokerHandle};
+use crate::agent_broker::{
+    AgentGrantView, AgentSessionView, AppLockAttempt, LocalBrokerHandle, UnattendedConsent,
+};
 use crate::clipboard::SecretClipboard;
 use crate::touch_id::TouchIdAttempt;
 use crate::ui::sanitize_untrusted;
@@ -30,7 +34,12 @@ use crate::{
     ui::{AddDraftValidationError, ReadOnlySensitiveText},
 };
 #[cfg(unix)]
-use crate::{PendingRequestView, approval_lifetime::ApprovalLifetime};
+use crate::{
+    PendingRequestView,
+    approval_lifetime::{
+        ApprovalLifetime, UnattendedLifetime, format_local_time, local_deadline_at,
+    },
+};
 
 const CANVAS: Color32 = Color32::from_rgb(244, 247, 251);
 const INK: Color32 = Color32::from_rgb(23, 35, 60);
@@ -94,6 +103,12 @@ struct LadonDesktop {
     #[cfg(unix)]
     agent_grants: Vec<AgentGrantView>,
     #[cfg(unix)]
+    agent_sessions: Vec<AgentSessionView>,
+    #[cfg(unix)]
+    session_editors: std::collections::HashMap<uuid::Uuid, SessionEditor>,
+    #[cfg(unix)]
+    unattended_confirmation: Option<UnattendedConfirmation>,
+    #[cfg(unix)]
     agent_command_active: bool,
     #[cfg(unix)]
     agent_grants_session: Option<uuid::Uuid>,
@@ -156,12 +171,44 @@ enum ApprovalAction {
     Deny,
 }
 
+#[cfg(unix)]
+#[derive(Default)]
+struct SessionEditor {
+    connection_id: Option<uuid::Uuid>,
+    name: String,
+    note: String,
+}
+
+#[cfg(unix)]
+struct UnattendedConfirmation {
+    consent: UnattendedConsent,
+    captured_at: SystemTime,
+    lifetime: UnattendedLifetime,
+    local_time: String,
+}
+
+#[cfg(unix)]
+impl UnattendedConfirmation {
+    fn deadline(&self) -> Result<SystemTime, LadonError> {
+        if self.lifetime == UnattendedLifetime::Custom {
+            local_deadline_at(&self.local_time, self.captured_at)
+        } else {
+            self.lifetime.deadline_at(self.captured_at)
+        }
+    }
+}
+
 struct PendingTouchId {
     authentication: TouchIdAttempt,
     target: TouchIdTarget,
 }
 
 enum TouchIdTarget {
+    #[cfg(unix)]
+    Unattended {
+        consent: UnattendedConsent,
+        deadline: SystemTime,
+    },
     AppUnlock {
         vault_session_id: uuid::Uuid,
         lock_epoch: u64,
@@ -336,6 +383,12 @@ impl LadonDesktop {
             broker,
             #[cfg(unix)]
             agent_grants: Vec::new(),
+            #[cfg(unix)]
+            agent_sessions: Vec::new(),
+            #[cfg(unix)]
+            session_editors: std::collections::HashMap::new(),
+            #[cfg(unix)]
+            unattended_confirmation: None,
             #[cfg(unix)]
             agent_command_active: false,
             #[cfg(unix)]
@@ -1278,6 +1331,8 @@ impl LadonDesktop {
     #[cfg(unix)]
     fn clear_agent_grants(&mut self) {
         self.agent_grants.clear();
+        self.agent_sessions.clear();
+        self.session_editors.clear();
         self.agent_command_active = false;
         self.agent_grants_session = None;
         self.agent_grants_error_shown = false;
@@ -1301,12 +1356,19 @@ impl LadonDesktop {
                 .and_then(|broker| {
                     Ok((
                         broker.agent_grants(&self.controller)?,
+                        broker.agent_sessions(&self.controller)?,
                         broker.agent_run_active()?,
                     ))
                 })
         })();
         match result {
-            Ok((grants, command_active)) => {
+            Ok((grants, sessions, command_active)) => {
+                self.session_editors.retain(|id, _| {
+                    sessions
+                        .iter()
+                        .any(|session| session.details.client_session_id == *id)
+                });
+                self.agent_sessions = sessions;
                 self.agent_grants = grants;
                 self.agent_command_active = command_active;
                 self.agent_grants_error_shown = false;
@@ -1352,12 +1414,399 @@ impl LadonDesktop {
         self.agent_grants
             .iter()
             .map(AgentGrantView::client_session_id)
+            .chain(
+                self.agent_sessions
+                    .iter()
+                    .map(|session| session.details.client_session_id),
+            )
             .collect::<std::collections::BTreeSet<_>>()
             .len()
     }
 
     #[cfg(unix)]
     fn show_agent_access(&mut self, ui: &mut egui::Ui) {
+        // Legacy request clients have no lifecycle connection. Preserve their visible grants.
+        if self.agent_sessions.is_empty() {
+            self.show_legacy_agent_access(ui);
+            return;
+        }
+        let mut allow = None;
+        let mut revoke_session = None;
+        let mut save = None;
+        let mut revoke_grant = None;
+        for session in &self.agent_sessions {
+            let details = &session.details;
+            let id = details.client_session_id;
+            let editor = self
+                .session_editors
+                .entry(id)
+                .or_insert_with(|| SessionEditor {
+                    connection_id: Some(details.connection_id),
+                    name: details.user_name.clone(),
+                    note: details.note.clone(),
+                });
+            if editor.connection_id != Some(details.connection_id) {
+                *editor = SessionEditor {
+                    connection_id: Some(details.connection_id),
+                    name: details.user_name.clone(),
+                    note: details.note.clone(),
+                };
+            }
+            Frame::new()
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0_f32, BORDER))
+                .corner_radius(10)
+                .inner_margin(Margin::same(18))
+                .show(ui, |ui| {
+                    ui.set_width(WORKSPACE_CARD_WIDTH.min(ui.available_width()));
+                    ui.push_id(id, |ui| {
+                        let title = if details.user_name.is_empty() {
+                            &details.reported_name
+                        } else {
+                            &details.user_name
+                        };
+                        ui.label(RichText::new(sanitize_untrusted(title)).strong().color(INK));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} (reported)",
+                                sanitize_untrusted(&details.reported_name)
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                        ui.label(
+                            RichText::new(short_session_id(id))
+                                .monospace()
+                                .size(11.0)
+                                .color(MUTED),
+                        )
+                        .on_hover_text(id.to_string());
+                        ui.label(
+                            RichText::new(if session.running {
+                                "Running"
+                            } else if session.waiting {
+                                "Waiting for approval"
+                            } else {
+                                "Idle"
+                            })
+                            .color(MUTED),
+                        );
+                        if !details.working_directory.is_empty() {
+                            ui.label(format!(
+                                "Project: {}",
+                                sanitize_untrusted(&details.working_directory)
+                            ));
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "Last activity: {}",
+                                format_local_time(details.last_activity)
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                        ui.label(
+                            RichText::new(sanitize_untrusted(&details.last_action))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        egui::CollapsingHeader::new("Local alias and note").show(ui, |ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut editor.name)
+                                    .hint_text("Your session name")
+                                    .char_limit(64),
+                            );
+                            ui.add(
+                                TextEdit::multiline(&mut editor.note)
+                                    .hint_text("Your note")
+                                    .char_limit(512)
+                                    .desired_rows(2),
+                            );
+                            if quiet_button(ui, "Save alias and note").clicked() {
+                                save = Some((
+                                    id,
+                                    details.connection_id,
+                                    editor.name.clone(),
+                                    editor.note.clone(),
+                                ));
+                            }
+                        });
+                        if session.grants.is_empty() {
+                            ui.label(RichText::new("No secret access").color(MUTED));
+                        }
+                        for grant in &session.grants {
+                            ui.label(
+                                RichText::new(sanitize_untrusted(grant.secret_name())).color(INK),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                let expiration = grant
+                                    .expires_at()
+                                    .map(format_local_time)
+                                    .unwrap_or_else(|| {
+                                        if grant.expires_with_session() {
+                                            "Until session ends".to_owned()
+                                        } else {
+                                            format!(
+                                                "{} remaining",
+                                                format_grant_remaining(grant.remaining())
+                                            )
+                                        }
+                                    });
+                                ui.label(RichText::new(expiration).size(11.0).color(MUTED));
+                                if grant.unattended() {
+                                    ui.label(RichText::new("Unattended").size(11.0).color(AMBER));
+                                }
+                                if quiet_button(ui, "Revoke").clicked() {
+                                    revoke_grant = Some((id, grant.secret_id()));
+                                }
+                            });
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.pending_touch_id.is_none(),
+                                    egui::Button::new("Allow all current secrets…"),
+                                )
+                                .clicked()
+                            {
+                                allow = Some(id);
+                            }
+                            if quiet_button(ui, "Revoke session").clicked() {
+                                revoke_session = Some(id);
+                            }
+                        });
+                    });
+                });
+            ui.add_space(12.0);
+        }
+        let legacy_grants = self.agent_grants.iter().any(|grant| {
+            !self
+                .agent_sessions
+                .iter()
+                .any(|session| session.details.client_session_id == grant.client_session_id())
+        });
+        if legacy_grants {
+            self.show_legacy_agent_access(ui);
+        } else {
+            if self.agent_command_active
+                && !self.agent_sessions.iter().any(|session| session.running)
+            {
+                ui.label(RichText::new("Agent command running").color(MUTED));
+            }
+            if (!self.agent_grants.is_empty() || self.agent_command_active)
+                && quiet_button(ui, "Revoke all").clicked()
+            {
+                self.revoke_all_agent_grants();
+            }
+        }
+        if let Some((id, connection_id, name, note)) = save {
+            let result = self
+                .broker
+                .as_ref()
+                .ok_or(LadonError::EndpointUnavailable)
+                .and_then(|broker| broker.set_session_annotation(id, connection_id, &name, &note));
+            self.notice_from(result, "Session alias and note saved");
+            self.refresh_agent_grants();
+        }
+        if let Some(id) = revoke_session {
+            let result = self
+                .broker
+                .as_ref()
+                .ok_or(LadonError::EndpointUnavailable)
+                .and_then(|broker| broker.revoke_session(id));
+            self.notice_from(result, "Session access revoked");
+            self.refresh_agent_grants();
+        }
+        if let Some((id, secret)) = revoke_grant {
+            self.revoke_agent_grant(id, secret);
+        }
+        if let Some(id) = allow {
+            self.begin_unattended_confirmation(id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn begin_unattended_confirmation(&mut self, client: uuid::Uuid) {
+        if self.desktop_lock != DesktopLockState::Active || self.pending_touch_id.is_some() {
+            return;
+        }
+        let consent = self
+            .broker
+            .as_ref()
+            .ok_or(LadonError::EndpointUnavailable)
+            .and_then(|broker| broker.snapshot_unattended(&self.controller, client));
+        self.local_pin.clear();
+        match consent {
+            Ok(consent) => {
+                self.unattended_confirmation = Some(UnattendedConfirmation {
+                    consent,
+                    captured_at: SystemTime::now(),
+                    lifetime: UnattendedLifetime::default(),
+                    local_time: String::new(),
+                })
+            }
+            Err(error) => self.notice_from(Err(error), ""),
+        }
+    }
+
+    #[cfg(unix)]
+    fn show_unattended_confirmation(&mut self, context: &egui::Context) {
+        let Some(confirmation) = self.unattended_confirmation.as_mut() else {
+            return;
+        };
+        let actions = confirmation_actions(
+            TouchIdAuthenticator::is_available(),
+            self.session_confirmation
+                .as_ref()
+                .is_some_and(SessionConfirmation::has_pin),
+        );
+        let busy = self.pending_touch_id.is_some();
+        let notice = self.notice.as_ref();
+        let mut action = None;
+        let mut cancel = false;
+        egui::Modal::new("unattended-consent".into()).frame(Frame::window(&context.style()).fill(PANEL).inner_margin(Margin::same(24))).show(context, |ui| {
+            ui.set_width(500.0);
+            ui.label(RichText::new("Allow unattended access").size(22.0).strong().color(INK));
+            ui.label(format!("{} · {} · {} current secrets", sanitize_untrusted(&confirmation.consent.context.session_label), short_session_id(confirmation.consent.context.client), confirmation.consent.secrets.len()));
+            ui.label(RichText::new("Access continues while interface is locked").strong().color(AMBER));
+            ui.label("Automatic interface lock preserves this access. Manual lock, vault lock, revoke, disconnect or expiry ends it.");
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                for secret in &confirmation.consent.secrets {
+                    ui.label(sanitize_untrusted(&secret.name));
+                }
+            });
+            ui.label("New secrets added later are not included.");
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (lifetime, label) in [(UnattendedLifetime::ThirtyMinutes, "30 min"), (UnattendedLifetime::TwoHours, "2 hours"), (UnattendedLifetime::EightHours, "8 hours"), (UnattendedLifetime::TwelveHours, "12 hours"), (UnattendedLifetime::Custom, "Local HH:MM")] {
+                        ui.selectable_value(&mut confirmation.lifetime, lifetime, label);
+                    }
+                });
+                if confirmation.lifetime == UnattendedLifetime::Custom { ui.add(TextEdit::singleline(&mut confirmation.local_time).hint_text("HH:MM within the next 24 hours").char_limit(5)); }
+            });
+            let deadline = confirmation.deadline();
+            match &deadline {
+                Ok(deadline) => { ui.label(RichText::new(format!("Expires: {}", format_local_time(*deadline))).strong().color(INK)); }
+                Err(_) => { ui.label(RichText::new("Enter a valid local HH:MM within 24 hours.").color(DANGER)); }
+            }
+            ui.add_enabled_ui(!busy && deadline.is_ok(), |ui| {
+                if actions.contains(&ConfirmationAction::TouchId) && primary_button(ui, "Confirm with Touch ID").clicked() { action = Some(ConfirmationAction::TouchId); }
+                if actions.contains(&ConfirmationAction::Pin) {
+                    password_field(ui, &mut self.local_pin, "Session PIN");
+                    if quiet_button(ui, "Confirm with PIN").clicked() { action = Some(ConfirmationAction::Pin); }
+                }
+            });
+            if let Some(notice) = notice {
+                ui.label(RichText::new(&notice.text).color(if notice.danger { DANGER } else { COBALT }));
+            }
+            if actions.is_empty() { ui.label("Touch ID is unavailable and no session PIN is configured."); }
+            if busy { ui.label("Waiting for local authentication…"); }
+            if quiet_button(ui, "Cancel").clicked() { cancel = true; }
+        });
+        if cancel {
+            self.unattended_confirmation = None;
+            self.pending_touch_id = None;
+            self.local_pin.clear();
+        } else if let Some(method) = action {
+            self.authenticate_unattended(method);
+        }
+    }
+
+    #[cfg(unix)]
+    fn authenticate_unattended(&mut self, method: ConfirmationAction) {
+        let Some(confirmation) = &self.unattended_confirmation else {
+            return;
+        };
+        let consent = confirmation.consent.clone();
+        let deadline = match confirmation.deadline() {
+            Ok(deadline) if deadline > SystemTime::now() => deadline,
+            _ => {
+                self.notice_from(Err(LadonError::InvalidRequest), "");
+                return;
+            }
+        };
+        if self.desktop_lock != DesktopLockState::Active
+            || self.vault_session_id().ok() != Some(consent.context.vault)
+        {
+            self.reject_stale_authentication();
+            self.unattended_confirmation = None;
+            return;
+        }
+        if method == ConfirmationAction::TouchId {
+            if self.pending_touch_id.is_some() {
+                return;
+            }
+            match TouchIdAuthenticator::authenticate_agent_session() {
+                Ok(authentication) => {
+                    self.pending_touch_id = Some(PendingTouchId {
+                        authentication,
+                        target: TouchIdTarget::Unattended { consent, deadline },
+                    })
+                }
+                Err(error) => self.notice_from(Err(error), ""),
+            }
+            return;
+        }
+        let verification = self
+            .session_confirmation
+            .as_mut()
+            .ok_or(LadonError::ApprovalAuthenticationFailed)
+            .and_then(|confirmation| confirmation.verify_pin(&self.local_pin));
+        self.local_pin.clear();
+        match verification {
+            Ok(PinVerification::Accepted) => {
+                self.finish_authenticated_unattended(consent, deadline, false)
+            }
+            Ok(PinVerification::Rejected { remaining_attempts }) => {
+                self.notice = Some(Notice {
+                    text: format!("PIN rejected; {remaining_attempts} attempts remain"),
+                    danger: true,
+                })
+            }
+            Ok(PinVerification::LockVault) => self.lock_immediately(),
+            Err(error) => self.notice_from(Err(error), ""),
+        }
+    }
+
+    #[cfg(unix)]
+    fn finish_unattended_touch_id(&mut self, consent: UnattendedConsent, deadline: SystemTime) {
+        self.finish_authenticated_unattended(consent, deadline, true);
+    }
+
+    #[cfg(unix)]
+    fn finish_authenticated_unattended(
+        &mut self,
+        consent: UnattendedConsent,
+        deadline: SystemTime,
+        touch_id: bool,
+    ) {
+        self.unattended_confirmation = None;
+        self.local_pin.clear();
+        let result = if self.desktop_lock != DesktopLockState::Active {
+            Err(LadonError::ApprovalCancelled)
+        } else {
+            self.broker
+                .as_ref()
+                .ok_or(LadonError::EndpointUnavailable)
+                .and_then(|broker| broker.grant_unattended(&self.controller, &consent, deadline))
+        };
+        if result.is_ok() {
+            if touch_id {
+                if let Some(confirmation) = self.session_confirmation.as_mut() {
+                    confirmation.record_touch_id_success();
+                }
+            }
+            self.refresh_agent_grants();
+        }
+        self.notice_from(
+            result,
+            "Unattended access granted until the confirmed deadline",
+        );
+    }
+
+    #[cfg(unix)]
+    fn show_legacy_agent_access(&mut self, ui: &mut egui::Ui) {
         let mut revoke = None;
         let mut revoke_all = false;
         Frame::new()
@@ -1378,6 +1827,13 @@ impl LadonDesktop {
                 let mut shown = std::collections::BTreeSet::new();
                 for session in &self.agent_grants {
                     let id = session.client_session_id();
+                    if self
+                        .agent_sessions
+                        .iter()
+                        .any(|connected| connected.details.client_session_id == id)
+                    {
+                        continue;
+                    }
                     if !shown.insert(id) {
                         continue;
                     }
@@ -1609,6 +2065,10 @@ impl LadonDesktop {
         };
         self.local_pin.clear();
         match (pending.target, result) {
+            #[cfg(unix)]
+            (TouchIdTarget::Unattended { consent, deadline }, Ok(())) => {
+                self.finish_unattended_touch_id(consent, deadline)
+            }
             (
                 TouchIdTarget::AppUnlock {
                     vault_session_id,
@@ -1850,9 +2310,26 @@ impl LadonDesktop {
 
     fn lock_app_with_touch_id_availability(&mut self, touch_id_available: bool) {
         if self.desktop_lock != DesktopLockState::Active {
+            #[cfg(unix)]
+            if self
+                .broker
+                .as_ref()
+                .ok_or(LadonError::EndpointUnavailable)
+                .and_then(LocalBrokerHandle::revoke_grants)
+                .is_err()
+            {
+                self.lock_immediately();
+                return;
+            }
             self.clear_for_app_lock();
             return;
         }
+        self.begin_interface_lock(touch_id_available, false);
+    }
+
+    fn begin_interface_lock(&mut self, touch_id_available: bool, automatic: bool) {
+        #[cfg(not(unix))]
+        let _ = automatic;
         let can_unlock = touch_id_available
             || self
                 .session_confirmation
@@ -1869,7 +2346,13 @@ impl LadonDesktop {
                 .broker
                 .as_ref()
                 .ok_or(LadonError::EndpointUnavailable)
-                .and_then(LocalBrokerHandle::begin_app_lock);
+                .and_then(|broker| {
+                    if automatic {
+                        broker.begin_auto_app_lock()
+                    } else {
+                        broker.begin_app_lock()
+                    }
+                });
             match attempt {
                 Ok(attempt) => {
                     let epoch = attempt.epoch();
@@ -2152,7 +2635,7 @@ impl LadonDesktop {
     fn handle_idle_timeout(&mut self) {
         if self.session_confirmation.is_some() {
             if self.desktop_lock == DesktopLockState::Active {
-                self.lock_app();
+                self.begin_interface_lock(TouchIdAuthenticator::is_available(), true);
             }
             return;
         }
@@ -2289,6 +2772,11 @@ impl LadonDesktop {
         self.app_unlock_pin_visible = false;
         self.pending_touch_id = None;
         self.focused_approval = None;
+        #[cfg(unix)]
+        {
+            self.unattended_confirmation = None;
+            self.session_editors.clear();
+        }
         self.draft = AddSecretDraft::new();
         self.detail.clear_for_vault_lock();
         self.unlock_confirmation = false;
@@ -2347,6 +2835,9 @@ impl LadonDesktop {
 
     #[cfg(unix)]
     fn show_pending_approval(&mut self, context: &egui::Context) {
+        if self.unattended_confirmation.is_some() {
+            return;
+        }
         let pending = match self
             .broker
             .as_ref()
@@ -2384,6 +2875,7 @@ impl LadonDesktop {
         let actions = confirmation_actions(touch_id_available, pin_configured);
         let mut action = None;
         let mut lifetime = ApprovalLifetime::default();
+        let mut unattended = false;
         let session_connected = self.broker.as_ref().is_some_and(|broker| {
             broker
                 .client_session_connected(pending.client_session_id())
@@ -2439,6 +2931,12 @@ impl LadonDesktop {
                         .color(AMBER),
                     );
                 }
+                if session_connected
+                    && self.pending_touch_id.is_none()
+                    && quiet_button(ui, "Allow all current secrets…").clicked()
+                {
+                    unattended = true;
+                }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -2451,6 +2949,10 @@ impl LadonDesktop {
                 self.show_notice(ui);
             });
 
+        if unattended {
+            self.begin_unattended_confirmation(pending.client_session_id());
+            return;
+        }
         match action {
             Some(ApprovalAction::Approve(method)) => {
                 self.authenticate_pending_approval(method, &pending, lifetime);
@@ -2795,6 +3297,8 @@ impl eframe::App for LadonDesktop {
                     if self.show_unlocked(context) {
                         #[cfg(unix)]
                         self.show_pending_approval(context);
+                        #[cfg(unix)]
+                        self.show_unattended_confirmation(context);
                     }
                 }
             },
@@ -4171,6 +4675,12 @@ mod tests {
                 controller,
                 broker: Some(broker),
                 agent_grants: Vec::new(),
+                #[cfg(unix)]
+                agent_sessions: Vec::new(),
+                #[cfg(unix)]
+                session_editors: std::collections::HashMap::new(),
+                #[cfg(unix)]
+                unattended_confirmation: None,
                 agent_command_active: false,
                 agent_grants_session: None,
                 agent_grants_error_shown: false,
@@ -4410,6 +4920,331 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[cfg(unix)]
+    fn open_desktop_session(endpoint: &std::path::Path, client: Uuid) -> crate::LocalSession {
+        crate::LocalClient::new(endpoint)
+            .open_session(&ladon_core::RpcRequest {
+                version: 2,
+                request_id: Uuid::new_v4(),
+                client_session_id: client,
+                client_label: "reported agent".to_owned(),
+                method: ladon_core::RpcMethod::SessionOpen,
+            })
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_lock_after_auto_lock_revokes_retained_unattended_access() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let client = Uuid::new_v4();
+        let _connection = open_desktop_session(&endpoint, client);
+        let broker = app.broker.as_ref().unwrap();
+        let consent = broker.snapshot_unattended(&app.controller, client).unwrap();
+        broker
+            .grant_unattended(
+                &app.controller,
+                &consent,
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            )
+            .unwrap();
+        app.handle_idle_timeout();
+        finish_pending_app_lock(&mut app);
+        assert!(
+            app.broker
+                .as_ref()
+                .unwrap()
+                .agent_grants(&app.controller)
+                .unwrap()
+                .iter()
+                .any(AgentGrantView::unattended)
+        );
+        app.lock_app();
+        assert!(
+            app.broker
+                .as_ref()
+                .unwrap()
+                .agent_grants(&app.controller)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_touch_id_rejects_a_snapshot_changed_during_authentication() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let client = Uuid::new_v4();
+        let _connection = open_desktop_session(&endpoint, client);
+        app.begin_unattended_confirmation(client);
+        let consent = app
+            .unattended_confirmation
+            .as_ref()
+            .unwrap()
+            .consent
+            .clone();
+        app.controller
+            .lock()
+            .unwrap()
+            .delete_secret(consent.secrets[0].id)
+            .unwrap();
+        app.finish_unattended_touch_id(
+            consent,
+            std::time::SystemTime::now() + Duration::from_secs(3600),
+        );
+        assert!(
+            app.broker
+                .as_ref()
+                .unwrap()
+                .agent_grants(&app.controller)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.notice.as_ref().unwrap().danger);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_session_cards_preserve_legacy_client_grants() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let connected = Uuid::new_v4();
+        let _connection = open_desktop_session(&endpoint, connected);
+        grant_desktop_access(&app, &endpoint, Uuid::new_v4(), "one-shot client");
+        app.refresh_agent_grants();
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| app.show_agent_access(ui));
+        });
+        for expected in [
+            "reported agent (reported)",
+            "one-shot client",
+            "external-lock-target",
+        ] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(&shape.shape, expected)),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_cards_keep_global_revoke_for_an_expired_running_command() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let _connection = open_desktop_session(&endpoint, Uuid::new_v4());
+        app.refresh_agent_grants();
+        app.agent_command_active = true;
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| app.show_agent_access(ui));
+        });
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, "Revoke all"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_confirmation_requires_fresh_pin_and_keeps_the_displayed_deadline() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let client = Uuid::new_v4();
+        let _connection = open_desktop_session(&endpoint, client);
+        app.begin_unattended_confirmation(client);
+        let deadline = app
+            .unattended_confirmation
+            .as_ref()
+            .unwrap()
+            .deadline()
+            .unwrap();
+        app.local_pin = SensitiveText::from("0000");
+        app.authenticate_unattended(ConfirmationAction::Pin);
+        assert!(
+            app.broker
+                .as_ref()
+                .unwrap()
+                .agent_grants(&app.controller)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.local_pin.as_str().is_empty());
+        app.local_pin = SensitiveText::from("1234");
+        app.authenticate_unattended(ConfirmationAction::Pin);
+        let grants = app
+            .broker
+            .as_ref()
+            .unwrap()
+            .agent_grants(&app.controller)
+            .unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].unattended());
+        assert_eq!(grants[0].expires_at(), Some(deadline));
+        assert!(app.unattended_confirmation.is_none());
+        assert!(app.local_pin.as_str().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_modal_displays_snapshot_and_explicit_locked_access() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let client = Uuid::new_v4();
+        let _connection = open_desktop_session(&endpoint, client);
+        let connection_id = app
+            .broker
+            .as_ref()
+            .unwrap()
+            .agent_sessions(&app.controller)
+            .unwrap()[0]
+            .details
+            .connection_id;
+        app.broker
+            .as_ref()
+            .unwrap()
+            .set_session_annotation(client, connection_id, "Night build", "")
+            .unwrap();
+        app.begin_unattended_confirmation(client);
+        app.broker
+            .as_ref()
+            .unwrap()
+            .set_session_annotation(client, connection_id, "Later alias", "")
+            .unwrap();
+        assert_eq!(
+            app.unattended_confirmation
+                .as_ref()
+                .unwrap()
+                .consent
+                .context
+                .session_label,
+            "Night build"
+        );
+        let expected_session = format!(
+            "Night build · {} · 1 current secrets",
+            short_session_id(client)
+        );
+        let secret_id = app
+            .unattended_confirmation
+            .as_ref()
+            .unwrap()
+            .consent
+            .secrets[0]
+            .id;
+        let context = egui::Context::default();
+        let render = |app: &mut LadonDesktop| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| app.show_unattended_confirmation(context),
+            )
+        };
+        render(&mut app);
+        let output = render(&mut app);
+        for expected in [
+            "Access continues while interface is locked",
+            "external-lock-target",
+            &expected_session,
+            "New secrets added later are not included.",
+            "2 hours",
+            "8 hours",
+            "12 hours",
+            "Confirm with PIN",
+        ] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(&shape.shape, expected)),
+                "missing {expected}"
+            );
+        }
+        assert!(!output.shapes.iter().any(|shape| shape_contains_text(
+            &shape.shape,
+            "fake-external-lock-secret"
+        ) || shape_contains_text(
+            &shape.shape,
+            &secret_id.to_string()
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_editor_cache_cannot_carry_an_alias_to_a_new_connection_generation() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let client = Uuid::new_v4();
+        let _connection = open_desktop_session(&endpoint, client);
+        app.refresh_agent_grants();
+        let context = egui::Context::default();
+        let render = |app: &mut LadonDesktop| {
+            let _ = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| app.show_agent_access(ui));
+            });
+        };
+        render(&mut app);
+        app.session_editors.get_mut(&client).unwrap().name = "Previous connection alias".to_owned();
+        app.agent_sessions[0].details.connection_id = Uuid::new_v4();
+        render(&mut app);
+        assert!(app.session_editors.get(&client).unwrap().name.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_sessions_without_grants_have_independent_aliases() {
+        let (mut app, endpoint, _directory) = app_with_sensitive_detail(false);
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let _first_connection = open_desktop_session(&endpoint, first);
+        let _second_connection = open_desktop_session(&endpoint, second);
+        app.broker
+            .as_ref()
+            .unwrap()
+            .set_session_annotation(
+                first,
+                app.broker
+                    .as_ref()
+                    .unwrap()
+                    .agent_sessions(&app.controller)
+                    .unwrap()
+                    .iter()
+                    .find(|s| s.details.client_session_id == first)
+                    .unwrap()
+                    .details
+                    .connection_id,
+                "Night build",
+                "workspace one",
+            )
+            .unwrap();
+        app.refresh_agent_grants();
+        assert_eq!(app.active_session_count(), 2);
+        assert_eq!(
+            app.agent_sessions
+                .iter()
+                .find(|session| session.details.client_session_id == first)
+                .unwrap()
+                .details
+                .user_name,
+            "Night build"
+        );
+        assert!(
+            app.agent_sessions
+                .iter()
+                .find(|session| session.details.client_session_id == second)
+                .unwrap()
+                .details
+                .user_name
+                .is_empty()
+        );
+        assert!(app.agent_grants.is_empty());
     }
 
     #[test]
@@ -5295,6 +6130,12 @@ mod tests {
             #[cfg(unix)]
             agent_grants: Vec::new(),
             #[cfg(unix)]
+            agent_sessions: Vec::new(),
+            #[cfg(unix)]
+            session_editors: std::collections::HashMap::new(),
+            #[cfg(unix)]
+            unattended_confirmation: None,
+            #[cfg(unix)]
             agent_command_active: false,
             #[cfg(unix)]
             agent_grants_session: None,
@@ -5374,6 +6215,12 @@ mod tests {
             broker: None,
             #[cfg(unix)]
             agent_grants: Vec::new(),
+            #[cfg(unix)]
+            agent_sessions: Vec::new(),
+            #[cfg(unix)]
+            session_editors: std::collections::HashMap::new(),
+            #[cfg(unix)]
+            unattended_confirmation: None,
             #[cfg(unix)]
             agent_command_active: false,
             #[cfg(unix)]

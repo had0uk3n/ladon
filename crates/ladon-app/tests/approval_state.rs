@@ -97,6 +97,167 @@ fn approve_request(coordinator: &Arc<ApprovalCoordinator<FakeClock>>, approval: 
 }
 
 #[test]
+fn unattended_snapshot_survives_only_automatic_lock_and_expires_at_its_deadline() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let token = RunCancellation::new();
+    coordinator
+        .register_client_session(client, token.clone())
+        .unwrap();
+    let secret = SecretId::new();
+    let other = SecretId::new();
+    let context = coordinator.capture_unattended(client, Uuid::nil()).unwrap();
+    coordinator
+        .grant_unattended(
+            &context,
+            &[secret],
+            std::time::UNIX_EPOCH + Duration::from_secs(3600),
+            || Ok(()),
+        )
+        .unwrap();
+    let epoch = coordinator.begin_auto_app_lock().unwrap();
+    coordinator.finish_app_lock(epoch).unwrap();
+    let ticket = coordinator
+        .authorize(
+            request(client, &[(secret, "night")]),
+            &RunCancellation::new(),
+        )
+        .unwrap();
+    assert!(coordinator.with_valid_grant(&ticket, || Ok(())).is_ok());
+    assert_eq!(
+        coordinator.authorize(request(client, &[(other, "new")]), &RunCancellation::new()),
+        Err(LadonError::VaultLocked)
+    );
+    assert_eq!(
+        coordinator.require_client_access(Uuid::new_v4()),
+        Err(LadonError::VaultLocked)
+    );
+    clock.advance(Duration::from_secs(3600));
+    assert_eq!(
+        coordinator.with_valid_grant(&ticket, || Ok(())),
+        Err(LadonError::ApprovalCancelled)
+    );
+    assert_eq!(
+        coordinator.require_client_access(client),
+        Err(LadonError::VaultLocked)
+    );
+}
+
+#[test]
+fn session_annotations_never_renew_permissions_and_disconnect_erases_them() {
+    let clock = FakeClock::new();
+    let coordinator = Arc::new(ApprovalCoordinator::new(
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    let client = Uuid::new_v4();
+    let token = RunCancellation::new();
+    coordinator
+        .register_client_session(client, token.clone())
+        .unwrap();
+    coordinator
+        .set_session_annotation(
+            client,
+            "Night work",
+            "Check results tomorrow\nThen revoke access",
+        )
+        .unwrap();
+    let secret = SecretId::new();
+    approve_request(&coordinator, request(client, &[(secret, "token")]));
+    clock.advance(Duration::from_secs(20));
+    coordinator
+        .observe_client(client, "agent changed its label")
+        .unwrap();
+    let sessions = coordinator.sessions().unwrap();
+    assert_eq!(sessions[0].user_name, "Night work");
+    assert_eq!(
+        sessions[0].note,
+        "Check results tomorrow\nThen revoke access"
+    );
+    assert_eq!(
+        coordinator.active_grants().unwrap()[0].remaining(),
+        Duration::from_secs(40)
+    );
+    token.cancel();
+    assert!(coordinator.sessions().unwrap().is_empty());
+    assert!(coordinator.active_grants().unwrap().is_empty());
+    coordinator
+        .register_client_session(client, RunCancellation::new())
+        .unwrap();
+    assert!(coordinator.sessions().unwrap()[0].user_name.is_empty());
+}
+
+#[test]
+fn unattended_consent_cannot_restore_access_after_a_revoke_or_mutation() {
+    let clock = FakeClock::new();
+    let coordinator =
+        ApprovalCoordinator::new(clock, Duration::from_secs(60), Duration::from_secs(2));
+    let client = Uuid::new_v4();
+    coordinator
+        .register_client_session(client, RunCancellation::new())
+        .unwrap();
+    let secret = SecretId::new();
+    let context = coordinator.capture_unattended(client, Uuid::nil()).unwrap();
+    coordinator.revoke_client(client).unwrap();
+    assert_eq!(
+        coordinator.grant_unattended(
+            &context,
+            &[secret],
+            std::time::UNIX_EPOCH + Duration::from_secs(3600),
+            || Ok(())
+        ),
+        Err(LadonError::ApprovalCancelled)
+    );
+    let context = coordinator.capture_unattended(client, Uuid::nil()).unwrap();
+    coordinator
+        .coordinate_secret_mutation(secret, || Ok(()), |()| Ok(()))
+        .unwrap();
+    assert_eq!(
+        coordinator.grant_unattended(
+            &context,
+            &[secret],
+            std::time::UNIX_EPOCH + Duration::from_secs(3600),
+            || Ok(())
+        ),
+        Err(LadonError::ApprovalCancelled)
+    );
+}
+
+#[test]
+fn reconnect_with_the_same_client_id_cannot_inherit_a_pending_unattended_consent() {
+    let coordinator = ApprovalCoordinator::new(
+        FakeClock::new(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    );
+    let client = Uuid::new_v4();
+    let first = RunCancellation::new();
+    coordinator
+        .register_client_session(client, first.clone())
+        .unwrap();
+    let context = coordinator.capture_unattended(client, Uuid::nil()).unwrap();
+    first.cancel();
+    coordinator
+        .register_client_session(client, RunCancellation::new())
+        .unwrap();
+    assert_eq!(
+        coordinator.grant_unattended(
+            &context,
+            &[SecretId::new()],
+            std::time::UNIX_EPOCH + Duration::from_secs(3600),
+            || Ok(())
+        ),
+        Err(LadonError::ApprovalCancelled)
+    );
+}
+
+#[test]
 fn active_grants_report_untrusted_labels_without_secret_values() {
     let clock = FakeClock::new();
     let coordinator = Arc::new(ApprovalCoordinator::new(

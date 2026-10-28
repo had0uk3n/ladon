@@ -202,10 +202,17 @@ fn call_tool(
         if session.lifetime.is_none() {
             match transport.open_session(session.id, session.label()) {
                 Ok(lifetime) => session.lifetime = Some(lifetime),
-                Err(error) => return tool_error(id, error.code(), error.safe_message()),
+                Err(error) => {
+                    return local_tool_error(id, error.code(), LocalCallPhase::SessionOpen);
+                }
             }
         }
     }
+    let phase = if matches!(method, RpcMethod::Run { .. }) {
+        LocalCallPhase::Run
+    } else {
+        LocalCallPhase::Request
+    };
     let request = RpcRequest {
         version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
@@ -215,8 +222,8 @@ fn call_tool(
     };
     match transport.call(&request) {
         Ok(response) => {
-            if let Some((code, message)) = response.error_details() {
-                tool_error(id, code, message)
+            if let Some((code, _)) = response.error_details() {
+                local_tool_error(id, code, phase)
             } else if let Some(result) = response.result() {
                 let structured = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
                 let text = serde_json::to_string(&structured).unwrap_or_else(|_| "{}".to_owned());
@@ -230,10 +237,10 @@ fn call_tool(
                     }
                 })
             } else {
-                tool_error(id, "invalid_response", "local Ladon response is invalid")
+                local_tool_error(id, "invalid_response", phase)
             }
         }
-        Err(error) => tool_error(id, error.code(), error.safe_message()),
+        Err(error) => local_tool_error(id, error.code(), phase),
     }
 }
 
@@ -386,6 +393,58 @@ fn tool_error(id: Value, code: &str, message: &str) -> Value {
     })
 }
 
+#[derive(Clone, Copy)]
+enum LocalCallPhase {
+    SessionOpen,
+    Run,
+    Request,
+}
+
+fn local_tool_error(id: Value, code: &str, phase: LocalCallPhase) -> Value {
+    let error = LadonError::from_code(code).unwrap_or(LadonError::InvalidResponse);
+    if !crate::client::needs_user_recovery(error) && error != LadonError::InvalidRequest {
+        return tool_error(id, error.code(), error.safe_message());
+    }
+    let (phase_name, execution, context) = match phase {
+        LocalCallPhase::SessionOpen => (
+            "session_open",
+            "not_started",
+            "A client session could not be established. The running app may not support this client's session protocol, or the connection was interrupted. No command was submitted.",
+        ),
+        LocalCallPhase::Run => (
+            "run",
+            "unknown",
+            "The run request did not produce a valid reply. Do not assume whether the command executed.",
+        ),
+        LocalCallPhase::Request => (
+            "request",
+            "not_applicable",
+            "The local Ladon request/response exchange failed.",
+        ),
+    };
+    // Use canonical safe messages, never a peer's potentially data-bearing diagnostics.
+    let structured = json!({
+        "code": error.code(),
+        "message": format!("{} {} {}", error.safe_message(), context, crate::client::LOCAL_SERVICE_RECOVERY_GUIDANCE),
+        "source": "local_ladon",
+        "phase": phase_name,
+        "execution": execution,
+        "recovery": {
+            "action": "ask_user",
+            "automatic_retry": false,
+            "manage_shared_app": false
+        }
+    });
+    json!({
+        "jsonrpc": "2.0", "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": structured.to_string() }],
+            "structuredContent": structured,
+            "isError": true
+        }
+    })
+}
+
 fn jsonrpc_error(id: Value, code: i32, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -404,7 +463,7 @@ fn tools() -> Value {
         },
         {
             "name": "ladon_list_secrets",
-            "description": "List secret names, IDs, and field names only. If Ladon is locked, opens its local unlock prompt and waits; do not ask the user to unlock separately or paste secrets.",
+            "description": "List secret names, IDs, and field names only. If Ladon is locked, opens its local unlock prompt and waits; do not ask the user to unlock separately or paste secrets. On IPC/protocol errors, follow the returned recovery guidance; never stop, restart or replace the shared Ladon app.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
         },
@@ -429,7 +488,7 @@ fn tools() -> Value {
         },
         {
             "name": "ladon_run",
-            "description": "Run a local non-interactive program with named secret fields injected via environment, stdin, or a temporary file. Pass references only; never pass a secret value. A locked desktop opens a local unlock prompt and waits, then asks for command approval; do not ask the user to unlock separately. The command may modify external state.",
+            "description": "Run a local non-interactive program with named secret fields injected via environment, stdin, or a temporary file. Pass references only; never pass a secret value. A locked desktop opens a local unlock prompt and waits, then asks for command approval; do not ask the user to unlock separately. The command may modify external state. On IPC/protocol errors, follow the returned recovery guidance; never stop, restart or replace the shared Ladon app or automatically repeat a run with an unknown outcome.",
             "inputSchema": {
                 "type": "object",
                 "required": ["executable"],

@@ -61,6 +61,33 @@ fn framed(json: &[u8]) -> Vec<u8> {
     frame
 }
 
+// @covers crates/ladon-core/src/protocol.rs::request_error_response
+#[test]
+fn request_error_response_never_recovers_ambiguous_or_invalid_identity() {
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let duplicate = format!(r#"{{"request_id":"{id}","request_id":"{id}"}}"#);
+    for payload in [
+        "not-json",
+        "{}",
+        r#"{"request_id":null}"#,
+        r#"{"request_id":"fake-private-data"}"#,
+        &duplicate,
+    ] {
+        assert!(
+            ladon_core::request_error_response(
+                &framed(payload.as_bytes()),
+                LadonError::InvalidRequest
+            )
+            .is_none()
+        );
+    }
+    let mut partial = framed(format!(r#"{{"request_id":"{id}"}}"#).as_bytes());
+    partial.pop();
+    assert!(ladon_core::request_error_response(&partial, LadonError::InvalidFrame).is_none());
+    let too_large = ((ladon_core::MAX_FRAME_BYTES as u32) + 1).to_be_bytes();
+    assert!(ladon_core::request_error_response(&too_large, LadonError::FrameTooLarge).is_none());
+}
+
 #[test]
 fn request_round_trip_has_version_request_and_client_uuids_label_method_and_typed_params() {
     let request = RpcRequest {

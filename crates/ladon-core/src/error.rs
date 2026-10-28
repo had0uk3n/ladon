@@ -42,6 +42,12 @@ pub enum LadonError {
     VaultLocked,
     #[error("IPC frame is invalid")]
     InvalidFrame,
+    #[error("local Ladon connection closed before a complete IPC message was received")]
+    IpcDisconnected,
+    #[error("local Ladon IPC read timed out")]
+    IpcTimeout,
+    #[error("local Ladon response is malformed or belongs to another request")]
+    InvalidResponse,
     #[error("IPC frame exceeds the size limit")]
     FrameTooLarge,
     #[error("IPC request is invalid")]
@@ -118,6 +124,9 @@ impl LadonError {
             "vault_unavailable" => Self::VaultUnavailable,
             "vault_locked" => Self::VaultLocked,
             "invalid_frame" => Self::InvalidFrame,
+            "ipc_disconnected" => Self::IpcDisconnected,
+            "ipc_timeout" => Self::IpcTimeout,
+            "invalid_response" => Self::InvalidResponse,
             "frame_too_large" => Self::FrameTooLarge,
             "invalid_request" => Self::InvalidRequest,
             "unsupported_protocol_version" => Self::UnsupportedProtocolVersion,
@@ -170,6 +179,9 @@ impl LadonError {
             Self::VaultUnavailable => "vault_unavailable",
             Self::VaultLocked => "vault_locked",
             Self::InvalidFrame => "invalid_frame",
+            Self::IpcDisconnected => "ipc_disconnected",
+            Self::IpcTimeout => "ipc_timeout",
+            Self::InvalidResponse => "invalid_response",
             Self::FrameTooLarge => "frame_too_large",
             Self::InvalidRequest => "invalid_request",
             Self::UnsupportedProtocolVersion => "unsupported_protocol_version",
@@ -221,6 +233,13 @@ impl LadonError {
             Self::VaultUnavailable => "neither managed vault copy can be opened",
             Self::VaultLocked => "vault is locked",
             Self::InvalidFrame => "IPC frame is invalid",
+            Self::IpcDisconnected => {
+                "local Ladon connection closed before a complete IPC message was received"
+            }
+            Self::IpcTimeout => "local Ladon IPC read timed out",
+            Self::InvalidResponse => {
+                "local Ladon response is malformed or belongs to another request"
+            }
             Self::FrameTooLarge => "IPC frame exceeds the size limit",
             Self::InvalidRequest => "IPC request is invalid",
             Self::UnsupportedProtocolVersion => "unsupported protocol version",

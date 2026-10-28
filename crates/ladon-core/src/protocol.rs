@@ -207,6 +207,19 @@ pub fn decode_request_frame(frame: &[u8]) -> Result<RpcRequest, LadonError> {
     Ok(request)
 }
 
+/// Recover only correlation identity for a rejected, fully framed JSON request.
+/// Never include raw input or a deserializer's data-bearing error in the reply.
+pub fn request_error_response(frame: &[u8], error: LadonError) -> Option<RpcResponse> {
+    #[derive(Deserialize)]
+    struct Identity {
+        request_id: Uuid,
+    }
+    let json = checked_frame_payload(frame).ok()?;
+    validate_json_document(json).ok()?;
+    let identity: Identity = serde_json::from_slice(json).ok()?;
+    Some(RpcResponse::error(identity.request_id, error))
+}
+
 fn checked_frame_payload(frame: &[u8]) -> Result<&[u8], LadonError> {
     let declared = frame
         .get(..4)

@@ -18,6 +18,7 @@ use std::{
 use ladon_core::{
     LadonError, MAX_FRAME_BYTES, RpcMethod, RpcRequest, RpcResponse, RpcResult,
     decode_request_frame, decode_response_frame, encode_request_frame, encode_response_frame,
+    request_error_response,
 };
 
 use crate::RunCancellation;
@@ -63,8 +64,7 @@ impl LocalServer {
             .map_err(|_| LadonError::EndpointUnavailable)?;
         configure_stream(&stream)?;
         verify_peer(stream.as_raw_fd())?;
-        let frame = read_frame(&mut stream)?;
-        let request = decode_request_frame(&frame)?;
+        let request = read_request(&mut stream)?;
         let response = handler(request);
         let frame = encode_response_frame(&response)?;
         stream
@@ -89,8 +89,7 @@ impl LocalServer {
         };
         configure_stream(&stream)?;
         verify_peer(stream.as_raw_fd())?;
-        let frame = read_frame(&mut stream)?;
-        let request = decode_request_frame(&frame)?;
+        let request = read_request(&mut stream)?;
         let response = handler(request);
         let frame = encode_response_frame(&response)?;
         stream
@@ -116,8 +115,7 @@ impl LocalConnection {
         mut self,
         handler: impl FnOnce(RpcRequest, RunCancellation) -> RpcResponse,
     ) -> Result<(), LadonError> {
-        let frame = read_frame(&mut self.stream)?;
-        let request = decode_request_frame(&frame)?;
+        let request = read_request(&mut self.stream)?;
         let cancellation = RunCancellation::new();
         let monitor_cancellation = cancellation.clone();
         let monitor_stop = Arc::new(AtomicBool::new(false));
@@ -248,14 +246,11 @@ impl LocalClient {
             return Err(LadonError::InvalidRequest);
         }
         let (stream, response) = self.exchange(request)?;
-        if response.request_id != request.request_id {
-            return Err(LadonError::InvalidRequest);
-        }
         if let Some((code, _)) = response.error_details() {
-            return Err(LadonError::from_code(code).unwrap_or(LadonError::InvalidRequest));
+            return Err(LadonError::from_code(code).unwrap_or(LadonError::InvalidResponse));
         }
         if response.result() != Some(&RpcResult::SessionOpened) {
-            return Err(LadonError::InvalidRequest);
+            return Err(LadonError::InvalidResponse);
         }
         Ok(LocalSession { _stream: stream })
     }
@@ -274,7 +269,14 @@ impl LocalClient {
             .write_all(&frame)
             .map_err(|_| LadonError::EndpointUnavailable)?;
         let response = read_frame(&mut stream)?;
-        Ok((stream, decode_response_frame(&response)?))
+        let response = decode_response_frame(&response).map_err(|error| match error {
+            LadonError::InvalidRequest => LadonError::InvalidResponse,
+            other => other,
+        })?;
+        if response.request_id != request.request_id {
+            return Err(LadonError::InvalidResponse);
+        }
+        Ok((stream, response))
     }
 }
 
@@ -330,9 +332,7 @@ fn validate_endpoint(path: &Path) -> Result<(), LadonError> {
 
 fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>, LadonError> {
     let mut header = [0_u8; 4];
-    reader
-        .read_exact(&mut header)
-        .map_err(|_| LadonError::InvalidFrame)?;
+    reader.read_exact(&mut header).map_err(frame_read_error)?;
     let length = u32::from_be_bytes(header) as usize;
     if length == 0 {
         return Err(LadonError::InvalidFrame);
@@ -345,8 +345,36 @@ fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>, LadonError> {
     frame.resize(4 + length, 0);
     reader
         .read_exact(&mut frame[4..])
-        .map_err(|_| LadonError::InvalidFrame)?;
+        .map_err(frame_read_error)?;
     Ok(frame)
+}
+
+fn frame_read_error(error: io::Error) -> LadonError {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted => LadonError::IpcDisconnected,
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => LadonError::IpcTimeout,
+        _ => LadonError::EndpointUnavailable,
+    }
+}
+
+fn read_request(stream: &mut UnixStream) -> Result<RpcRequest, LadonError> {
+    let frame = read_frame(stream)?;
+    match decode_request_frame(&frame) {
+        Ok(request) => Ok(request),
+        Err(error) => {
+            if let Some(response) = request_error_response(&frame, error) {
+                // The request remains rejected even if its peer has already gone away.
+                let _ = encode_response_frame(&response).and_then(|reply| {
+                    stream
+                        .write_all(&reply)
+                        .map_err(|_| LadonError::EndpointUnavailable)
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 fn effective_uid() -> u32 {
@@ -405,6 +433,119 @@ mod tests {
     use ladon_core::{PROTOCOL_VERSION, RpcMethod, RpcResult};
     use std::sync::mpsc;
     use uuid::Uuid;
+
+    // @covers crates/ladon-app/src/ipc.rs::read_frame
+    #[test]
+    fn closed_stream_is_a_disconnect_even_with_a_partial_header_or_payload() {
+        for bytes in [vec![], vec![0, 0], vec![0, 0, 0, 5, b'{', b'}']] {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(&bytes).unwrap();
+            writer.shutdown(std::net::Shutdown::Write).unwrap();
+            assert_eq!(
+                read_frame(&mut reader).unwrap_err().code(),
+                "ipc_disconnected"
+            );
+        }
+    }
+
+    // @covers crates/ladon-app/src/ipc.rs::read_frame
+    #[test]
+    fn read_timeout_is_distinct_from_a_malformed_message() {
+        let (mut reader, _writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        assert_eq!(read_frame(&mut reader).unwrap_err().code(), "ipc_timeout");
+        assert_eq!(
+            read_frame(&mut &0_u32.to_be_bytes()[..])
+                .unwrap_err()
+                .code(),
+            "invalid_frame"
+        );
+    }
+
+    // @covers crates/ladon-app/src/ipc.rs::read_frame
+    // @covers crates/ladon-app/src/ipc.rs::frame_read_error
+    #[test]
+    fn socket_io_failures_preserve_their_recovery_class() {
+        struct FailedRead(io::ErrorKind);
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(self.0.into())
+            }
+        }
+        for (kind, code) in [
+            (io::ErrorKind::ConnectionReset, "ipc_disconnected"),
+            (io::ErrorKind::ConnectionAborted, "ipc_disconnected"),
+            (io::ErrorKind::TimedOut, "ipc_timeout"),
+            (io::ErrorKind::BrokenPipe, "endpoint_unavailable"),
+        ] {
+            assert_eq!(read_frame(&mut FailedRead(kind)).unwrap_err().code(), code);
+        }
+    }
+
+    // @covers crates/ladon-app/src/ipc.rs::LocalConnection::serve
+    #[test]
+    fn rejected_request_receives_a_correlated_error_without_reaching_the_handler() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let id = Uuid::new_v4();
+        let payload = format!(
+            r#"{{"version":2,"request_id":"{id}","client_session_id":"{id}","client_label":"fixture","method":"future_method","params":{{"private":"fake-sensitive-marker"}}}}"#
+        );
+        let worker = thread::spawn(move || {
+            LocalConnection { stream: server }
+                .serve(|_, _| panic!("rejected request reached the handler"))
+        });
+        client
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        client.write_all(payload.as_bytes()).unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert_eq!(worker.join().unwrap(), Err(LadonError::InvalidRequest));
+        let response =
+            decode_response_frame(&reply).expect("server must reply to a rejected valid envelope");
+        assert_eq!(response.request_id, id);
+        assert_eq!(response.error_details().unwrap().0, "invalid_request");
+        assert!(!String::from_utf8_lossy(&reply).contains("fake-sensitive-marker"));
+    }
+
+    // @covers crates/ladon-app/src/ipc.rs::LocalClient::exchange
+    #[test]
+    fn client_rejects_malformed_and_uncorrelated_responses() {
+        for malformed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("reply.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            let worker = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _request = read_frame(&mut stream).unwrap();
+                let reply = if malformed {
+                    let bytes = b"fake-sensitive-marker";
+                    let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+                    frame.extend_from_slice(bytes);
+                    frame
+                } else {
+                    encode_response_frame(&RpcResponse::success(Uuid::new_v4(), RpcResult::Locked))
+                        .unwrap()
+                };
+                stream.write_all(&reply).unwrap();
+            });
+            let request = RpcRequest {
+                version: 2,
+                request_id: Uuid::new_v4(),
+                client_session_id: Uuid::new_v4(),
+                client_label: "fixture".into(),
+                method: RpcMethod::Status,
+            };
+            assert_eq!(
+                LocalClient::new(&socket).call(&request).unwrap_err().code(),
+                "invalid_response"
+            );
+            worker.join().unwrap();
+        }
+    }
 
     #[test]
     fn session_socket_remains_open_until_guard_disconnects() {

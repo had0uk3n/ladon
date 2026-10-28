@@ -14,6 +14,17 @@ use uuid::Uuid;
 
 use crate::{RpcTransport, integrate::execute_integration, serve_mcp};
 
+enum CliFailure {
+    Local(LadonError),
+    Service(LadonError),
+}
+
+impl From<LadonError> for CliFailure {
+    fn from(error: LadonError) -> Self {
+        Self::Local(error)
+    }
+}
+
 pub fn execute_cli(
     arguments: impl IntoIterator<Item = String>,
     transport: &impl RpcTransport,
@@ -22,8 +33,18 @@ pub fn execute_cli(
 ) -> i32 {
     match execute(arguments, transport, stdout, stderr) {
         Ok(()) => 0,
-        Err(error) => {
+        Err(failure) => {
+            let (error, service_origin) = match failure {
+                CliFailure::Local(error) => (error, false),
+                CliFailure::Service(error) => (error, true),
+            };
             let _ = writeln!(stderr, "{}: {}", error.code(), error.safe_message());
+            if service_origin
+                && (crate::client::needs_user_recovery(error)
+                    || error == LadonError::InvalidRequest)
+            {
+                let _ = writeln!(stderr, "{}", crate::client::LOCAL_SERVICE_RECOVERY_GUIDANCE);
+            }
             2
         }
     }
@@ -34,7 +55,7 @@ fn execute(
     transport: &impl RpcTransport,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
-) -> Result<(), LadonError> {
+) -> Result<(), CliFailure> {
     let mut arguments = arguments.into_iter();
     let _program = arguments.next();
     let command = arguments.next().ok_or(LadonError::InvalidRequest)?;
@@ -44,9 +65,11 @@ fn execute(
         "list" if rest.is_empty() => call_and_render(RpcMethod::List, transport, stdout),
         "lock" if rest.is_empty() => call_and_render(RpcMethod::Lock, transport, stdout),
         "run" => call_and_render(parse_run(rest, RunCaller::Cli)?, transport, stdout),
-        "mcp" if rest.is_empty() => serve_mcp(std::io::stdin(), stdout, transport),
-        "integrate" => execute_integration(&rest, stdout, stderr),
-        _ => Err(LadonError::InvalidRequest),
+        "mcp" if rest.is_empty() => {
+            serve_mcp(std::io::stdin(), stdout, transport).map_err(Into::into)
+        }
+        "integrate" => execute_integration(&rest, stdout, stderr).map_err(Into::into),
+        _ => Err(LadonError::InvalidRequest.into()),
     }
 }
 
@@ -54,7 +77,7 @@ fn call_and_render(
     method: RpcMethod,
     transport: &impl RpcTransport,
     stdout: &mut impl Write,
-) -> Result<(), LadonError> {
+) -> Result<(), CliFailure> {
     let request = RpcRequest {
         version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
@@ -64,17 +87,24 @@ fn call_and_render(
     };
     // Lock and status must remain available even when lifecycle slots are full.
     let _lifetime = if matches!(request.method, RpcMethod::Run { .. } | RpcMethod::List) {
-        Some(transport.open_session(request.client_session_id, &request.client_label)?)
+        Some(
+            transport
+                .open_session(request.client_session_id, &request.client_label)
+                .map_err(CliFailure::Service)?,
+        )
     } else {
         None
     };
-    render_response(&transport.call(&request)?, stdout)
+    let response = transport.call(&request).map_err(CliFailure::Service)?;
+    if let Some((code, _)) = response.error_details() {
+        return Err(CliFailure::Service(
+            LadonError::from_code(code).unwrap_or(LadonError::InvalidResponse),
+        ));
+    }
+    render_response(&response, stdout).map_err(Into::into)
 }
 
 fn render_response(response: &RpcResponse, stdout: &mut impl Write) -> Result<(), LadonError> {
-    if let Some((code, _)) = response.error_details() {
-        return Err(LadonError::from_code(code).unwrap_or(LadonError::InvalidRequest));
-    }
     let result = response.result().ok_or(LadonError::InvalidRequest)?;
     serde_json::to_writer_pretty(&mut *stdout, result).map_err(|_| LadonError::InvalidRequest)?;
     writeln!(stdout).map_err(|_| LadonError::InvalidRequest)

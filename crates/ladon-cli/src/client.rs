@@ -1,6 +1,23 @@
 use ladon_core::{LadonError, RpcRequest, RpcResponse};
 use uuid::Uuid;
 
+pub(crate) const LOCAL_SERVICE_RECOVERY_GUIDANCE: &str = "Ask the user to check Ladon and that its app and client builds are compatible. Do not restart, stop, replace, or globally lock the shared Ladon app. Do not automatically retry a command after losing its reply.";
+
+pub(crate) const fn needs_user_recovery(error: ladon_core::LadonError) -> bool {
+    matches!(
+        error,
+        ladon_core::LadonError::IpcDisconnected
+            | ladon_core::LadonError::IpcTimeout
+            | ladon_core::LadonError::InvalidFrame
+            | ladon_core::LadonError::InvalidResponse
+            | ladon_core::LadonError::FrameTooLarge
+            | ladon_core::LadonError::UnsupportedProtocolVersion
+            | ladon_core::LadonError::EndpointUnavailable
+            | ladon_core::LadonError::UnsafeEndpoint
+            | ladon_core::LadonError::InvalidPeer
+    )
+}
+
 pub trait RpcSessionLease: Send {
     fn is_connected(&self) -> bool {
         true

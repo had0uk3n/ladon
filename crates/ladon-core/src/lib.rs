@@ -26,7 +26,8 @@ pub use model::{
 pub use protocol::{
     BindingTarget, MAX_FRAME_BYTES, PROTOCOL_VERSION, RpcMethod, RpcRequest, RpcResponse,
     RpcResult, SecretBindingRequest, SecretFieldSummary, SecretSummary, decode_request_frame,
-    decode_response_frame, encode_request_frame, encode_response_frame, validate_json_document,
+    decode_response_frame, encode_request_frame, encode_response_frame, request_error_response,
+    validate_json_document,
 };
 pub use redact::{
     DEFAULT_OUTPUT_LIMIT_BYTES, MAX_OUTPUT_LIMIT_BYTES, MIN_OUTPUT_LIMIT_BYTES, RedactedOutput,

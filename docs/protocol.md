@@ -167,3 +167,33 @@ configuration before an atomic replacement.
 The configured coding agent and `ladon-app` must execute on the same machine and
 as the same OS user. Hosted/cloud agent execution cannot reach this local
 broker.
+
+
+### Communication failures and recovery
+
+The app and CLI/MCP client are independently running processes. Some older
+protocol-v2 app builds predate `session_open`; protocol version 2 alone does not
+prove session-handshake support. They can answer `status` but close a session
+request without replying. Do not fall back to untracked secret access.
+
+Transport EOF, including a partial header or payload, reports `ipc_disconnected`;
+a read deadline reports `ipc_timeout`. `invalid_frame` is reserved for malformed
+framing. A malformed response or a response with another request UUID reports
+`invalid_response`. A valid, bounded request with a recoverable UUID receives a
+correlated rejection instead of a silent disconnect; malformed or ambiguous JSON
+never gets its contents reflected in diagnostics.
+
+MCP communication errors retain `code`, `message` and `isError: true`, and add
+`source: local_ladon`, `phase`, `execution` and `recovery`. A `session_open` failure
+has `execution: not_started`: the requested command was not submitted. A failed
+`run` exchange has `execution: unknown`: it may already have caused external
+effects, so losing a reply never authorizes replay. Other exchanges use
+`execution: not_applicable`. Both text and structured MCP content carry the same
+safe result; command arguments, bindings and raw peer diagnostics are excluded.
+
+Recovery says `action: ask_user`, `automatic_retry: false`, and
+`manage_shared_app: false`. The user checks whether the running app and client
+builds are compatible. An agent must not stop, restart, replace or globally lock
+the shared Ladon app to repair its own connection. CLI failures carry the same
+human guidance. These instructions do not replace operating-system isolation;
+they grant no new authority and do not automatically retry or restart anything.

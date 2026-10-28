@@ -2,14 +2,17 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     net::Shutdown,
     os::unix::{fs::PermissionsExt, net::UnixStream},
     thread,
 };
 
 use ladon_app::{LocalClient, LocalServer};
-use ladon_core::{LadonError, MAX_FRAME_BYTES, RpcMethod, RpcRequest, RpcResponse, RpcResult};
+use ladon_core::{
+    LadonError, MAX_FRAME_BYTES, RpcMethod, RpcRequest, RpcResponse, RpcResult,
+    decode_response_frame,
+};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -108,6 +111,8 @@ fn never_removes_a_non_socket_collision() {
     assert_eq!(fs::read(&socket).unwrap(), b"keep me");
 }
 
+// @covers crates/ladon-app/src/ipc.rs::LocalServer::serve_once
+// @covers crates/ladon-app/src/ipc.rs::read_frame
 #[test]
 fn rejects_partial_and_oversized_frames_before_allocating_payloads() {
     let root = tempdir().unwrap();
@@ -119,7 +124,7 @@ fn rejects_partial_and_oversized_frames_before_allocating_payloads() {
     stream.shutdown(Shutdown::Write).unwrap();
     assert_eq!(
         worker.join().unwrap().unwrap_err(),
-        LadonError::InvalidFrame
+        LadonError::IpcDisconnected
     );
     drop(stream);
 
@@ -134,6 +139,48 @@ fn rejects_partial_and_oversized_frames_before_allocating_payloads() {
         LadonError::FrameTooLarge
     );
     drop(stream);
+}
+
+// @covers crates/ladon-app/src/ipc.rs::LocalServer::serve_once
+// @covers crates/ladon-app/src/ipc.rs::LocalServer::try_serve_once
+// @covers crates/ladon-core/src/protocol.rs::request_error_response
+#[test]
+fn both_server_entry_points_reply_to_rejected_versions_without_dispatch() {
+    for nonblocking in [false, true] {
+        let root = tempdir().unwrap();
+        let socket = socket_path(&root);
+        let server = LocalServer::bind(&socket).unwrap();
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let worker = thread::spawn(move || {
+            if nonblocking {
+                server
+                    .try_serve_once(|_| panic!("unsupported request dispatched"))
+                    .map(|_| ())
+            } else {
+                server.serve_once(|_| panic!("unsupported request dispatched"))
+            }
+        });
+        let id = Uuid::new_v4();
+        let payload = format!(
+            r#"{{"version":65535,"request_id":"{id}","client_session_id":"{id}","client_label":"fixture","method":"status"}}"#
+        );
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        stream.write_all(payload.as_bytes()).unwrap();
+        let mut frame = Vec::new();
+        stream.read_to_end(&mut frame).unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            Err(LadonError::UnsupportedProtocolVersion)
+        );
+        let response = decode_response_frame(&frame).unwrap();
+        assert_eq!(response.request_id, id);
+        assert_eq!(
+            response.error_details().unwrap().0,
+            "unsupported_protocol_version"
+        );
+    }
 }
 
 #[test]
@@ -180,6 +227,8 @@ fn local_session_guard_keeps_authenticated_socket_open_until_drop() {
     worker.join().unwrap();
 }
 
+// @covers crates/ladon-app/src/ipc.rs::LocalClient::open_session
+// @covers crates/ladon-app/src/ipc.rs::LocalClient::exchange
 #[test]
 fn local_session_rejects_wrong_method_response_or_request_id() {
     let root = tempdir().unwrap();
@@ -209,7 +258,7 @@ fn local_session_rejects_wrong_method_response_or_request_id() {
             LocalClient::new(&socket)
                 .open_session(&registration)
                 .unwrap_err(),
-            LadonError::InvalidRequest
+            LadonError::InvalidResponse
         );
         worker.join().unwrap();
     }

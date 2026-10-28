@@ -397,10 +397,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
                     }
                     ApprovalDecision::ApproveSession => {
                         let client = pending.request.client_session_id;
-                        if !state
+                        if state
                             .client_sessions
                             .get(&client)
-                            .is_some_and(|session| !session.is_cancelled())
+                            .is_none_or(|session| session.is_cancelled())
                         {
                             return Err(LadonError::ApprovalCancelled);
                         }
@@ -817,6 +817,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         self.set_session_annotation_checked(client, None, name, note)
     }
 
+    #[cfg(all(unix, any(feature = "gui", test)))]
     pub(crate) fn set_session_annotation_for_connection(
         &self,
         client: Uuid,
@@ -937,10 +938,10 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
             || state.lock_epoch != context.epoch
             || state.revision != context.revision
             || !state.client_sessions.contains_key(&context.client)
-            || !state
+            || state
                 .sessions
                 .get(&context.client)
-                .is_some_and(|session| session.connection_id == context.connection_id)
+                .is_none_or(|session| session.connection_id != context.connection_id)
         {
             return Err(LadonError::ApprovalCancelled);
         }
@@ -975,7 +976,7 @@ impl<C: MonotonicClock> ApprovalCoordinator<C> {
         Ok(client_has_unattended(&mut state, client))
     }
 
-    #[cfg(any(feature = "gui", test))]
+    #[cfg(all(unix, any(feature = "gui", test)))]
     pub(crate) fn unattended_covers(
         &self,
         client: Uuid,

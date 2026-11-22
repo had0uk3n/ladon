@@ -438,15 +438,20 @@ fn mcp_discovery_declines_an_unimplemented_protocol_without_broker_calls() {
 // @covers crates/ladon-cli/src/mcp.rs::handle_message
 fn mcp_discovery_fallback_keeps_legacy_tools_and_client_identity_available() {
     let transport = FakeTransport::new();
-    let input = [
+    let requests = [
         serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"server/discover", "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}),
         serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"initialize", "params":{"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"compatibility-client", "version":"1"}}}),
         serde_json::json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
         serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"tools/list", "params":{}}),
         serde_json::json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{"name":"ladon_status", "arguments":{}}}),
-    ].iter().map(|request| format!("{request}\n")).collect::<String>();
+    ];
+    let mut input = Vec::new();
+    for request in &requests {
+        serde_json::to_writer(&mut input, request).unwrap();
+        input.push(b'\n');
+    }
     let mut output = Vec::new();
-    serve_mcp(input.as_bytes(), &mut output, &transport).unwrap();
+    serve_mcp(input.as_slice(), &mut output, &transport).unwrap();
     let responses: Vec<serde_json::Value> = String::from_utf8(output)
         .unwrap()
         .lines()

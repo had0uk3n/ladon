@@ -415,3 +415,59 @@ fn status_and_lock_remain_available_when_lifecycle_registration_is_unavailable()
             .contains("endpoint_unavailable")
     );
 }
+
+#[test]
+// @covers crates/ladon-cli/src/mcp.rs::handle_message
+fn mcp_discovery_declines_an_unimplemented_protocol_without_broker_calls() {
+    let transport = LifetimeTransport::new(false);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": "discover-1", "method": "server/discover",
+        "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}
+    });
+    let mut output = Vec::new();
+    serve_mcp(format!("{request}\n").as_bytes(), &mut output, &transport).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["id"], "discover-1");
+    assert_eq!(response["error"]["code"], -32601);
+    assert!(response.get("result").is_none());
+    assert!(transport.opened.borrow().is_empty());
+    assert_eq!(transport.calls.get(), 0);
+}
+
+#[test]
+// @covers crates/ladon-cli/src/mcp.rs::handle_message
+fn mcp_discovery_fallback_keeps_legacy_tools_and_client_identity_available() {
+    let transport = FakeTransport::new();
+    let input = [
+        serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"server/discover", "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}),
+        serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"initialize", "params":{"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"compatibility-client", "version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"tools/list", "params":{}}),
+        serde_json::json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{"name":"ladon_status", "arguments":{}}}),
+    ].iter().map(|request| format!("{request}\n")).collect::<String>();
+    let mut output = Vec::new();
+    serve_mcp(input.as_bytes(), &mut output, &transport).unwrap();
+    let responses: Vec<serde_json::Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0]["error"]["code"], -32601);
+    assert_eq!(responses[1]["result"]["protocolVersion"], "2025-11-25");
+    let tools = responses[2]["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "ladon_run"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "ladon_list_secrets")
+    );
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["state"],
+        "locked"
+    );
+    let seen = transport.seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert!(matches!(seen[0].method, RpcMethod::Status));
+    assert_eq!(seen[0].client_label, "compatibility-client");
+}

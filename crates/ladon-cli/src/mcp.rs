@@ -12,7 +12,6 @@ use uuid::Uuid;
 use crate::{RpcSessionLease, RpcTransport, commands::resolve_executable};
 
 const MCP_LEGACY_VERSION: &str = "2025-11-25";
-const MCP_MODERN_VERSION: &str = "2026-07-28";
 const MAX_REPORTED_NAME_BYTES: usize = 64;
 
 struct McpSession {
@@ -117,6 +116,8 @@ fn handle_message(
     }
     let method = method.unwrap_or_default();
     let id = id?;
+    // Only the initialize-based lifecycle is implemented. Keep server/discover
+    // unsupported so probing clients can fall back without a false modern offer.
     match method {
         "initialize" => {
             if let Some(name) = request
@@ -138,17 +139,6 @@ fn handle_message(
                 }
             }))
         }
-        "server/discover" => Some(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "resultType": "complete",
-                "supportedVersions": [MCP_MODERN_VERSION, MCP_LEGACY_VERSION],
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "ladon", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Use named secret references with Ladon tools. Never ask the user to paste a secret value."
-            }
-        })),
         "ping" => Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
         "tools/list" => Some(json!({
             "jsonrpc": "2.0",
